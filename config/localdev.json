@@ -1,0 +1,17 @@
+{
+	"observability": {
+		"profiling": {
+			"serviceName": ""
+		},
+		"logging": {
+			"serviceName": "template-go",
+			"level": "debug",
+			"provider": "slog"
+		},
+		"metrics": {
+			"serviceName": "",
+			"enabled": false
+		},
+		"tracing": {}
+	}
+}

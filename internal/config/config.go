@@ -37,13 +37,13 @@ import (
 
 // DefaultServiceName is the service name reported by the observability suite
 // when the caller does not supply one.
-const DefaultServiceName = "template-go"
+const DefaultServiceName = "beeline"
 
 // EnvVarPrefix is prepended to every environment variable this application
 // reads, keeping its configuration in a distinct namespace. For example the
-// logging level is read from TEMPLATE_GO_OBSERVABILITY_LOGGING_LEVEL: the prefix
+// logging level is read from BEELINE_OBSERVABILITY_LOGGING_LEVEL: the prefix
 // here, then the nested envPrefix tags on Config and the platform sub-configs.
-const EnvVarPrefix = "TEMPLATE_GO_"
+const EnvVarPrefix = "BEELINE_"
 
 // Log level names accepted by Options.LogLevel (case-insensitive).
 const (
@@ -116,7 +116,7 @@ func envVarOptions() []platformconfig.Option {
 
 // Load builds a Config from the given options and then overlays environment
 // variables on top of it. The options (typically the CLI's flags) seed the
-// defaults; any TEMPLATE_GO_-prefixed environment variable that is set wins over
+// defaults; any BEELINE_-prefixed environment variable that is set wins over
 // them. Fields left unset in the environment keep their default value, so the
 // binary still boots with structured slog logging and noop telemetry out of the
 // box. The result is validated before it is returned.
@@ -135,7 +135,7 @@ func Load(ctx context.Context, opts Options) (*Config, error) {
 }
 
 // LoadFromFile decodes a complete JSON configuration file and then overlays
-// environment variables (a set TEMPLATE_GO_ variable wins over the file value).
+// environment variables (a set BEELINE_ variable wins over the file value).
 // Unlike Load, it does not start from the built-in defaults: the file is
 // expected to fully specify the config — at minimum a logging service name — so
 // use it once a deployment has a real config file to mount. The result is

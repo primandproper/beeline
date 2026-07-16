@@ -192,7 +192,7 @@ formatters:
     gci:
       sections:
         - standard
-        - prefix(github.com/primandproper/template-go)
+        - prefix(github.com/primandproper/beeline)
         - prefix(github.com/primandproper)
         - default
       custom-order: true

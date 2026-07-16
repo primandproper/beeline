@@ -4,7 +4,7 @@
 			"serviceName": ""
 		},
 		"logging": {
-			"serviceName": "template-go",
+			"serviceName": "beeline",
 			"level": "info",
 			"provider": "slog"
 		},

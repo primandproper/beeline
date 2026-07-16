@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/primandproper/template-go/internal/config"
+	"github.com/primandproper/beeline/internal/config"
 
 	"github.com/primandproper/platform-go/v4/observability"
 	"github.com/primandproper/platform-go/v4/observability/logging"
@@ -65,14 +65,14 @@ func (a *application) newRootCommand() *cobra.Command {
 			return a.bootstrap(cmd.Context(), config.Options{ServiceName: serviceName, LogLevel: logLevel}, configPath)
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			a.log().Info("no subcommand provided; run `template-go help` to see what's available")
+			a.log().Info("no subcommand provided; run `beeline help` to see what's available")
 
 			return cmd.Help()
 		},
 	}
 
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", envOr("TEMPLATE_GO_LOG_LEVEL", config.LevelInfo), "log level: debug, info, warn, or error")
-	rootCmd.PersistentFlags().StringVar(&serviceName, "service-name", envOr("TEMPLATE_GO_SERVICE_NAME", config.DefaultServiceName), "service name reported in telemetry")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", envOr("BEELINE_LOG_LEVEL", config.LevelInfo), "log level: debug, info, warn, or error")
+	rootCmd.PersistentFlags().StringVar(&serviceName, "service-name", envOr("BEELINE_SERVICE_NAME", config.DefaultServiceName), "service name reported in telemetry")
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", envOr(ConfigFilePathEnvVar, ""), "path to a JSON config file; when set, it is loaded in place of the flag/env defaults")
 
 	rootCmd.AddCommand(a.newVersionCommand())

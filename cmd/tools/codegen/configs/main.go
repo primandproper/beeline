@@ -10,7 +10,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/primandproper/template-go/internal/config"
+	"github.com/primandproper/beeline/internal/config"
 )
 
 func main() {

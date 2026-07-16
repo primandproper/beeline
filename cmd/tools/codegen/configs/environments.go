@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/primandproper/template-go/internal/config"
+	"github.com/primandproper/beeline/internal/config"
 
 	"github.com/primandproper/platform-go/v4/observability"
 	"github.com/primandproper/platform-go/v4/observability/logging"

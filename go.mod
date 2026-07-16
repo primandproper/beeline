@@ -1,4 +1,4 @@
-module github.com/primandproper/template-go
+module github.com/primandproper/beeline
 
 go 1.26
 

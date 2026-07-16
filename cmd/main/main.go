@@ -12,7 +12,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/primandproper/template-go/internal/cli"
+	"github.com/primandproper/beeline/internal/cli"
 )
 
 func main() {

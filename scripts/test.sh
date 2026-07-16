@@ -5,4 +5,4 @@ set -euo pipefail
 # Usage: test.sh
 
 # shellcheck disable=SC2086,SC2046
-CGO_ENABLED=1 go test -shuffle=on -race -vet=all -failfast $(go list github.com/primandproper/template-go/... | grep -Ev '(cmd)')
+CGO_ENABLED=1 go test -shuffle=on -race -vet=all -failfast $(go list github.com/primandproper/beeline/... | grep -Ev '(cmd)')

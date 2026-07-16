@@ -1,4 +1,4 @@
-# template-go
+# beeline
 
 A batteries-included Go application template built on
 [`primandproper/platform-go`](https://github.com/primandproper/platform-go).
@@ -19,9 +19,9 @@ shellcheck.
 
 ```bash
 make setup                  # create artifacts/ and download the module cache
-make build                  # compile everything, produce artifacts/template-go
-./artifacts/template-go version
-./artifacts/template-go --help
+make build                  # compile everything, produce artifacts/beeline
+./artifacts/beeline version
+./artifacts/beeline --help
 ```
 
 Or run without building a binary:
@@ -60,16 +60,16 @@ The CLI reads two settings, via flags or environment variables:
 
 | Flag             | Environment variable       | Default       | Values                           |
 | ---------------- | -------------------------- | ------------- | -------------------------------- |
-| `--log-level`    | `TEMPLATE_GO_LOG_LEVEL`    | `info`        | `debug`, `info`, `warn`, `error` |
-| `--service-name` | `TEMPLATE_GO_SERVICE_NAME` | `template-go` | any string                       |
+| `--log-level`    | `BEELINE_LOG_LEVEL`    | `info`        | `debug`, `info`, `warn`, `error` |
+| `--service-name` | `BEELINE_SERVICE_NAME` | `beeline` | any string                       |
 
 ```bash
-TEMPLATE_GO_LOG_LEVEL=debug ./artifacts/template-go version
+BEELINE_LOG_LEVEL=debug ./artifacts/beeline version
 ```
 
 Observability logs are structured slog written to **stdout**. The `version`
 subcommand prints its data to stdout and emits nothing at the default `info`
-level, so `template-go version` stays machine-parseable.
+level, so `beeline version` stays machine-parseable.
 
 To enable real tracing/metrics/profiling, populate the corresponding sub-configs
 in `internal/config/config.go` and call `observability.Config.NewPillars`
@@ -113,7 +113,7 @@ make setup && make build && make test
   (this module and its org).
 - **`scripts/`** — the module path in `scripts/test.sh` and
   `scripts/format_imports.sh`, and `VERSION_PKG` in `scripts/build.sh`.
-- **`internal/`** — `DefaultServiceName` and the `TEMPLATE_GO_*` env-var prefixes.
+- **`internal/`** — `DefaultServiceName` and the `BEELINE_*` env-var prefixes.
 - **`CLAUDE.md`** and this **`README.md`** — project details.
 
 The `Makefile` `THIS` variable must be the full module path, because

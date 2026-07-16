@@ -4,8 +4,8 @@ MYSELF   := $(shell id -u)
 MY_GROUP := $(shell id -g)
 
 # PATHS
-THIS          := github.com/primandproper/template-go
-BINARY_NAME   := template-go
+THIS          := github.com/primandproper/beeline
+BINARY_NAME   := beeline
 CMD_PACKAGE   := $(THIS)/cmd/main
 ARTIFACTS_DIR := artifacts
 SCRIPTS_DIR   := scripts

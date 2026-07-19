@@ -30,6 +30,83 @@ Or run without building a binary:
 make run ARGS="version"
 ```
 
+## Demo: the matrix service
+
+The `serve` subcommand is the prototype. It tessellates a service area into H3
+cells, keeps origin→destination travel-time estimates fresh in the background, and
+serves the read path plus an embedded operator console over HTTP. The routing
+engine is a Haversine stand-in (great-circle distance ÷ per-profile speed) behind
+the same interface a real engine (OSRM/Valhalla) would implement, so the whole
+pipeline runs with **no external routing dependency**.
+
+```bash
+make build
+make run ARGS="serve --config config/localdev.json"   # or ./artifacts/beeline serve --config config/localdev.json
+```
+
+Then open **http://localhost:8080**.
+
+The demo area is **Lake Travis** in the Austin, TX metro. As the background refresh
+loop computes estimates, the console fills the service area with H3 cells — and the
+reservoir stays **carved out**: cells over open water are pruned because they have
+no roads (design §7, "road-aware tessellation"). The startup log shows it:
+
+```
+road mask loaded; pruning roadless cells   cells=1421 resolution=9
+service area tessellated ...                cells=488  pairs=43848
+```
+
+488 cells are seeded out of the full 631-cell disk — the 143 roadless water cells
+(~23%) are dropped. (The basemap tiles need internet; the cells and markers render
+regardless.)
+
+Poke at it while it runs:
+
+```bash
+curl 'localhost:8080/_ops_/freshness'    # §3 debt/throughput contract (watch it drain)
+curl 'localhost:8080/_ops_/cells'        # per-origin-cell freshness rollup (the console's overlay)
+curl 'localhost:8080/estimate?origin=30.3428,-98.0274&dest=30.35,-98.00&profile=car'
+```
+
+You can also redraw the boundary, move the center, or change the H3 resolution at
+runtime from the console (or `POST /_config_/area`) and watch the cache reload. The
+road mask follows resolution changes through the H3 hierarchy — pruning stays exact
+at or below the mask's resolution and approximate (edge only as sharp as the mask)
+when you zoom finer. The console warns under the resolution slider when you've zoomed
+past the mask's resolution; rebuild the mask at that resolution for a crisp edge.
+
+### The road mask
+
+The road mask (`config/masks/austin-res9.cells`) is **committed**, so the demo
+needs neither the network nor DuckDB — it loads the cell set from disk. Point
+`serve` at your own mask with the `roadMaskPath` config key (env
+`BEELINE_MATRIX_ROAD_MASK_PATH`); an empty path disables pruning (full geometric
+disk).
+
+To rebuild the mask, or build one for a different area, use `make mask`. It reads
+[Overture Maps](https://overturemaps.org/) road data via the
+[DuckDB](https://duckdb.org/) CLI — pinned in `mise.toml`, so `mise install`
+provisions it:
+
+```bash
+mise install                 # provides the duckdb CLI
+make mask                    # rebuild the demo mask (pulls from Overture's public S3, then caches)
+
+# build a mask for a different area — matches the config's area spec:
+make mask MASK_LAT=30.2672 MASK_LNG=-97.7431 MASK_RESOLUTION=8 \
+          MASK_AREA_RINGS=6 MASK_OUT=config/masks/myarea.cells
+```
+
+`make mask` prints how much it prunes for the configured area (e.g. `488/631 disk
+cells have roads, 143 pruned`) and caches the S3 pull under `artifacts/`, so
+re-runs are offline unless the area changes or you pass `--refetch`.
+
+> **Note:** the mask is resolution-specific, and how much it prunes depends
+> entirely on the area. A wide water body at a fine resolution (like the Lake
+> Travis demo) drops a big fraction of the disk; a dense urban area (e.g. downtown
+> Austin, ~`30.27, -97.74`) is fully road-covered and prunes almost nothing — the
+> mask still loads, it just has little to remove.
+
 ## What's included
 
 - **A working CLI** — `cmd/main` → `internal/cli` (cobra root + `version`

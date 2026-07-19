@@ -29,14 +29,17 @@ type Environment struct {
 // disk. The rendered files round-trip through LoadFromFile.
 func Render(ctx context.Context, envs []Environment, validate bool) error {
 	if validate {
-		for _, env := range envs {
+		for idx := range envs {
+			env := &envs[idx]
 			if err := env.Config.Validate(ctx); err != nil {
 				return fmt.Errorf("validating %s config: %w", env.Name, err)
 			}
 		}
 	}
 
-	for _, env := range envs {
+	for idx := range envs {
+		env := &envs[idx]
+
 		data, err := json.MarshalIndent(env.Config, "", "\t")
 		if err != nil {
 			return fmt.Errorf("marshaling %s config: %w", env.Name, err)

@@ -34,6 +34,7 @@ const shutdownTimeout = 5 * time.Second
 type application struct {
 	pillars *observability.Pillars
 	logger  logging.Logger
+	cfg     *config.Config
 }
 
 // Execute builds the root command, runs it, and tears down the observability
@@ -76,6 +77,7 @@ func (a *application) newRootCommand() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", envOr(ConfigFilePathEnvVar, ""), "path to a JSON config file; when set, it is loaded in place of the flag/env defaults")
 
 	rootCmd.AddCommand(a.newVersionCommand())
+	rootCmd.AddCommand(a.newServeCommand())
 
 	return rootCmd
 }
@@ -104,6 +106,7 @@ func (a *application) bootstrap(ctx context.Context, opts config.Options, config
 		return err
 	}
 
+	a.cfg = cfg
 	a.pillars = pillars
 	a.logger = logging.NewNamedLogger(pillars.Logger, cfg.Observability.Logging.ServiceName)
 

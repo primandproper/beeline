@@ -73,10 +73,19 @@ func TestLoad(t *testing.T) {
 }
 
 func TestLoadFromFile(t *testing.T) {
+	// A complete config file must fully specify both observability and the matrix
+	// service; this is a minimal valid matrix block the success cases can embed.
+	const matrixJSON = `"matrix":{` +
+		`"server":{"port":8080,"startupDeadline":5000000000},` +
+		`"area":{"resolution":8,"areaRings":1,"radiusRings":1},` +
+		`"profiles":{"car":13.9},"defaultProfile":"car",` +
+		`"targetTTL":60000000000,"leaseDuration":30000000000,` +
+		`"refreshWorkers":1,"refreshBatch":1}`
+
 	t.Run("decodes a complete config file", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "config.json")
 		require.NoError(t, os.WriteFile(path, []byte(
-			`{"observability":{"logging":{"provider":"slog","serviceName":"from-file","level":"warn"}}}`,
+			`{"observability":{"logging":{"provider":"slog","serviceName":"from-file","level":"warn"}},`+matrixJSON+`}`,
 		), 0o600))
 
 		cfg, err := LoadFromFile(context.Background(), path)
@@ -85,6 +94,7 @@ func TestLoadFromFile(t *testing.T) {
 		assert.Equal(t, "from-file", cfg.Observability.Logging.ServiceName)
 		assert.Equal(t, loggingcfg.ProviderSlog, cfg.Observability.Logging.Provider)
 		assert.True(t, logging.LevelsEqual(logging.WarnLevel, cfg.Observability.Logging.Level))
+		assert.Equal(t, "car", cfg.Matrix.DefaultProfile)
 	})
 
 	t.Run("environment variables overlay the file", func(t *testing.T) {
@@ -92,7 +102,7 @@ func TestLoadFromFile(t *testing.T) {
 
 		path := filepath.Join(t.TempDir(), "config.json")
 		require.NoError(t, os.WriteFile(path, []byte(
-			`{"observability":{"logging":{"provider":"slog","serviceName":"from-file"}}}`,
+			`{"observability":{"logging":{"provider":"slog","serviceName":"from-file"}},`+matrixJSON+`}`,
 		), 0o600))
 
 		cfg, err := LoadFromFile(context.Background(), path)

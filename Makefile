@@ -104,6 +104,24 @@ lint: golang_lint shellcheck
 configs:
 	$(SCRIPTS_DIR)/configs.sh $(THIS)
 
+# mask builds the road mask (design §7) for a service area from Overture Maps and
+# writes the H3 cell set `serve` loads via BEELINE_MATRIX_ROAD_MASK_PATH. Requires
+# the duckdb CLI on PATH (`mise install` provides it). The defaults build the demo
+# Austin mask; override the MASK_* variables to build one for another area. The S3
+# pull is cached under artifacts/, so re-runs are offline unless you pass --refetch.
+MASK_LAT        ?= 30.34284460447388
+MASK_LNG        ?= -98.02736352689148
+MASK_RESOLUTION ?= 9
+MASK_AREA_RINGS ?= 14
+MASK_OUT        ?= config/masks/austin-res9.cells
+MASK_CACHE      ?= $(ARTIFACTS_DIR)/overture/austin-res9.csv
+
+.PHONY: mask
+mask:
+	mise exec -- go run $(THIS)/cmd/tools/maskgen \
+		--lat $(MASK_LAT) --lng $(MASK_LNG) --resolution $(MASK_RESOLUTION) \
+		--area-rings $(MASK_AREA_RINGS) --cache $(MASK_CACHE) --out $(MASK_OUT)
+
 ## EXECUTION
 
 # build compiles every package (fast failure on breakage) and then produces the

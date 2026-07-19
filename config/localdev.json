@@ -13,5 +13,30 @@
 			"enabled": false
 		},
 		"tracing": {}
+	},
+	"matrix": {
+		"profiles": {
+			"bike": 4.2,
+			"car": 13.9,
+			"walk": 1.4
+		},
+		"defaultProfile": "car",
+		"roadMaskPath": "config/masks/austin-res9.cells",
+		"server": {
+			"startupDeadline": 5000000000,
+			"port": 8080,
+			"debug": false
+		},
+		"area": {
+			"lat": 30.34284460447388,
+			"lng": -98.02736352689148,
+			"resolution": 9,
+			"areaRings": 14,
+			"radiusRings": 3
+		},
+		"targetTTL": 30000000000,
+		"leaseDuration": 15000000000,
+		"refreshWorkers": 4,
+		"refreshBatch": 256
 	}
 }

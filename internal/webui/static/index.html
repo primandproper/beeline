@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Beeline — Console</title>
+  <link rel="stylesheet" href="/assets/vendor/leaflet.css" />
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="brand">
+        <h1><span class="bee">◆</span> Beeline Console</h1>
+        <p>Draw the service area, then watch the cache load.</p>
+      </div>
+
+      <div class="section" id="config-section">
+        <h2>Boundary &amp; tessellation</h2>
+
+        <div class="field">
+          <label>Center <span class="val" id="center-val">—</span></label>
+          <div class="coords" id="center-coords">click the map to move</div>
+          <div class="hint">Click the map or drag the marker to set the center.</div>
+        </div>
+
+        <div class="field">
+          <label>H3 resolution <span class="val" id="res-val">8</span></label>
+          <input type="range" id="res" min="4" max="12" step="1" value="8" />
+          <div class="hint" id="res-hint"></div>
+          <div class="mask-warn" id="mask-warn" hidden></div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label>Area rings <span class="val" id="area-rings-val">6</span></label>
+            <input type="range" id="area-rings" min="0" max="16" step="1" value="6" />
+          </div>
+          <div class="field">
+            <label>Radius rings <span class="val" id="radius-rings-val">3</span></label>
+            <input type="range" id="radius-rings" min="1" max="8" step="1" value="3" />
+          </div>
+        </div>
+        <div class="hint">Area rings set how far the boundary reaches from center. Radius rings bound how far each origin routes (the travel-radius prune, §7).</div>
+
+        <div class="preview-stats">
+          <div class="stat"><span class="n" id="preview-cells">—</span><span class="k">cells</span></div>
+          <div class="stat"><span class="n" id="preview-pairs">—</span><span class="k">pairs</span></div>
+        </div>
+
+        <button class="apply" id="apply">Apply &amp; rebuild cache</button>
+      </div>
+
+      <div class="section">
+        <h2>Cache load</h2>
+        <div class="progress-head">
+          <span class="pct" id="pct">0%</span>
+          <span class="frac" id="frac">0 / 0 fresh</span>
+        </div>
+        <div class="bar"><span id="bar-fill"></span></div>
+
+        <div class="metrics">
+          <div class="metric"><div class="n" id="m-debt">—</div><div class="k">freshness debt</div></div>
+          <div class="metric"><div class="n" id="m-oldest">—</div><div class="k">oldest age</div></div>
+          <div class="metric" id="m-throughput-box"><div class="n" id="m-throughput">—</div><div class="k">throughput / req</div></div>
+          <div class="metric"><div class="n" id="m-eta">—</div><div class="k">est. to fresh</div></div>
+        </div>
+
+        <div class="legend">
+          <span><span class="swatch" style="background:#f2545b"></span>stale</span>
+          <span><span class="swatch" style="background:#ffb454"></span>partial</span>
+          <span><span class="swatch" style="background:#3ddc84"></span>fresh</span>
+        </div>
+      </div>
+
+      <div class="section pill-section">
+        <h2>Profiles</h2>
+        <div class="pill-row" id="profiles"></div>
+      </div>
+
+      <div class="spacer"></div>
+      <div class="foot">
+        Reads: <code>GET /estimate</code> · Freshness: <code>/_ops_/freshness</code>
+      </div>
+    </aside>
+
+    <div id="map"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="/assets/vendor/leaflet.js"></script>
+  <script src="/assets/vendor/h3-js.umd.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

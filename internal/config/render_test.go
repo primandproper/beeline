@@ -23,6 +23,7 @@ func validConfig(serviceName string) *Config {
 				Level:       logging.InfoLevel,
 			},
 		},
+		Matrix: defaultMatrixConfig(),
 	}
 }
 

@@ -61,6 +61,7 @@ const (
 // tags so they participate in Load and LoadFromFile.
 type Config struct {
 	Observability observability.Config `envPrefix:"OBSERVABILITY_" json:"observability"`
+	Matrix        MatrixConfig         `envPrefix:"MATRIX_"        json:"matrix"`
 }
 
 // Options tune the values that most deployments care about. Empty fields fall
@@ -92,6 +93,7 @@ func New(opts Options) *Config {
 			// which the platform resolves to noop providers. Enable them by
 			// populating the corresponding sub-config.
 		},
+		Matrix: defaultMatrixConfig(),
 	}
 
 	return cfg
@@ -155,7 +157,11 @@ func LoadFromFile(ctx context.Context, path string) (*Config, error) {
 
 // Validate confirms the assembled configuration is internally consistent.
 func (c *Config) Validate(ctx context.Context) error {
-	return c.Observability.ValidateWithContext(ctx)
+	if err := c.Observability.ValidateWithContext(ctx); err != nil {
+		return err
+	}
+
+	return c.Matrix.validate(ctx)
 }
 
 // NewPillars builds the observability pillars for the application.

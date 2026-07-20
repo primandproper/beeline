@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/tessellate"
@@ -36,18 +37,21 @@ type AreasRepository interface {
 	RemoveCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) error
 }
 
-// AreaIndex is the freshness-index seam: seed an area's pairs, remove them, and
-// report per-area freshness. The in-memory index satisfies it.
+// AreaIndex is the freshness-index seam: seed an area's pairs, remove them, sweep its
+// cold demand pairs, and report per-area freshness. The in-memory index satisfies it.
 type AreaIndex interface {
 	Seed(ctx context.Context, keys []beeline.PairKey) error
 	Unseed(ctx context.Context, area beeline.AreaID) error
+	SweepArea(ctx context.Context, area beeline.AreaID, cutoff time.Time) ([]beeline.PairKey, error)
 	CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error)
 	DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.DebtStats, error)
 }
 
-// AreaStore is the hot-store seam: drop an area's cached estimates on disable.
+// AreaStore is the hot-store seam: drop an area's cached estimates on disable, and
+// drop individual swept keys on demand decay.
 type AreaStore interface {
 	DeleteArea(ctx context.Context, area beeline.AreaID) error
+	Delete(ctx context.Context, keys []beeline.PairKey) error
 }
 
 // CreateAreaInput describes a new area. Exactly one geometry source is used: if
@@ -58,6 +62,7 @@ type CreateAreaInput struct {
 	WarmStrategy     beeline.WarmStrategy
 	GeoJSON          []byte
 	Cells            []beeline.H3Cell
+	DemandIdleTTL    time.Duration
 	Resolution       int
 	MaxRadiusMeters  float64
 	CoreRadiusMeters float64
@@ -68,6 +73,7 @@ type CreateAreaInput struct {
 type UpdateAreaInput struct {
 	Name             string
 	WarmStrategy     beeline.WarmStrategy
+	DemandIdleTTL    time.Duration
 	Resolution       int
 	MaxRadiusMeters  float64
 	CoreRadiusMeters float64
@@ -79,6 +85,7 @@ type UpdateAreaInput struct {
 // whether a demand-fill falls within the area's cacheable radius.
 type enabledArea struct {
 	cells           map[beeline.H3Cell]struct{}
+	demandIdleTTL   time.Duration
 	resolution      int
 	maxRadiusMeters float64
 }
@@ -121,7 +128,7 @@ func (c *Coordinator) Get(ctx context.Context, id beeline.AreaID) (beeline.Area,
 // seed the index — an area does no refresh work until enabled.
 func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.Area, error) {
 	strategy := normalizeStrategy(in.WarmStrategy)
-	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy); err != nil {
+	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy, in.DemandIdleTTL); err != nil {
 		return beeline.Area{}, err
 	}
 
@@ -142,6 +149,7 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 		MaxRadiusMeters:  in.MaxRadiusMeters,
 		CoreRadiusMeters: in.CoreRadiusMeters,
 		WarmStrategy:     strategy,
+		DemandIdleTTL:    in.DemandIdleTTL,
 		Cells:            cells,
 		GeoJSON:          in.GeoJSON,
 		Enabled:          false,
@@ -154,7 +162,7 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 // enabled, its working set is re-converged.
 func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in UpdateAreaInput) (beeline.Area, error) {
 	strategy := normalizeStrategy(in.WarmStrategy)
-	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy); err != nil {
+	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy, in.DemandIdleTTL); err != nil {
 		return beeline.Area{}, err
 	}
 
@@ -182,6 +190,7 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in UpdateAr
 	area.MaxRadiusMeters = in.MaxRadiusMeters
 	area.CoreRadiusMeters = in.CoreRadiusMeters
 	area.WarmStrategy = strategy
+	area.DemandIdleTTL = in.DemandIdleTTL
 
 	return c.persistAndConvergeLocked(ctx, &area)
 }
@@ -361,6 +370,38 @@ func (c *Coordinator) EnabledAreas() []beeline.AreaID {
 	return ids
 }
 
+// SweepExpired evicts cold demand pairs across every enabled area: for each area with
+// decay enabled (a positive DemandIdleTTL), any unpinned pair not queried within the
+// TTL is dropped from both the freshness index and the hot store, so cost tracks real
+// usage instead of ratcheting up forever. Areas with DemandIdleTTL == 0 are skipped
+// (decay disabled). It is serialized under the same lock as enable/disable, so a sweep
+// never races an area's teardown. The janitor loop calls it on a fixed cadence.
+func (c *Coordinator) SweepExpired(ctx context.Context, now time.Time) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	swept := 0
+	for id, ea := range c.enabled {
+		if ea.demandIdleTTL <= 0 {
+			continue // decay disabled for this area
+		}
+
+		removed, err := c.index.SweepArea(ctx, id, now.Add(-ea.demandIdleTTL))
+		if err != nil {
+			return swept, err
+		}
+		if len(removed) == 0 {
+			continue
+		}
+		if err := c.store.Delete(ctx, removed); err != nil {
+			return swept, err
+		}
+		swept += len(removed)
+	}
+
+	return swept, nil
+}
+
 // CellStatesForArea proxies the index's per-area rollup for the progress map.
 func (c *Coordinator) CellStatesForArea(ctx context.Context, id beeline.AreaID) ([]beeline.CellState, error) {
 	return c.index.CellStatesForArea(ctx, id)
@@ -428,6 +469,7 @@ func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error 
 		resolution:      area.Resolution,
 		cells:           cellSet,
 		maxRadiusMeters: area.MaxRadiusMeters,
+		demandIdleTTL:   area.DemandIdleTTL,
 	}
 
 	return nil
@@ -500,7 +542,7 @@ func normalizeStrategy(s beeline.WarmStrategy) beeline.WarmStrategy {
 // value is a travel-radius bound. The core radius is only meaningful for the hybrid
 // strategy and must lie within [0, max]. A full-mesh area (max == 0) must be eager,
 // since there is no bounded tail to fill on demand.
-func validateAreaFields(name string, resolution int, maxRadiusMeters, coreRadiusMeters float64, strategy beeline.WarmStrategy) error {
+func validateAreaFields(name string, resolution int, maxRadiusMeters, coreRadiusMeters float64, strategy beeline.WarmStrategy, demandIdleTTL time.Duration) error {
 	if name == "" {
 		return errors.New("control: area name is required")
 	}
@@ -521,6 +563,9 @@ func validateAreaFields(name string, resolution int, maxRadiusMeters, coreRadius
 	}
 	if maxRadiusMeters > 0 && coreRadiusMeters > maxRadiusMeters {
 		return fmt.Errorf("control: core radius meters %.2f must be <= max radius meters %.2f", coreRadiusMeters, maxRadiusMeters)
+	}
+	if demandIdleTTL < 0 {
+		return fmt.Errorf("control: demand idle TTL %v must be >= 0 (0 = decay disabled)", demandIdleTTL)
 	}
 
 	return nil

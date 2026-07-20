@@ -80,6 +80,7 @@ func TestLoadFromFile(t *testing.T) {
 		`"databasePath":"beeline.db",` +
 		`"profiles":{"car":13.9},"defaultProfile":"car",` +
 		`"targetTTL":60000000000,"leaseDuration":30000000000,` +
+		`"sweepInterval":30000000000,` +
 		`"refreshWorkers":1,"refreshBatch":1}`
 
 	t.Run("decodes a complete config file", func(t *testing.T) {

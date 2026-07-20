@@ -3,6 +3,7 @@ package control_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/control"
@@ -136,6 +137,92 @@ func TestHybridSeedsCoreNotFullBound(t *testing.T) {
 	assert.Positive(t, hybridDebt.WorkingSet, "hybrid pins its core")
 	assert.Less(t, hybridDebt.WorkingSet, eagerDebt.WorkingSet,
 		"hybrid's core (1.5km) is a subset of eager's full bound (6km)")
+}
+
+func TestSweepExpiredEvictsColdDemandFromIndexAndStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	cells := diskCells(t, 2)
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "lazy", Resolution: testRes, MaxRadiusMeters: 3000,
+		WarmStrategy: beeline.WarmLazy, DemandIdleTTL: time.Hour, Cells: cells,
+	})
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	// Simulate a demand-fill: the read path tracks the pair (Access) and caches it.
+	key := beeline.PairKey{Area: area.ID, Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes}
+	require.NoError(t, h.index.Access(ctx, []beeline.PairKey{key}))
+	require.NoError(t, h.store.Put(ctx, []beeline.Entry{{
+		Key:    key,
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1, Distance: 2}},
+	}}))
+
+	debt, err := h.index.DebtForArea(ctx, area.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, debt.WorkingSet, "the demand pair is tracked")
+	require.Equal(t, 1, h.store.Len())
+
+	// Within the TTL nothing is swept.
+	swept, err := h.coord.SweepExpired(ctx, time.Now())
+	require.NoError(t, err)
+	assert.Zero(t, swept, "a freshly-accessed pair is not cold yet")
+	assert.Equal(t, 1, h.store.Len())
+
+	// Past the TTL the pair is evicted from both the index and the hot store.
+	swept, err = h.coord.SweepExpired(ctx, time.Now().Add(2*time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, 1, swept, "the cold demand pair is swept")
+
+	debt, err = h.index.DebtForArea(ctx, area.ID)
+	require.NoError(t, err)
+	assert.Zero(t, debt.WorkingSet, "the pair left the working set")
+	assert.Zero(t, h.store.Len(), "the pair left the hot store")
+}
+
+func TestSweepExpiredSkipsDecayDisabledAndPinned(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	cells := diskCells(t, 2)
+
+	// An eager area: its whole bound is pinned, so nothing ever decays.
+	eager := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "eager", Resolution: testRes, MaxRadiusMeters: 3000,
+		WarmStrategy: beeline.WarmEager, DemandIdleTTL: time.Hour, Cells: cells,
+	})
+	_, err := h.coord.Enable(ctx, eager.ID)
+	require.NoError(t, err)
+	eagerBefore, err := h.index.DebtForArea(ctx, eager.ID)
+	require.NoError(t, err)
+
+	// A lazy area with decay disabled (TTL 0): demand pairs live until disable.
+	lazy := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "lazy", Resolution: testRes, MaxRadiusMeters: 3000,
+		WarmStrategy: beeline.WarmLazy, DemandIdleTTL: 0, Cells: cells,
+	})
+	_, err = h.coord.Enable(ctx, lazy.ID)
+	require.NoError(t, err)
+	key := beeline.PairKey{Area: lazy.ID, Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes}
+	require.NoError(t, h.index.Access(ctx, []beeline.PairKey{key}))
+
+	// Even far in the future, nothing is swept.
+	swept, err := h.coord.SweepExpired(ctx, time.Now().Add(9000*time.Hour))
+	require.NoError(t, err)
+	assert.Zero(t, swept, "pinned pairs and decay-disabled areas are never swept")
+
+	eagerAfter, err := h.index.DebtForArea(ctx, eager.ID)
+	require.NoError(t, err)
+	assert.Equal(t, eagerBefore.WorkingSet, eagerAfter.WorkingSet, "eager core intact")
+
+	lazyDebt, err := h.index.DebtForArea(ctx, lazy.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, lazyDebt.WorkingSet, "decay-disabled demand pair survives")
 }
 
 func TestValidationRejectsBadWarmConfig(t *testing.T) {

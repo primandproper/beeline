@@ -48,15 +48,16 @@ func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area,
 
 	err := r.inTx(ctx, func(tx *sql.Tx) error {
 		id, createErr := r.queries.CreateArea(ctx, tx, &generated.CreateAreaParams{
-			Name:             a.Name,
-			Resolution:       int64(a.Resolution),
-			RadiusMeters:     a.MaxRadiusMeters,
-			WarmStrategy:     string(a.WarmStrategy),
-			CoreRadiusMeters: a.CoreRadiusMeters,
-			Geojson:          geojsonParam(a.GeoJSON),
-			Enabled:          boolToInt(a.Enabled),
-			CreatedAt:        now.Format(timeFormat),
-			UpdatedAt:        now.Format(timeFormat),
+			Name:                 a.Name,
+			Resolution:           int64(a.Resolution),
+			RadiusMeters:         a.MaxRadiusMeters,
+			WarmStrategy:         string(a.WarmStrategy),
+			CoreRadiusMeters:     a.CoreRadiusMeters,
+			DemandIdleTtlSeconds: ttlSeconds(a.DemandIdleTTL),
+			Geojson:              geojsonParam(a.GeoJSON),
+			Enabled:              boolToInt(a.Enabled),
+			CreatedAt:            now.Format(timeFormat),
+			UpdatedAt:            now.Format(timeFormat),
 		})
 		if createErr != nil {
 			return fmt.Errorf("sqlite: inserting area: %w", createErr)
@@ -122,14 +123,15 @@ func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
 
 	return r.inTx(ctx, func(tx *sql.Tx) error {
 		if updErr := r.queries.UpdateArea(ctx, tx, &generated.UpdateAreaParams{
-			ID:               int64(a.ID),
-			Name:             a.Name,
-			Resolution:       int64(a.Resolution),
-			RadiusMeters:     a.MaxRadiusMeters,
-			WarmStrategy:     string(a.WarmStrategy),
-			CoreRadiusMeters: a.CoreRadiusMeters,
-			Geojson:          geojsonParam(a.GeoJSON),
-			UpdatedAt:        now.Format(timeFormat),
+			ID:                   int64(a.ID),
+			Name:                 a.Name,
+			Resolution:           int64(a.Resolution),
+			RadiusMeters:         a.MaxRadiusMeters,
+			WarmStrategy:         string(a.WarmStrategy),
+			CoreRadiusMeters:     a.CoreRadiusMeters,
+			DemandIdleTtlSeconds: ttlSeconds(a.DemandIdleTTL),
+			Geojson:              geojsonParam(a.GeoJSON),
+			UpdatedAt:            now.Format(timeFormat),
 		}); updErr != nil {
 			return fmt.Errorf("sqlite: updating area %d: %w", a.ID, updErr)
 		}
@@ -266,6 +268,7 @@ func convertArea(row *generated.Areas, cells []beeline.H3Cell) (beeline.Area, er
 		MaxRadiusMeters:  row.RadiusMeters,
 		CoreRadiusMeters: row.CoreRadiusMeters,
 		WarmStrategy:     beeline.WarmStrategy(row.WarmStrategy),
+		DemandIdleTTL:    time.Duration(row.DemandIdleTtlSeconds) * time.Second,
 		Cells:            cells,
 		GeoJSON:          geojson,
 		Enabled:          row.Enabled != 0,
@@ -282,6 +285,12 @@ func geojsonParam(raw []byte) *string {
 	s := string(raw)
 
 	return &s
+}
+
+// ttlSeconds rounds a demand-idle TTL down to whole seconds for storage. Sub-second
+// precision is meaningless for a decay window measured in minutes-to-hours.
+func ttlSeconds(d time.Duration) int64 {
+	return int64(d / time.Second)
 }
 
 // boolToInt maps a bool to SQLite's 0/1 integer boolean.

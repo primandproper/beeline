@@ -96,6 +96,70 @@ func TestIndexReseedingAreaResetsBaseline(t *testing.T) {
 	assert.Equal(t, 0.0, stats.AchievedThroughput, "baseline reset on re-seed")
 }
 
+func TestIndexSweepAreaEvictsColdDemandPairs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	idx := memory.New(time.Minute, clk.now)
+
+	pinned := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
+	demand := beeline.PairKey{Area: 1, Origin: 1, Dest: 3, Profile: "car", Res: 8}
+	otherArea := beeline.PairKey{Area: 2, Origin: 1, Dest: 3, Profile: "car", Res: 8}
+
+	require.NoError(t, idx.Seed(ctx, []beeline.PairKey{pinned}))    // eager core: pinned
+	require.NoError(t, idx.Access(ctx, []beeline.PairKey{demand}))  // demand: unpinned, accessed now
+	require.NoError(t, idx.Seed(ctx, []beeline.PairKey{otherArea})) // a different area
+
+	// Two hours pass; the cutoff is one hour ago, so the demand pair (accessed 2h ago)
+	// is cold while nothing recent would be.
+	clk.advance(2 * time.Hour)
+	cutoff := clk.now().Add(-time.Hour)
+
+	removed, err := idx.SweepArea(ctx, 1, cutoff)
+	require.NoError(t, err)
+	assert.Equal(t, []beeline.PairKey{demand}, removed, "only the cold unpinned pair is swept")
+
+	one, err := idx.DebtForArea(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, one.WorkingSet, "the pinned eager-core pair survives")
+
+	two, err := idx.DebtForArea(ctx, 2)
+	require.NoError(t, err)
+	assert.Equal(t, 1, two.WorkingSet, "another area is untouched")
+}
+
+func TestIndexSweepAreaKeepsActiveAndLeasedPairs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	idx := memory.New(time.Minute, clk.now)
+
+	active := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
+	leased := beeline.PairKey{Area: 1, Origin: 1, Dest: 3, Profile: "car", Res: 8}
+
+	// Both accessed long ago (cold by lastAccess).
+	require.NoError(t, idx.Access(ctx, []beeline.PairKey{active, leased}))
+
+	// The leased pair is claimed by a worker: it holds a lease that outlives the sweep.
+	claimed, err := idx.Claim(ctx, 10, 3*time.Hour)
+	require.NoError(t, err)
+	require.Contains(t, claimed, leased)
+
+	// The active pair is queried again right before the sweep, refreshing its access.
+	clk.advance(2 * time.Hour)
+	require.NoError(t, idx.Access(ctx, []beeline.PairKey{active}))
+
+	removed, err := idx.SweepArea(ctx, 1, clk.now().Add(-time.Hour))
+	require.NoError(t, err)
+	assert.Empty(t, removed, "a recently-accessed pair and a leased pair both survive")
+
+	stats, err := idx.DebtForArea(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 2, stats.WorkingSet)
+}
+
 func TestIndexCellStatesForAreaScopes(t *testing.T) {
 	t.Parallel()
 

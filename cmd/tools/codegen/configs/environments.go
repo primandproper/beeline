@@ -51,6 +51,7 @@ func buildLocalDevConfig() *config.Config {
 			DefaultProfile:      "car",
 			TargetTTL:           30 * time.Second,
 			LeaseDuration:       15 * time.Second,
+			SweepInterval:       15 * time.Second,
 			RefreshWorkers:      4,
 			RefreshBatch:        256,
 			SilenceRouteLogging: true, // the console polls twice a second; keep the demo quiet
@@ -80,6 +81,7 @@ func buildProductionConfig() *config.Config {
 			DefaultProfile: "car",
 			TargetTTL:      300 * time.Second,
 			LeaseDuration:  60 * time.Second,
+			SweepInterval:  60 * time.Second,
 			RefreshWorkers: 8,
 			RefreshBatch:   512,
 		},

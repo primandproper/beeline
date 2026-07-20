@@ -121,6 +121,34 @@ func (i *Index) Unseed(_ context.Context, area beeline.AreaID) error {
 	return nil
 }
 
+// SweepArea evicts one area's cold demand pairs: every unpinned entry whose last
+// access predates cutoff and that is not currently leased (being refreshed) is removed
+// from the working set, and its key is returned so the caller can drop it from the hot
+// store too. Pinned (eager-core) pairs are never swept. This is the mechanism behind
+// per-area demand decay: cost tracks real usage instead of ratcheting up forever.
+func (i *Index) SweepArea(_ context.Context, area beeline.AreaID, cutoff time.Time) ([]beeline.PairKey, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	now := i.now()
+
+	var removed []beeline.PairKey
+	for k, e := range i.entries {
+		if k.Area != area || e.pinned {
+			continue
+		}
+		if now.Before(e.leaseUntil) {
+			continue // a worker holds this pair; let the refresh finish
+		}
+		if e.lastAccess.Before(cutoff) {
+			removed = append(removed, k)
+			delete(i.entries, k)
+		}
+	}
+
+	return removed, nil
+}
+
 // CellStates rolls the working set up per origin cell for the progress map: for
 // each origin, how many outgoing pairs exist and how many are currently fresh
 // (computed and within the target TTL), plus the oldest age among its computed

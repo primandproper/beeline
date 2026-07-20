@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/store/sqlite"
@@ -42,12 +43,15 @@ func TestRepositoryCreateAndGet(t *testing.T) {
 
 	cells := cellsAround(t, 1)
 	created, err := repo.Create(ctx, &beeline.Area{
-		Name:            "downtown",
-		Resolution:      8,
-		MaxRadiusMeters: 1500.5,
-		Cells:           cells,
-		GeoJSON:         []byte(`{"type":"Polygon","coordinates":[]}`),
-		Enabled:         false,
+		Name:             "downtown",
+		Resolution:       8,
+		MaxRadiusMeters:  1500.5,
+		CoreRadiusMeters: 600,
+		WarmStrategy:     beeline.WarmHybrid,
+		DemandIdleTTL:    90 * time.Minute,
+		Cells:            cells,
+		GeoJSON:          []byte(`{"type":"Polygon","coordinates":[]}`),
+		Enabled:          false,
 	})
 	require.NoError(t, err)
 	assert.NotZero(t, created.ID, "an id is assigned")
@@ -58,6 +62,9 @@ func TestRepositoryCreateAndGet(t *testing.T) {
 	assert.Equal(t, "downtown", got.Name)
 	assert.Equal(t, 8, got.Resolution)
 	assert.Equal(t, 1500.5, got.MaxRadiusMeters)
+	assert.Equal(t, 600.0, got.CoreRadiusMeters)
+	assert.Equal(t, beeline.WarmHybrid, got.WarmStrategy)
+	assert.Equal(t, 90*time.Minute, got.DemandIdleTTL)
 	assert.False(t, got.Enabled)
 	assert.ElementsMatch(t, cells, got.Cells)
 	assert.JSONEq(t, `{"type":"Polygon","coordinates":[]}`, string(got.GeoJSON))

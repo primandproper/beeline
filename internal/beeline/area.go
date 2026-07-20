@@ -45,13 +45,18 @@ func (w WarmStrategy) Valid() bool {
 // WarmStrategy and CoreRadiusMeters govern how much of that bound is kept fresh
 // eagerly. eager pins the whole bound; lazy pins nothing (demand only); hybrid pins
 // everything within CoreRadiusMeters and demand-fills the tail out to MaxRadiusMeters.
+//
+// DemandIdleTTL is how long a demand-filled (unpinned) pair survives without being
+// queried before the decay sweep evicts it; 0 disables decay (demand pairs live until
+// the area is disabled). Eager-core pairs are never evicted regardless.
 type Area struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	Name             string
 	WarmStrategy     WarmStrategy
-	GeoJSON          []byte // raw uploaded polygon for provenance; nil when built purely from manual cells
+	GeoJSON          []byte
 	Cells            []H3Cell
+	DemandIdleTTL    time.Duration
 	ID               AreaID
 	Resolution       int
 	MaxRadiusMeters  float64

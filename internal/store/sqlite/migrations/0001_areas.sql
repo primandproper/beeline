@@ -12,6 +12,9 @@ CREATE TABLE areas (
     warm_strategy      TEXT    NOT NULL DEFAULT 'eager',
     -- core_radius_meters is the hybrid strategy's eagerly-pinned near field (meters).
     core_radius_meters REAL    NOT NULL DEFAULT 0,
+    -- demand_idle_ttl_seconds evicts an unqueried demand pair after this many seconds;
+    -- 0 disables decay (demand pairs live until the area is disabled).
+    demand_idle_ttl_seconds INTEGER NOT NULL DEFAULT 0,
     geojson            TEXT,
     enabled            INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT    NOT NULL,

@@ -29,6 +29,7 @@
 		},
 		"targetTTL": 300000000000,
 		"leaseDuration": 60000000000,
+		"sweepInterval": 60000000000,
 		"refreshWorkers": 8,
 		"refreshBatch": 512
 	}

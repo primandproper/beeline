@@ -42,12 +42,14 @@
     newRadius: id("new-radius"), newRadiusVal: id("new-radius-val"),
     newStrategy: id("new-strategy"),
     newCore: id("new-core"), newCoreVal: id("new-core-val"), newCoreField: id("new-core-field"),
+    newTTL: id("new-ttl"),
     newGeoJSON: id("new-geojson"), createPreview: id("create-preview"),
     previewCells: id("preview-cells"),
     createBtn: id("create-btn"), createCancel: id("create-cancel"),
     detailSection: id("detail-section"), detailName: id("detail-name"),
     detailBadge: id("detail-badge"), detailRes: id("detail-res"),
-    detailRadius: id("detail-radius"), detailStrategy: id("detail-strategy"), detailCells: id("detail-cells"),
+    detailRadius: id("detail-radius"), detailStrategy: id("detail-strategy"),
+    detailTTL: id("detail-ttl"), detailCells: id("detail-cells"),
     toggleEnable: id("toggle-enable"), editHexes: id("edit-hexes"),
     replaceGeoJSON: id("replace-geojson"), deleteArea: id("delete-area"),
     editHint: id("edit-hint"),
@@ -197,6 +199,7 @@
     els.detailStrategy.textContent = a.warmStrategy === "hybrid"
       ? "hybrid (" + (a.coreRadiusMeters || 0).toLocaleString() + " m core)"
       : (a.warmStrategy || "eager");
+    els.detailTTL.textContent = (a.demandIdleTTL && a.demandIdleTTL !== "0s") ? a.demandIdleTTL : "no decay";
     els.detailCells.textContent = a.cellCount.toLocaleString();
     els.toggleEnable.textContent = a.enabled ? "Disable" : "Enable";
 
@@ -370,6 +373,8 @@
       warmStrategy: strategy,
     };
     if (strategy === "hybrid") body.coreRadiusMeters = parseFloat(els.newCore.value);
+    var ttl = els.newTTL.value.trim();
+    if (ttl) body.demandIdleTTL = ttl;
     if (pendingGeoJSON) body.geojson = pendingGeoJSON;
 
     els.createBtn.disabled = true;

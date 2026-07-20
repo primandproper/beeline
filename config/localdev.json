@@ -29,6 +29,7 @@
 		},
 		"targetTTL": 30000000000,
 		"leaseDuration": 15000000000,
+		"sweepInterval": 15000000000,
 		"refreshWorkers": 4,
 		"refreshBatch": 256,
 		"silenceRouteLogging": true

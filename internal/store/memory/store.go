@@ -80,6 +80,20 @@ func (s *Store) DeleteArea(_ context.Context, area beeline.AreaID) error {
 	return nil
 }
 
+// Delete drops the given keys from the store, ignoring any that are absent. The
+// demand-decay janitor calls it with the keys the freshness index swept, so a cold
+// demand pair's cached estimate leaves the hot store together with its index entry.
+func (s *Store) Delete(_ context.Context, keys []beeline.PairKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range keys {
+		delete(s.data, keys[i])
+	}
+
+	return nil
+}
+
 // Len reports how many pairs are currently stored (useful for tests and metrics).
 func (s *Store) Len() int {
 	s.mu.RLock()

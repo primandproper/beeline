@@ -146,6 +146,11 @@ func (a *application) serve(ctx context.Context) error {
 	go pool.Run(ctx)
 	go srv.Serve()
 
+	// Demand-decay janitor: on a fixed cadence, sweep each enabled area's cold demand
+	// pairs (unqueried past their DemandIdleTTL) out of the index and store, so cost
+	// tracks real usage. Areas with decay disabled (TTL 0) are skipped inside Sweep.
+	go a.runSweeper(ctx, coordinator, mcfg.SweepInterval)
+
 	<-ctx.Done()
 	a.log().Info("shutdown signal received; draining HTTP server")
 
@@ -153,4 +158,33 @@ func (a *application) serve(ctx context.Context) error {
 	defer cancel()
 
 	return srv.Shutdown(shutdownCtx)
+}
+
+// runSweeper ticks every interval and asks the coordinator to evict cold demand pairs
+// across all enabled areas. It runs until ctx is cancelled. A non-positive interval
+// disables the janitor entirely (the config validates it as positive, so this is a
+// belt-and-suspenders guard).
+func (a *application) runSweeper(ctx context.Context, coordinator *control.Coordinator, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			swept, err := coordinator.SweepExpired(ctx, time.Now())
+			if err != nil {
+				a.log().Error("sweeping cold demand pairs", err)
+				continue
+			}
+			if swept > 0 {
+				a.log().WithValues(map[string]any{"swept": swept}).Debug("demand-decay sweep evicted cold pairs")
+			}
+		}
+	}
 }

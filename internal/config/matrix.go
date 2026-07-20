@@ -27,6 +27,7 @@ type MatrixConfig struct {
 	Server         serverhttp.Config  `envPrefix:"SERVER_"   json:"server"`
 	TargetTTL      time.Duration      `env:"TARGET_TTL"      json:"targetTTL"`
 	LeaseDuration  time.Duration      `env:"LEASE_DURATION"  json:"leaseDuration"`
+	SweepInterval  time.Duration      `env:"SWEEP_INTERVAL"  json:"sweepInterval"`
 	RefreshWorkers int                `env:"REFRESH_WORKERS" json:"refreshWorkers"`
 	RefreshBatch   int                `env:"REFRESH_BATCH"   json:"refreshBatch"`
 
@@ -56,6 +57,7 @@ func defaultMatrixConfig() MatrixConfig {
 		DefaultProfile: "car",
 		TargetTTL:      60 * time.Second,
 		LeaseDuration:  30 * time.Second,
+		SweepInterval:  30 * time.Second,
 		RefreshWorkers: 4,
 		RefreshBatch:   256,
 	}
@@ -83,6 +85,9 @@ func (m *MatrixConfig) validate(ctx context.Context) error {
 	}
 	if m.LeaseDuration <= 0 {
 		return fmt.Errorf("lease duration %v must be positive", m.LeaseDuration)
+	}
+	if m.SweepInterval <= 0 {
+		return fmt.Errorf("sweep interval %v must be positive", m.SweepInterval)
 	}
 	if m.RefreshWorkers < 1 {
 		return fmt.Errorf("refresh workers %d must be >= 1", m.RefreshWorkers)

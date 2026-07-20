@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/control"
@@ -215,6 +216,7 @@ type areaResponse struct {
 	UpdatedAt        string          `json:"updatedAt"`
 	Name             string          `json:"name"`
 	WarmStrategy     string          `json:"warmStrategy"`
+	DemandIdleTTL    string          `json:"demandIdleTTL"`
 	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
 	Cells            []string        `json:"cells,omitempty"`
 	ID               int64           `json:"id"`
@@ -233,6 +235,7 @@ func toAreaResponse(a *beeline.Area, includeGeometry bool) areaResponse {
 		MaxRadiusMeters:  a.MaxRadiusMeters,
 		CoreRadiusMeters: a.CoreRadiusMeters,
 		WarmStrategy:     string(a.WarmStrategy),
+		DemandIdleTTL:    a.DemandIdleTTL.String(),
 		CellCount:        len(a.Cells),
 		Enabled:          a.Enabled,
 		CreatedAt:        a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
@@ -272,6 +275,7 @@ func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 type createAreaRequest struct {
 	Name             string          `json:"name"`
 	WarmStrategy     string          `json:"warmStrategy"`
+	DemandIdleTTL    string          `json:"demandIdleTTL"`
 	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
 	Cells            []string        `json:"cells,omitempty"`
 	Resolution       int             `json:"resolution"`
@@ -293,12 +297,19 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			return
 		}
 
+		ttl, err := parseDuration(req.DemandIdleTTL)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid demandIdleTTL: "+err.Error())
+			return
+		}
+
 		area, err := deps.Coordinator.Create(r.Context(), &control.CreateAreaInput{
 			Name:             req.Name,
 			Resolution:       req.Resolution,
 			MaxRadiusMeters:  req.MaxRadiusMeters,
 			CoreRadiusMeters: req.CoreRadiusMeters,
 			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
+			DemandIdleTTL:    ttl,
 			GeoJSON:          req.GeoJSON,
 			Cells:            cells,
 		})
@@ -333,6 +344,7 @@ func areaGetHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request
 type updateAreaRequest struct {
 	Name             string  `json:"name"`
 	WarmStrategy     string  `json:"warmStrategy"`
+	DemandIdleTTL    string  `json:"demandIdleTTL"`
 	Resolution       int     `json:"resolution"`
 	MaxRadiusMeters  float64 `json:"maxRadiusMeters"`
 	CoreRadiusMeters float64 `json:"coreRadiusMeters"`
@@ -351,12 +363,19 @@ func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Requ
 			return
 		}
 
+		ttl, err := parseDuration(req.DemandIdleTTL)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid demandIdleTTL: "+err.Error())
+			return
+		}
+
 		area, err := deps.Coordinator.Update(r.Context(), id, control.UpdateAreaInput{
 			Name:             req.Name,
 			Resolution:       req.Resolution,
 			MaxRadiusMeters:  req.MaxRadiusMeters,
 			CoreRadiusMeters: req.CoreRadiusMeters,
 			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
+			DemandIdleTTL:    ttl,
 		})
 		if err != nil {
 			writeAreaError(w, logger, err)
@@ -569,6 +588,27 @@ func cellStrings(cells []beeline.H3Cell) []string {
 	}
 
 	return out
+}
+
+// parseDuration parses a Go duration string (e.g. "1h", "30m") for the demand-idle
+// TTL. An empty string means 0 — decay disabled — so the field is optional. A negative
+// duration is rejected here so a bad value surfaces as a 400 rather than deep in the
+// control plane.
+func parseDuration(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, errors.New("must not be negative")
+	}
+
+	return d, nil
 }
 
 // parseAreaID parses a positive area id from a query-string value.

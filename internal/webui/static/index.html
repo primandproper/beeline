@@ -61,6 +61,11 @@
           </div>
         </div>
         <div class="field">
+          <label for="new-ttl">Demand idle TTL</label>
+          <input type="text" id="new-ttl" class="text" placeholder="e.g. 1h (blank = never decay)" />
+          <div class="hint">Demand-filled pairs unqueried for this long are evicted. Blank / 0 disables decay.</div>
+        </div>
+        <div class="field">
           <label for="new-geojson">GeoJSON polygon</label>
           <input type="file" id="new-geojson" accept=".json,.geojson,application/geo+json,application/json" />
           <div class="hint">Upload a Polygon / MultiPolygon (Feature or FeatureCollection). Or leave empty and add hexes by hand.</div>
@@ -84,6 +89,7 @@
           <div><span class="dk">resolution</span><span class="dv" id="detail-res">—</span></div>
           <div><span class="dk">max radius</span><span class="dv" id="detail-radius">—</span></div>
           <div><span class="dk">warm</span><span class="dv" id="detail-strategy">—</span></div>
+          <div><span class="dk">demand TTL</span><span class="dv" id="detail-ttl">—</span></div>
           <div><span class="dk">cells</span><span class="dv" id="detail-cells">—</span></div>
         </div>
         <div class="btn-row">

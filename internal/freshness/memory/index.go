@@ -18,7 +18,9 @@ import (
 type entry struct {
 	computedAt time.Time // zero value means never computed
 	leaseUntil time.Time // a key is claimable when now >= leaseUntil
+	lastAccess time.Time // last time a query touched this pair (Access/Bump); drives decay
 	bumped     bool      // demand-driven priority (stale-while-revalidate)
+	pinned     bool      // eager-core pair; never evicted by the demand-decay sweep
 }
 
 // baseline is the per-area achieved-throughput baseline: how many refreshes have
@@ -58,10 +60,12 @@ func New(targetTTL time.Duration, clock func() time.Time) *Index {
 	}
 }
 
-// Seed adds keys to the working set as never-computed (maximally stale). Existing
-// keys are left untouched so re-seeding is idempotent. The achieved-throughput
-// baseline for every area present in the batch is reset to now, so a freshly enabled
-// (or re-converged) area's load progress reads from zero.
+// Seed adds keys to the working set as never-computed (maximally stale) and pinned,
+// so the eager core they represent is never evicted by the demand-decay sweep.
+// Existing keys are left untouched so re-seeding is idempotent (a demand pair that was
+// later promoted into the seed set keeps its state). The achieved-throughput baseline
+// for every area present in the batch is reset to now, so a freshly enabled (or
+// re-converged) area's load progress reads from zero.
 func (i *Index) Seed(_ context.Context, keys []beeline.PairKey) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -69,9 +73,32 @@ func (i *Index) Seed(_ context.Context, keys []beeline.PairKey) error {
 	now := i.now()
 	for pos := range keys {
 		if _, ok := i.entries[keys[pos]]; !ok {
-			i.entries[keys[pos]] = &entry{}
+			i.entries[keys[pos]] = &entry{pinned: true}
 		}
 		i.baselines[keys[pos].Area] = &baseline{started: now}
+	}
+
+	return nil
+}
+
+// Access records that a pair was queried (demand-fill or a fresh cache hit): it adds
+// unknown keys to the working set as unpinned demand entries and stamps every key's
+// last-access time, so actively-queried pairs stay alive against Sweep. Unlike Bump it
+// does not raise refresh priority — a fresh-but-queried pair should not be re-refreshed
+// early. It never resets a per-area baseline, so demand traffic does not disturb the
+// area's throughput accounting.
+func (i *Index) Access(_ context.Context, keys []beeline.PairKey) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	now := i.now()
+	for pos := range keys {
+		e, ok := i.entries[keys[pos]]
+		if !ok {
+			e = &entry{}
+			i.entries[keys[pos]] = e
+		}
+		e.lastAccess = now
 	}
 
 	return nil
@@ -278,9 +305,15 @@ func (i *Index) MarkComputed(_ context.Context, keys []beeline.PairKey, at time.
 		e.leaseUntil = time.Time{}
 		e.bumped = false
 		i.computedTotal++
-		if b, has := i.baselines[keys[pos].Area]; has {
-			b.computedTotal++
+		// A lazy area is never Seed-ed with keys, so it has no baseline until its first
+		// demand-filled pair is computed; establish one now so its achieved-throughput
+		// accounting starts here rather than staying blank forever.
+		b, has := i.baselines[keys[pos].Area]
+		if !has {
+			b = &baseline{started: i.now()}
+			i.baselines[keys[pos].Area] = b
 		}
+		b.computedTotal++
 	}
 
 	return nil
@@ -288,11 +321,14 @@ func (i *Index) MarkComputed(_ context.Context, keys []beeline.PairKey, at time.
 
 // Bump raises refresh priority for demand-driven pairs (stale-while-revalidate).
 // Unknown keys are added to the working set so a queried-but-unseeded pair starts
-// getting refreshed.
+// getting refreshed. A bump is also an access, so it stamps last-access time (keeping
+// the pair alive against the decay sweep); newly created keys are unpinned demand
+// entries.
 func (i *Index) Bump(_ context.Context, keys []beeline.PairKey) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
+	now := i.now()
 	for pos := range keys {
 		e, ok := i.entries[keys[pos]]
 		if !ok {
@@ -300,6 +336,7 @@ func (i *Index) Bump(_ context.Context, keys []beeline.PairKey) error {
 			i.entries[keys[pos]] = e
 		}
 		e.bumped = true
+		e.lastAccess = now
 	}
 
 	return nil

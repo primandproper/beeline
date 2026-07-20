@@ -40,12 +40,14 @@
     createSection: id("create-section"),
     newName: id("new-name"), newRes: id("new-res"), newResVal: id("new-res-val"),
     newRadius: id("new-radius"), newRadiusVal: id("new-radius-val"),
+    newStrategy: id("new-strategy"),
+    newCore: id("new-core"), newCoreVal: id("new-core-val"), newCoreField: id("new-core-field"),
     newGeoJSON: id("new-geojson"), createPreview: id("create-preview"),
     previewCells: id("preview-cells"),
     createBtn: id("create-btn"), createCancel: id("create-cancel"),
     detailSection: id("detail-section"), detailName: id("detail-name"),
     detailBadge: id("detail-badge"), detailRes: id("detail-res"),
-    detailRadius: id("detail-radius"), detailCells: id("detail-cells"),
+    detailRadius: id("detail-radius"), detailStrategy: id("detail-strategy"), detailCells: id("detail-cells"),
     toggleEnable: id("toggle-enable"), editHexes: id("edit-hexes"),
     replaceGeoJSON: id("replace-geojson"), deleteArea: id("delete-area"),
     editHint: id("edit-hint"),
@@ -192,6 +194,9 @@
     els.detailBadge.className = "badge " + (a.enabled ? "on" : "off");
     els.detailRes.textContent = a.resolution;
     els.detailRadius.textContent = a.maxRadiusMeters ? a.maxRadiusMeters.toLocaleString() + " m" : "full mesh";
+    els.detailStrategy.textContent = a.warmStrategy === "hybrid"
+      ? "hybrid (" + (a.coreRadiusMeters || 0).toLocaleString() + " m core)"
+      : (a.warmStrategy || "eager");
     els.detailCells.textContent = a.cellCount.toLocaleString();
     els.toggleEnable.textContent = a.enabled ? "Disable" : "Enable";
 
@@ -357,11 +362,14 @@
   function createArea() {
     var name = els.newName.value.trim();
     if (!name) { toast("name is required", true); return; }
+    var strategy = els.newStrategy.value;
     var body = {
       name: name,
       resolution: parseInt(els.newRes.value, 10),
       maxRadiusMeters: parseFloat(els.newRadius.value),
+      warmStrategy: strategy,
     };
+    if (strategy === "hybrid") body.coreRadiusMeters = parseFloat(els.newCore.value);
     if (pendingGeoJSON) body.geojson = pendingGeoJSON;
 
     els.createBtn.disabled = true;
@@ -553,6 +561,12 @@
     });
     els.newRadius.addEventListener("input", function () {
       els.newRadiusVal.textContent = els.newRadius.value;
+    });
+    els.newStrategy.addEventListener("change", function () {
+      els.newCoreField.hidden = els.newStrategy.value !== "hybrid";
+    });
+    els.newCore.addEventListener("input", function () {
+      els.newCoreVal.textContent = els.newCore.value;
     });
     els.toggleEnable.addEventListener("click", function () {
       if (selectedId != null) setEnabled(selectedId, !detail.enabled);

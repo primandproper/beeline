@@ -72,6 +72,120 @@ func createArea(t *testing.T, h *harness, cells []beeline.H3Cell) beeline.Area {
 	return area
 }
 
+// createAreaWith creates an area with an explicit warm strategy and bounds.
+func createAreaWith(t *testing.T, h *harness, in *control.CreateAreaInput) beeline.Area {
+	t.Helper()
+
+	area, err := h.coord.Create(context.Background(), in)
+	require.NoError(t, err)
+
+	return area
+}
+
+func TestLazyAreaSeedsNothingButRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "lazy", Resolution: testRes, MaxRadiusMeters: 3000,
+		WarmStrategy: beeline.WarmLazy, Cells: diskCells(t, 2),
+	})
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	debt, err := h.index.DebtForArea(ctx, area.ID)
+	require.NoError(t, err)
+	assert.Zero(t, debt.WorkingSet, "a lazy area seeds no pairs eagerly")
+
+	// It still routes reads, carrying the bound so the read path can demand-fill.
+	routed, ok := h.coord.Locate(beeline.LatLng{Lat: sfLat, Lng: sfLng})
+	require.True(t, ok)
+	assert.Equal(t, area.ID, routed.ID)
+	assert.InDelta(t, 3000, routed.MaxRadiusMeters, 1e-9)
+}
+
+func TestHybridSeedsCoreNotFullBound(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	cells := diskCells(t, 5) // a roomy area so the radius, not the area, clips
+
+	eager := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "eager", Resolution: testRes, MaxRadiusMeters: 6000,
+		WarmStrategy: beeline.WarmEager, Cells: cells,
+	})
+	_, err := h.coord.Enable(ctx, eager.ID)
+	require.NoError(t, err)
+
+	hybrid := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "hybrid", Resolution: testRes, MaxRadiusMeters: 6000, CoreRadiusMeters: 1500,
+		WarmStrategy: beeline.WarmHybrid, Cells: cells,
+	})
+	_, err = h.coord.Enable(ctx, hybrid.ID)
+	require.NoError(t, err)
+
+	eagerDebt, err := h.index.DebtForArea(ctx, eager.ID)
+	require.NoError(t, err)
+	hybridDebt, err := h.index.DebtForArea(ctx, hybrid.ID)
+	require.NoError(t, err)
+
+	assert.Positive(t, hybridDebt.WorkingSet, "hybrid pins its core")
+	assert.Less(t, hybridDebt.WorkingSet, eagerDebt.WorkingSet,
+		"hybrid's core (1.5km) is a subset of eager's full bound (6km)")
+}
+
+func TestValidationRejectsBadWarmConfig(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+	cells := diskCells(t, 1)
+
+	t.Run("full mesh must be eager", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
+			Name: "fm", Resolution: testRes, MaxRadiusMeters: 0,
+			WarmStrategy: beeline.WarmLazy, Cells: cells,
+		})
+		assert.Error(t, err, "full-mesh (max 0) with a non-eager strategy is rejected")
+	})
+
+	t.Run("core may not exceed max", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
+			Name: "big-core", Resolution: testRes, MaxRadiusMeters: 1000, CoreRadiusMeters: 5000,
+			WarmStrategy: beeline.WarmHybrid, Cells: cells,
+		})
+		assert.Error(t, err, "core radius greater than max radius is rejected")
+	})
+
+	t.Run("unknown strategy is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
+			Name: "weird", Resolution: testRes, MaxRadiusMeters: 1000,
+			WarmStrategy: beeline.WarmStrategy("aggressive"), Cells: cells,
+		})
+		assert.Error(t, err)
+	})
+
+	t.Run("empty strategy defaults to eager and is accepted", func(t *testing.T) {
+		t.Parallel()
+
+		area, err := h.coord.Create(ctx, &control.CreateAreaInput{
+			Name: "default", Resolution: testRes, MaxRadiusMeters: 1000, Cells: cells,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, beeline.WarmEager, area.WarmStrategy)
+	})
+}
+
 func TestCreateIsDisabledAndNotSeeded(t *testing.T) {
 	t.Parallel()
 

@@ -15,11 +15,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeRouter routes every coordinate into one area at a fixed resolution, unless
-// present is false, in which case every coordinate is out of area.
+// fakeRouter routes every coordinate into one area at a fixed resolution and travel
+// bound, unless present is false, in which case every coordinate is out of area. A
+// zero maxRadius is the full-mesh sentinel (unbounded), matching the domain contract.
 type fakeRouter struct {
 	id         beeline.AreaID
 	resolution int
+	maxRadius  float64
 	present    bool
 }
 
@@ -28,7 +30,7 @@ func (f fakeRouter) Locate(beeline.LatLng) (beeline.RoutedArea, bool) {
 		return beeline.RoutedArea{}, false
 	}
 
-	return beeline.RoutedArea{ID: f.id, Resolution: f.resolution}, true
+	return beeline.RoutedArea{ID: f.id, Resolution: f.resolution, MaxRadiusMeters: f.maxRadius}, true
 }
 
 const testArea = beeline.AreaID(1)
@@ -132,6 +134,59 @@ func TestEstimateOutOfAreaComputesButDoesNotCache(t *testing.T) {
 	assert.Equal(t, query.SourceDemand, res.Source)
 	assert.Positive(t, res.Estimate.Distance, "a coordinate outside every area is still answered")
 	assert.Zero(t, store.Len(), "an out-of-area answer is not cached")
+}
+
+func TestEstimateBeyondBoundComputesButDoesNotCache(t *testing.T) {
+	t.Parallel()
+
+	store := memstore.New()
+	index := memindex.New(time.Minute, nil)
+	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
+	// A tight 500 m bound: the ~2.2 km trip below falls outside it.
+	router := fakeRouter{id: testArea, resolution: 9, maxRadius: 500, present: true}
+	handler := query.NewHandler(store, index, engine, router, nil, time.Minute)
+
+	ctx := context.Background()
+	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194} // ~2.2 km north, beyond the bound
+
+	res, err := handler.Estimate(ctx, origin, dest, "car")
+	require.NoError(t, err)
+
+	assert.Equal(t, query.SourceDemand, res.Source)
+	assert.Positive(t, res.Estimate.Distance, "a beyond-bound trip is still answered")
+	assert.Zero(t, store.Len(), "a beyond-bound answer must not be cached")
+
+	debt, err := index.Debt(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, debt.WorkingSet, "a beyond-bound answer must not enter the working set")
+}
+
+func TestEstimateWithinBoundDemandFillIsTracked(t *testing.T) {
+	t.Parallel()
+
+	store := memstore.New()
+	index := memindex.New(time.Minute, nil)
+	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
+	// A generous 10 km bound easily contains the ~2.2 km trip.
+	router := fakeRouter{id: testArea, resolution: 9, maxRadius: 10000, present: true}
+	handler := query.NewHandler(store, index, engine, router, nil, time.Minute)
+
+	ctx := context.Background()
+	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194}
+
+	res, err := handler.Estimate(ctx, origin, dest, "car")
+	require.NoError(t, err)
+	assert.Equal(t, query.SourceDemand, res.Source)
+	assert.Equal(t, 1, store.Len(), "a within-bound miss is cached")
+
+	// The demand-filled pair must be tracked in the working set (an unseeded lazy-area
+	// pair that MarkComputed alone would have dropped), and it is marked fresh.
+	debt, err := index.Debt(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, debt.WorkingSet, "a within-bound miss enters the working set")
+	assert.Zero(t, debt.Debt, "the demand-filled pair is fresh, not debt")
 }
 
 func TestEstimateStaleHitBumps(t *testing.T) {

@@ -211,28 +211,32 @@ func cellsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 // areaResponse is the JSON shape of a configured area. Cells and GeoJSON are populated
 // only on the single-area detail view, not in list responses.
 type areaResponse struct {
-	CreatedAt       string          `json:"createdAt"`
-	UpdatedAt       string          `json:"updatedAt"`
-	Name            string          `json:"name"`
-	GeoJSON         json.RawMessage `json:"geojson,omitempty"`
-	Cells           []string        `json:"cells,omitempty"`
-	ID              int64           `json:"id"`
-	Resolution      int             `json:"resolution"`
-	MaxRadiusMeters float64         `json:"maxRadiusMeters"`
-	CellCount       int             `json:"cellCount"`
-	Enabled         bool            `json:"enabled"`
+	CreatedAt        string          `json:"createdAt"`
+	UpdatedAt        string          `json:"updatedAt"`
+	Name             string          `json:"name"`
+	WarmStrategy     string          `json:"warmStrategy"`
+	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
+	Cells            []string        `json:"cells,omitempty"`
+	ID               int64           `json:"id"`
+	Resolution       int             `json:"resolution"`
+	MaxRadiusMeters  float64         `json:"maxRadiusMeters"`
+	CoreRadiusMeters float64         `json:"coreRadiusMeters"`
+	CellCount        int             `json:"cellCount"`
+	Enabled          bool            `json:"enabled"`
 }
 
 func toAreaResponse(a *beeline.Area, includeGeometry bool) areaResponse {
 	resp := areaResponse{
-		ID:              int64(a.ID),
-		Name:            a.Name,
-		Resolution:      a.Resolution,
-		MaxRadiusMeters: a.MaxRadiusMeters,
-		CellCount:       len(a.Cells),
-		Enabled:         a.Enabled,
-		CreatedAt:       a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-		UpdatedAt:       a.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		ID:               int64(a.ID),
+		Name:             a.Name,
+		Resolution:       a.Resolution,
+		MaxRadiusMeters:  a.MaxRadiusMeters,
+		CoreRadiusMeters: a.CoreRadiusMeters,
+		WarmStrategy:     string(a.WarmStrategy),
+		CellCount:        len(a.Cells),
+		Enabled:          a.Enabled,
+		CreatedAt:        a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		UpdatedAt:        a.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 
 	if includeGeometry {
@@ -266,11 +270,13 @@ func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 // createAreaRequest is the POST /_config_/areas body. Geometry comes from either an
 // inline GeoJSON polygon (polyfilled server-side) or an explicit cell set.
 type createAreaRequest struct {
-	Name            string          `json:"name"`
-	GeoJSON         json.RawMessage `json:"geojson,omitempty"`
-	Cells           []string        `json:"cells,omitempty"`
-	Resolution      int             `json:"resolution"`
-	MaxRadiusMeters float64         `json:"maxRadiusMeters"`
+	Name             string          `json:"name"`
+	WarmStrategy     string          `json:"warmStrategy"`
+	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
+	Cells            []string        `json:"cells,omitempty"`
+	Resolution       int             `json:"resolution"`
+	MaxRadiusMeters  float64         `json:"maxRadiusMeters"`
+	CoreRadiusMeters float64         `json:"coreRadiusMeters"`
 }
 
 func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
@@ -288,11 +294,13 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		}
 
 		area, err := deps.Coordinator.Create(r.Context(), &control.CreateAreaInput{
-			Name:            req.Name,
-			Resolution:      req.Resolution,
-			MaxRadiusMeters: req.MaxRadiusMeters,
-			GeoJSON:         req.GeoJSON,
-			Cells:           cells,
+			Name:             req.Name,
+			Resolution:       req.Resolution,
+			MaxRadiusMeters:  req.MaxRadiusMeters,
+			CoreRadiusMeters: req.CoreRadiusMeters,
+			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
+			GeoJSON:          req.GeoJSON,
+			Cells:            cells,
 		})
 		if err != nil {
 			writeError(w, logger, http.StatusBadRequest, err.Error())
@@ -323,9 +331,11 @@ func areaGetHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request
 
 // updateAreaRequest is the PATCH body: an area's mutable metadata.
 type updateAreaRequest struct {
-	Name            string  `json:"name"`
-	Resolution      int     `json:"resolution"`
-	MaxRadiusMeters float64 `json:"maxRadiusMeters"`
+	Name             string  `json:"name"`
+	WarmStrategy     string  `json:"warmStrategy"`
+	Resolution       int     `json:"resolution"`
+	MaxRadiusMeters  float64 `json:"maxRadiusMeters"`
+	CoreRadiusMeters float64 `json:"coreRadiusMeters"`
 }
 
 func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
@@ -342,9 +352,11 @@ func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Requ
 		}
 
 		area, err := deps.Coordinator.Update(r.Context(), id, control.UpdateAreaInput{
-			Name:            req.Name,
-			Resolution:      req.Resolution,
-			MaxRadiusMeters: req.MaxRadiusMeters,
+			Name:             req.Name,
+			Resolution:       req.Resolution,
+			MaxRadiusMeters:  req.MaxRadiusMeters,
+			CoreRadiusMeters: req.CoreRadiusMeters,
+			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
 		})
 		if err != nil {
 			writeAreaError(w, logger, err)

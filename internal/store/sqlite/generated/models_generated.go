@@ -10,12 +10,14 @@ type AreaCells struct {
 }
 
 type Areas struct {
-	ID           int64
-	Name         string
-	Resolution   int64
-	RadiusMeters float64
-	Geojson      *string
-	Enabled      int64
-	CreatedAt    string
-	UpdatedAt    string
+	ID               int64
+	Name             string
+	Resolution       int64
+	RadiusMeters     float64
+	WarmStrategy     string
+	CoreRadiusMeters float64
+	Geojson          *string
+	Enabled          int64
+	CreatedAt        string
+	UpdatedAt        string
 }

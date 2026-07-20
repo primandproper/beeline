@@ -107,6 +107,35 @@ func TestIndexBumpPrioritizesDemand(t *testing.T) {
 	assert.Equal(t, ks[1], got[0])
 }
 
+func TestIndexAccessTracksWithoutBumping(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	idx := memory.New(time.Minute, clk.now)
+
+	ks := keys()
+	require.NoError(t, idx.Seed(ctx, ks))
+	claimed, err := idx.Claim(ctx, 10, 30*time.Second)
+	require.NoError(t, err)
+	require.NoError(t, idx.MarkComputed(ctx, claimed, clk.now()))
+
+	// Access an unseeded key: it joins the working set as a never-computed demand entry.
+	newKey := beeline.PairKey{Origin: 9, Dest: 10, Profile: "car", Res: 8}
+	require.NoError(t, idx.Access(ctx, []beeline.PairKey{newKey}))
+
+	stats, err := idx.Debt(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 4, stats.WorkingSet, "Access adds the key to the working set")
+
+	// Accessing an existing fresh key must NOT raise its refresh priority (unlike Bump),
+	// so only the never-computed newKey is due.
+	require.NoError(t, idx.Access(ctx, []beeline.PairKey{ks[0]}))
+	due, err := idx.Claim(ctx, 10, 30*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, []beeline.PairKey{newKey}, due, "Access does not bump a fresh pair")
+}
+
 func TestIndexInvalidateReenqueues(t *testing.T) {
 	t.Parallel()
 

@@ -54,26 +54,33 @@ type AreaStore interface {
 // GeoJSON is non-empty it is polyfilled to the cell set (and kept as provenance);
 // otherwise Cells is taken verbatim (possibly empty, to be filled in by hand later).
 type CreateAreaInput struct {
-	Name            string
-	GeoJSON         []byte
-	Cells           []beeline.H3Cell
-	Resolution      int
-	MaxRadiusMeters float64
+	Name             string
+	WarmStrategy     beeline.WarmStrategy
+	GeoJSON          []byte
+	Cells            []beeline.H3Cell
+	Resolution       int
+	MaxRadiusMeters  float64
+	CoreRadiusMeters float64
 }
 
 // UpdateAreaInput carries the mutable metadata of an area. Changing Resolution is
 // only allowed when the area has a GeoJSON provenance to re-polyfill from.
 type UpdateAreaInput struct {
-	Name            string
-	Resolution      int
-	MaxRadiusMeters float64
+	Name             string
+	WarmStrategy     beeline.WarmStrategy
+	Resolution       int
+	MaxRadiusMeters  float64
+	CoreRadiusMeters float64
 }
 
-// enabledArea is the in-memory routing snapshot for one enabled area: its resolution
-// and cell membership set, consulted by Locate on the read path.
+// enabledArea is the in-memory routing snapshot for one enabled area: its resolution,
+// cell membership set, and outer travel bound, consulted by Locate on the read path.
+// The bound is carried here so the read path can decide, without a store round-trip,
+// whether a demand-fill falls within the area's cacheable radius.
 type enabledArea struct {
-	cells      map[beeline.H3Cell]struct{}
-	resolution int
+	cells           map[beeline.H3Cell]struct{}
+	resolution      int
+	maxRadiusMeters float64
 }
 
 // Coordinator serializes area lifecycle operations over the repository, index, and
@@ -113,7 +120,8 @@ func (c *Coordinator) Get(ctx context.Context, id beeline.AreaID) (beeline.Area,
 // from GeoJSON (polyfill) when provided, else from the supplied cells. It does not
 // seed the index — an area does no refresh work until enabled.
 func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.Area, error) {
-	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters); err != nil {
+	strategy := normalizeStrategy(in.WarmStrategy)
+	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy); err != nil {
 		return beeline.Area{}, err
 	}
 
@@ -129,12 +137,14 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 	}
 
 	return c.repo.Create(ctx, &beeline.Area{
-		Name:            in.Name,
-		Resolution:      in.Resolution,
-		MaxRadiusMeters: in.MaxRadiusMeters,
-		Cells:           cells,
-		GeoJSON:         in.GeoJSON,
-		Enabled:         false,
+		Name:             in.Name,
+		Resolution:       in.Resolution,
+		MaxRadiusMeters:  in.MaxRadiusMeters,
+		CoreRadiusMeters: in.CoreRadiusMeters,
+		WarmStrategy:     strategy,
+		Cells:            cells,
+		GeoJSON:          in.GeoJSON,
+		Enabled:          false,
 	})
 }
 
@@ -143,7 +153,8 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 // (no GeoJSON) is rejected because its cells cannot be reprojected. If the area is
 // enabled, its working set is re-converged.
 func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in UpdateAreaInput) (beeline.Area, error) {
-	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters); err != nil {
+	strategy := normalizeStrategy(in.WarmStrategy)
+	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy); err != nil {
 		return beeline.Area{}, err
 	}
 
@@ -169,6 +180,8 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in UpdateAr
 	area.Name = in.Name
 	area.Resolution = in.Resolution
 	area.MaxRadiusMeters = in.MaxRadiusMeters
+	area.CoreRadiusMeters = in.CoreRadiusMeters
+	area.WarmStrategy = strategy
 
 	return c.persistAndConvergeLocked(ctx, &area)
 }
@@ -327,7 +340,7 @@ func (c *Coordinator) Locate(p beeline.LatLng) (beeline.RoutedArea, bool) {
 			continue
 		}
 		if _, ok := ea.cells[cell]; ok {
-			return beeline.RoutedArea{ID: id, Resolution: ea.resolution}, true
+			return beeline.RoutedArea{ID: id, Resolution: ea.resolution, MaxRadiusMeters: ea.maxRadiusMeters}, true
 		}
 	}
 
@@ -391,10 +404,14 @@ func (c *Coordinator) reloadAndConvergeLocked(ctx context.Context, id beeline.Ar
 	return area, nil
 }
 
-// seedLocked tessellates an area's cells into pairs, seeds the index, and records the
-// routing snapshot. Callers hold c.mu.
+// seedLocked seeds an area's eager pairs into the index and records the routing
+// snapshot. How much is seeded depends on the warm strategy: eager pins the whole
+// MaxRadiusMeters bound (as before), lazy seeds nothing (the working set grows purely
+// from demand), and hybrid pins only the CoreRadiusMeters near field. In every case
+// the routing snapshot records the full cell set and bound so Locate works and the
+// read path can demand-fill the (unseeded) tail. Callers hold c.mu.
 func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error {
-	pairs, err := tessellate.PairsFromCells(area.ID, area.Cells, area.Resolution, area.MaxRadiusMeters, c.profiles)
+	pairs, err := c.eagerSeedPairs(area)
 	if err != nil {
 		return err
 	}
@@ -407,9 +424,32 @@ func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error 
 	for _, cell := range area.Cells {
 		cellSet[cell] = struct{}{}
 	}
-	c.enabled[area.ID] = &enabledArea{resolution: area.Resolution, cells: cellSet}
+	c.enabled[area.ID] = &enabledArea{
+		resolution:      area.Resolution,
+		cells:           cellSet,
+		maxRadiusMeters: area.MaxRadiusMeters,
+	}
 
 	return nil
+}
+
+// eagerSeedPairs is the set of pairs to pin fresh at enable time for an area, chosen by
+// its warm strategy. lazy pins nothing; hybrid pins the core near field (and only when
+// a positive core radius is set — a zero core is an empty core, not the full-mesh
+// sentinel); eager pins the entire bound (which may itself be the full mesh).
+func (c *Coordinator) eagerSeedPairs(area *beeline.Area) ([]beeline.PairKey, error) {
+	switch area.WarmStrategy {
+	case beeline.WarmLazy:
+		return nil, nil
+	case beeline.WarmHybrid:
+		if area.CoreRadiusMeters <= 0 {
+			return nil, nil
+		}
+
+		return tessellate.PairsFromCells(area.ID, area.Cells, area.Resolution, area.CoreRadiusMeters, c.profiles)
+	default: // WarmEager
+		return tessellate.PairsFromCells(area.ID, area.Cells, area.Resolution, area.MaxRadiusMeters, c.profiles)
+	}
 }
 
 // unseedLocked removes an area's pairs and cached estimates and forgets its routing
@@ -444,10 +484,23 @@ func (c *Coordinator) convergeLocked(ctx context.Context, area *beeline.Area) er
 	return c.seedLocked(ctx, area)
 }
 
+// normalizeStrategy maps the empty (unset) strategy to the eager default, preserving
+// today's behavior for callers that don't specify one. Any other value is returned
+// unchanged for validateAreaFields to accept or reject.
+func normalizeStrategy(s beeline.WarmStrategy) beeline.WarmStrategy {
+	if s == "" {
+		return beeline.WarmEager
+	}
+
+	return s
+}
+
 // validateAreaFields rejects area metadata the tessellator or store would refuse. A
 // maxRadiusMeters of 0 is the full-mesh sentinel (every in-area pair); any positive
-// value is a travel-radius bound. Negative bounds are rejected.
-func validateAreaFields(name string, resolution int, maxRadiusMeters float64) error {
+// value is a travel-radius bound. The core radius is only meaningful for the hybrid
+// strategy and must lie within [0, max]. A full-mesh area (max == 0) must be eager,
+// since there is no bounded tail to fill on demand.
+func validateAreaFields(name string, resolution int, maxRadiusMeters, coreRadiusMeters float64, strategy beeline.WarmStrategy) error {
 	if name == "" {
 		return errors.New("control: area name is required")
 	}
@@ -456,6 +509,18 @@ func validateAreaFields(name string, resolution int, maxRadiusMeters float64) er
 	}
 	if maxRadiusMeters < 0 {
 		return fmt.Errorf("control: max radius meters %.2f must be >= 0 (0 = full mesh)", maxRadiusMeters)
+	}
+	if !strategy.Valid() {
+		return fmt.Errorf("control: unknown warm strategy %q (want eager, lazy, or hybrid)", strategy)
+	}
+	if maxRadiusMeters == 0 && strategy != beeline.WarmEager {
+		return fmt.Errorf("control: full-mesh area (maxRadiusMeters 0) must use the eager strategy, got %q", strategy)
+	}
+	if coreRadiusMeters < 0 {
+		return fmt.Errorf("control: core radius meters %.2f must be >= 0", coreRadiusMeters)
+	}
+	if maxRadiusMeters > 0 && coreRadiusMeters > maxRadiusMeters {
+		return fmt.Errorf("control: core radius meters %.2f must be <= max radius meters %.2f", coreRadiusMeters, maxRadiusMeters)
 	}
 
 	return nil

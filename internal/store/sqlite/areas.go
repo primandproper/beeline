@@ -48,13 +48,15 @@ func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area,
 
 	err := r.inTx(ctx, func(tx *sql.Tx) error {
 		id, createErr := r.queries.CreateArea(ctx, tx, &generated.CreateAreaParams{
-			Name:         a.Name,
-			Resolution:   int64(a.Resolution),
-			RadiusMeters: a.MaxRadiusMeters,
-			Geojson:      geojsonParam(a.GeoJSON),
-			Enabled:      boolToInt(a.Enabled),
-			CreatedAt:    now.Format(timeFormat),
-			UpdatedAt:    now.Format(timeFormat),
+			Name:             a.Name,
+			Resolution:       int64(a.Resolution),
+			RadiusMeters:     a.MaxRadiusMeters,
+			WarmStrategy:     string(a.WarmStrategy),
+			CoreRadiusMeters: a.CoreRadiusMeters,
+			Geojson:          geojsonParam(a.GeoJSON),
+			Enabled:          boolToInt(a.Enabled),
+			CreatedAt:        now.Format(timeFormat),
+			UpdatedAt:        now.Format(timeFormat),
 		})
 		if createErr != nil {
 			return fmt.Errorf("sqlite: inserting area: %w", createErr)
@@ -120,12 +122,14 @@ func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
 
 	return r.inTx(ctx, func(tx *sql.Tx) error {
 		if updErr := r.queries.UpdateArea(ctx, tx, &generated.UpdateAreaParams{
-			ID:           int64(a.ID),
-			Name:         a.Name,
-			Resolution:   int64(a.Resolution),
-			RadiusMeters: a.MaxRadiusMeters,
-			Geojson:      geojsonParam(a.GeoJSON),
-			UpdatedAt:    now.Format(timeFormat),
+			ID:               int64(a.ID),
+			Name:             a.Name,
+			Resolution:       int64(a.Resolution),
+			RadiusMeters:     a.MaxRadiusMeters,
+			WarmStrategy:     string(a.WarmStrategy),
+			CoreRadiusMeters: a.CoreRadiusMeters,
+			Geojson:          geojsonParam(a.GeoJSON),
+			UpdatedAt:        now.Format(timeFormat),
 		}); updErr != nil {
 			return fmt.Errorf("sqlite: updating area %d: %w", a.ID, updErr)
 		}
@@ -256,15 +260,17 @@ func convertArea(row *generated.Areas, cells []beeline.H3Cell) (beeline.Area, er
 	}
 
 	return beeline.Area{
-		ID:              beeline.AreaID(row.ID),
-		Name:            row.Name,
-		Resolution:      int(row.Resolution),
-		MaxRadiusMeters: row.RadiusMeters,
-		Cells:           cells,
-		GeoJSON:         geojson,
-		Enabled:         row.Enabled != 0,
-		CreatedAt:       created,
-		UpdatedAt:       updated,
+		ID:               beeline.AreaID(row.ID),
+		Name:             row.Name,
+		Resolution:       int(row.Resolution),
+		MaxRadiusMeters:  row.RadiusMeters,
+		CoreRadiusMeters: row.CoreRadiusMeters,
+		WarmStrategy:     beeline.WarmStrategy(row.WarmStrategy),
+		Cells:            cells,
+		GeoJSON:          geojson,
+		Enabled:          row.Enabled != 0,
+		CreatedAt:        created,
+		UpdatedAt:        updated,
 	}, nil
 }
 

@@ -45,6 +45,21 @@
             <div class="hint">Per-origin travel-radius bound. 0 = full mesh (every in-area pair).</div>
           </div>
         </div>
+        <div class="row">
+          <div class="field">
+            <label for="new-strategy">Warm strategy</label>
+            <select id="new-strategy" class="text">
+              <option value="eager">eager — pin the whole bound</option>
+              <option value="lazy">lazy — demand only</option>
+              <option value="hybrid">hybrid — pin core, fill tail</option>
+            </select>
+          </div>
+          <div class="field" id="new-core-field" hidden>
+            <label for="new-core">Core radius (m) <span class="val" id="new-core-val">1500</span></label>
+            <input type="range" id="new-core" min="0" max="20000" step="500" value="1500" />
+            <div class="hint">Hybrid only: near field pinned fresh (≤ max radius).</div>
+          </div>
+        </div>
         <div class="field">
           <label for="new-geojson">GeoJSON polygon</label>
           <input type="file" id="new-geojson" accept=".json,.geojson,application/geo+json,application/json" />
@@ -68,6 +83,7 @@
         <div class="detail-grid">
           <div><span class="dk">resolution</span><span class="dv" id="detail-res">—</span></div>
           <div><span class="dk">max radius</span><span class="dv" id="detail-radius">—</span></div>
+          <div><span class="dk">warm</span><span class="dv" id="detail-strategy">—</span></div>
           <div><span class="dk">cells</span><span class="dv" id="detail-cells">—</span></div>
         </div>
         <div class="btn-row">

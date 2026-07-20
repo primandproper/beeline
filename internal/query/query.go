@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+	"github.com/primandproper/beeline/internal/geo"
 
 	"github.com/primandproper/platform-go/v4/observability/logging"
 )
@@ -112,6 +113,10 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 			if bumpErr := h.index.Bump(ctx, []beeline.PairKey{key}); bumpErr != nil {
 				h.logger.Error("bumping stale pair", bumpErr)
 			}
+		} else if accessErr := h.index.Access(ctx, []beeline.PairKey{key}); accessErr != nil {
+			// A fresh hit is still an access: record it so an actively-queried pair
+			// survives the demand-decay sweep. Non-fatal — the value is still correct.
+			h.logger.Error("recording fresh-hit access", accessErr)
 		}
 
 		return Result{
@@ -122,10 +127,16 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 		}, nil
 	}
 
-	// Miss: compute on the true endpoints now, cache it, and let the index track it.
+	// Miss: compute on the true endpoints now. Cache it only if the destination falls
+	// within the area's travel bound; beyond the bound the pair is answered but never
+	// tracked or stored, the same treatment as an out-of-area coordinate (§ warm-set).
 	res, err := h.compute(ctx, origin, dest, profile, SourceDemand)
 	if err != nil {
 		return Result{}, err
+	}
+
+	if !withinBound(routed.MaxRadiusMeters, origin, dest) {
+		return res, nil
 	}
 
 	if putErr := h.store.Put(ctx, []beeline.Entry{{
@@ -134,11 +145,30 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 	}}); putErr != nil {
 		h.logger.Error("caching demand-filled estimate", putErr)
 	}
+	// Track the pair before marking it computed: MarkComputed ignores unknown keys, so
+	// a demand-filled pair in a lazy/hybrid-tail area must be added to the working set
+	// (as an unpinned demand entry) first, or it would be stored but never refreshed.
+	if accessErr := h.index.Access(ctx, []beeline.PairKey{key}); accessErr != nil {
+		h.logger.Error("tracking demand-filled estimate", accessErr)
+	}
 	if markErr := h.index.MarkComputed(ctx, []beeline.PairKey{key}, res.ComputedAt); markErr != nil {
 		h.logger.Error("marking demand-filled estimate computed", markErr)
 	}
 
 	return res, nil
+}
+
+// withinBound reports whether a demand-fill to dest falls inside the area's travel
+// bound and may therefore be cached. A maxRadiusMeters of 0 is the full-mesh sentinel:
+// unbounded, so every in-area query is cacheable. The distance is measured on the true
+// query coordinates with the same great-circle metric the tessellator uses to size the
+// bound, so the read path and the precompute agree on what "within radius" means.
+func withinBound(maxRadiusMeters float64, origin, dest beeline.LatLng) bool {
+	if maxRadiusMeters == 0 {
+		return true
+	}
+
+	return geo.Haversine(origin, dest) <= maxRadiusMeters
 }
 
 // compute runs a 1×1 engine call on the true coordinates and packages the result.

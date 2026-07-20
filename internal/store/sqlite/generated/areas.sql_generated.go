@@ -30,6 +30,8 @@ INSERT INTO areas (
     name,
     resolution,
     radius_meters,
+    warm_strategy,
+    core_radius_meters,
     geojson,
     enabled,
     created_at,
@@ -41,19 +43,23 @@ INSERT INTO areas (
     ?4,
     ?5,
     ?6,
-    ?7
+    ?7,
+    ?8,
+    ?9
 )
 RETURNING id
 `
 
 type CreateAreaParams struct {
-	Name         string
-	Resolution   int64
-	RadiusMeters float64
-	Geojson      *string
-	Enabled      int64
-	CreatedAt    string
-	UpdatedAt    string
+	Name             string
+	Resolution       int64
+	RadiusMeters     float64
+	WarmStrategy     string
+	CoreRadiusMeters float64
+	Geojson          *string
+	Enabled          int64
+	CreatedAt        string
+	UpdatedAt        string
 }
 
 func (q *Queries) CreateArea(ctx context.Context, db DBTX, arg *CreateAreaParams) (int64, error) {
@@ -61,6 +67,8 @@ func (q *Queries) CreateArea(ctx context.Context, db DBTX, arg *CreateAreaParams
 		arg.Name,
 		arg.Resolution,
 		arg.RadiusMeters,
+		arg.WarmStrategy,
+		arg.CoreRadiusMeters,
 		arg.Geojson,
 		arg.Enabled,
 		arg.CreatedAt,
@@ -97,6 +105,8 @@ SELECT
     name,
     resolution,
     radius_meters,
+    warm_strategy,
+    core_radius_meters,
     geojson,
     enabled,
     created_at,
@@ -113,6 +123,8 @@ func (q *Queries) GetArea(ctx context.Context, db DBTX, id int64) (*Areas, error
 		&i.Name,
 		&i.Resolution,
 		&i.RadiusMeters,
+		&i.WarmStrategy,
+		&i.CoreRadiusMeters,
 		&i.Geojson,
 		&i.Enabled,
 		&i.CreatedAt,
@@ -157,6 +169,8 @@ SELECT
     name,
     resolution,
     radius_meters,
+    warm_strategy,
+    core_radius_meters,
     geojson,
     enabled,
     created_at,
@@ -179,6 +193,8 @@ func (q *Queries) ListAreas(ctx context.Context, db DBTX) ([]*Areas, error) {
 			&i.Name,
 			&i.Resolution,
 			&i.RadiusMeters,
+			&i.WarmStrategy,
+			&i.CoreRadiusMeters,
 			&i.Geojson,
 			&i.Enabled,
 			&i.CreatedAt,
@@ -237,18 +253,22 @@ SET
     name = ?1,
     resolution = ?2,
     radius_meters = ?3,
-    geojson = ?4,
-    updated_at = ?5
-WHERE id = ?6
+    warm_strategy = ?4,
+    core_radius_meters = ?5,
+    geojson = ?6,
+    updated_at = ?7
+WHERE id = ?8
 `
 
 type UpdateAreaParams struct {
-	Name         string
-	Resolution   int64
-	RadiusMeters float64
-	Geojson      *string
-	UpdatedAt    string
-	ID           int64
+	Name             string
+	Resolution       int64
+	RadiusMeters     float64
+	WarmStrategy     string
+	CoreRadiusMeters float64
+	Geojson          *string
+	UpdatedAt        string
+	ID               int64
 }
 
 func (q *Queries) UpdateArea(ctx context.Context, db DBTX, arg *UpdateAreaParams) error {
@@ -256,6 +276,8 @@ func (q *Queries) UpdateArea(ctx context.Context, db DBTX, arg *UpdateAreaParams
 		arg.Name,
 		arg.Resolution,
 		arg.RadiusMeters,
+		arg.WarmStrategy,
+		arg.CoreRadiusMeters,
 		arg.Geojson,
 		arg.UpdatedAt,
 		arg.ID,

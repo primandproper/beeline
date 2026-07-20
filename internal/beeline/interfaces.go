@@ -39,6 +39,11 @@ type FreshnessIndex interface {
 	Claim(ctx context.Context, limit int, lease time.Duration) ([]PairKey, error)
 	MarkComputed(ctx context.Context, keys []PairKey, at time.Time) error
 	Bump(ctx context.Context, keys []PairKey) error // demand-driven priority
+	// Access records that a pair was queried: it adds unknown keys to the working set
+	// (unpinned, so they are eligible to decay) and stamps their last-access time,
+	// without raising refresh priority the way Bump does. It is the demand-fill and
+	// fresh-hit signal that keeps actively-queried pairs alive against the sweep.
+	Access(ctx context.Context, keys []PairKey) error
 	Invalidate(ctx context.Context, sel Selector) error
 	Debt(ctx context.Context) (DebtStats, error)
 }

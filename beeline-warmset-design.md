@@ -1,6 +1,7 @@
 # Beeline Warm-Set Design: bounding, warm strategies, and decay
 
-**Status:** proposal / scope. Not yet implemented.
+**Status:** **Implemented** (Phases 1–3). Phase 4 (multi-resolution tiering) remains deferred —
+sketch only. See §7 for the decisions taken; the plan below is retained as the record of intent.
 **Audience:** an implementing agent starting fresh. This doc is self-contained; read
 `beeline-design.md` (esp. §3 freshness, §6 batching, §7 bounding, §9 read path) for the
 underlying model, and `CLAUDE.md` for build/test commands. Section refs (§) point into
@@ -268,14 +269,16 @@ Areas remain **database-owned**, created disabled via the control plane — none
 4. `warmStrategy` default `eager` (preserves today's behavior for existing/demo areas).
 5. Access signal for decay is queries only (demand-fill + hits), never refresh.
 
-**Open (get a human call, or pick and note it):**
-1. Existing-row DB migration: convert `radius_rings`→meters, or drop/recreate? (No real data yet ⇒
-   recreate is probably fine.)
-2. `Bump`-reuse vs dedicated `Access`/`Touch` for the decay clock (recommend dedicated).
-3. Where the janitor lives — refresh worker tick vs. dedicated goroutine.
-4. Field naming: `RadiusMeters` vs `MaxRadiusMeters` once `CoreRadiusMeters` exists (recommend
-   `MaxRadiusMeters` for symmetry).
-5. Miles vs meters at the API/console boundary — store meters, but does the UI collect miles?
+**Open (get a human call, or pick and note it):** — all resolved during implementation:
+1. Existing-row DB migration: **recreated.** The `internal/store/sqlite` package was still untracked, so
+   migration `0001` was edited in place (no real DBs exist); the column is `radius_meters REAL`.
+2. `Bump`-reuse vs dedicated `Access`/`Touch`: **dedicated `Access`.** It tracks a pair and stamps
+   last-access without raising refresh priority; `Bump` (stale path) also stamps last-access.
+3. Where the janitor lives: **dedicated goroutine in `serve.go`** (`runSweeper`) driving
+   `control.Coordinator.SweepExpired` under the coordinator's lock, on the new `sweepInterval` config knob.
+4. Field naming: **`MaxRadiusMeters`** (+ `CoreRadiusMeters`), used from the start to avoid a rename.
+5. Miles vs meters: **meters end to end** — API, storage, and the console all use meters (the console
+   radius sliders are meters; demand-idle TTL is a Go duration string like `"1h"`).
 
 ## 8. How to validate end to end
 

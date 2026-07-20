@@ -14,7 +14,8 @@ The application is a **Cobra CLI**. Two subcommands:
 - `version` — prints build metadata to stdout.
 - `serve` — the prototype. It opens the SQLite **area store**, re-seeds the freshness index from any
   already-**enabled** service areas, runs a background refresh loop that keeps those areas' pairs
-  fresh, and serves the read path over HTTP. Service areas live in the database (not the config file),
+  fresh (plus a demand-decay janitor that evicts cold demand-filled pairs on the `sweepInterval`
+  cadence), and serves the read path over HTTP. Service areas live in the database (not the config file),
   are **disabled by default**, and only enter the working set once enabled — so a fresh database boots
   with **no areas** and nothing to refresh until the operator creates and enables one. Multiple areas
   can be enabled at once; each partitions the shared store/index by its `AreaID`. The routing engine is
@@ -28,8 +29,9 @@ HTTP endpoints (default `:8080`):
 
 - Read path — `GET /estimate?origin=lat,lng&dest=lat,lng&profile=car`. Routes the origin to the
   enabled area that contains it (cache hit, same-cell correction, or demand-fill against that area's
-  partition/resolution); a coordinate outside every enabled area is still answered directly but not
-  cached.
+  partition/resolution); a demand-fill is only cached when the trip is within the area's
+  `maxRadiusMeters` bound. A coordinate outside every enabled area — or a trip beyond the bound — is
+  still answered directly but not cached.
 - Freshness/progress — `GET /_ops_/freshness` (the §3 debt/throughput contract as JSON, wire shape of
   `beeline.DebtStats`; aggregate across enabled areas, or one area with `?area=<id>`) and
   `GET /_ops_/cells` (per-origin-cell freshness rollup — `cell`/`area`/center/`total`/`fresh`/
@@ -61,8 +63,10 @@ HTTP endpoints (default `:8080`):
   and then overlays the same environment variables. `Render` goes the other way: it validates typed
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
-  `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs. Service
-  areas are no longer configured here — they live in the database (`internal/store/sqlite`).
+  `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs (`targetTTL`,
+  `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch). Service areas
+  — including their per-area warm strategy, radius bound, and demand-idle TTL — are not configured here;
+  they live in the database (`internal/store/sqlite`).
 
 ### Matrix service packages (design §5 seams)
 
@@ -75,25 +79,33 @@ HTTP endpoints (default `:8080`):
   a real engine in behind the interface without touching callers.
 - `internal/tessellate/` — turns an area's geometry into its pair set: `CellsFromGeoJSON` polyfills an
   uploaded polygon via `h3.PolygonToCells` (§7); `PairsFromCells` builds the directed, `AreaID`-tagged
-  pair set from an explicit cell set + travel-radius rings. Roadless cells (water, private land) are
-  carved out by hand from the console, not by an automated mask.
+  pair set from an explicit cell set + a **travel-radius bound in meters** (`RingsForRadius` converts it
+  to an H3 ring count empirically via `geo.Haversine`; `radiusMeters == 0` is the full-mesh sentinel).
+  Roadless cells (water, private land) are carved out by hand from the console, not by an automated mask.
 - `internal/store/memory/` — in-memory `Store` (map + RWMutex); `DeleteArea` drops one area's estimates.
 - `internal/store/sqlite/` — the persistent **area store** (`modernc.org/sqlite`, pure-Go): a
   `Repository` over sqlc-generated queries (`generated/`, regenerate with `make sqlc`) and embedded
-  goose migrations (`migrations/`). Stores area definitions (name, resolution, radius rings, cell set,
-  GeoJSON, enabled flag) — not the computed matrix.
+  goose migrations (`migrations/`). Stores area definitions (name, resolution, `radius_meters`,
+  `warm_strategy`, `core_radius_meters`, `demand_idle_ttl_seconds`, cell set, GeoJSON, enabled flag) —
+  not the computed matrix.
 - `internal/freshness/memory/` — in-memory `FreshnessIndex`: leased queue (`Claim`/`MarkComputed`,
-  §8), demand `Bump`, the `Debt` signals (§3), and per-area `Seed`/`Unseed` + `DebtForArea`/
+  §8), demand `Bump`, the query-access signal `Access` (tracks a pair + stamps last-access without
+  raising refresh priority), per-area demand decay `SweepArea` (evicts unpinned, unqueried pairs; `Seed`
+  pins the eager core), the `Debt` signals (§3), and per-area `Seed`/`Unseed` + `DebtForArea`/
   `CellStatesForArea` (each area keeps its own throughput baseline). Clock is injectable for tests.
 - `internal/refresh/` — the worker+engine pool (§4): claim stalest → dense origin-centric 1×K table
   request → write → mark computed. Claims span all enabled areas from the shared index.
 - `internal/query/` — the read path (§9): resolves the origin to its enabled area via the `AreaRouter`
   seam, then keys the lookup against that area's partition/resolution (cache hit, same-cell correction,
-  demand-fill). Out-of-area coordinates are computed but not cached.
+  demand-fill). A demand-fill is cached and tracked only when the trip falls within the area's
+  `MaxRadiusMeters` bound (measured with `geo.Haversine`); beyond the bound — like an out-of-area
+  coordinate — it is computed but not cached.
 - `internal/control/` — the multi-area control plane. A `Coordinator` (backed by the SQLite
   `AreasRepository`) owns the enabled-area set and, on `Enable`/`Disable`/`AddCells`/`SetGeoJSON`/…,
   drives per-area seed/unseed over the `AreaIndex`/`AreaStore` seams while the refresh pool keeps
-  running. It also implements `query.AreaRouter` (`Locate`). `serve.go` calls `ResumeEnabled` at boot.
+  running. `Enable` seeds by warm strategy (eager pins the whole bound, lazy nothing, hybrid the core);
+  `SweepExpired` (driven by a janitor goroutine in `serve.go`) evicts cold demand pairs per area. It
+  also implements `query.AreaRouter` (`Locate`). `serve.go` calls `ResumeEnabled` at boot.
 - `internal/httpapi/` — HTTP routes registered on the platform-go chi router (read path, freshness,
   cells, the `/_config_/areas` registry, health). `{areaID}` params via the router's param manager.
 - `internal/webui/` — the embedded single-page operator console (`go:embed static`): Leaflet + h3-js

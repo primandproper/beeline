@@ -393,8 +393,8 @@ func (c *Coordinator) SweepExpired(ctx context.Context, now time.Time) (int, err
 		if len(removed) == 0 {
 			continue
 		}
-		if err := c.store.Delete(ctx, removed); err != nil {
-			return swept, err
+		if delErr := c.store.Delete(ctx, removed); delErr != nil {
+			return swept, delErr
 		}
 		swept += len(removed)
 	}

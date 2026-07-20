@@ -69,14 +69,14 @@ func TestSeed(t *testing.T) {
 	})
 }
 
-// resDisk returns the res-9 GridDisk of radius r around San Francisco, plus its
-// center cell, for the meters-bound tests.
-func resDisk(t *testing.T, res, r int) (beeline.H3Cell, []beeline.H3Cell) {
+// resDisk returns the GridDisk of radius r around San Francisco at the given
+// resolution, plus its center cell, for the meters-bound tests.
+func resDisk(t *testing.T, res, r int) (center beeline.H3Cell, cells []beeline.H3Cell) {
 	t.Helper()
 
 	center, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, res)
 	require.NoError(t, err)
-	cells, err := h3.GridDisk(center, r)
+	cells, err = h3.GridDisk(center, r)
 	require.NoError(t, err)
 
 	return center, cells
@@ -85,8 +85,8 @@ func resDisk(t *testing.T, res, r int) (beeline.H3Cell, []beeline.H3Cell) {
 func TestRingsForRadius(t *testing.T) {
 	t.Parallel()
 
-	center, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, 9)
-	require.NoError(t, err)
+	center, centerErr := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, 9)
+	require.NoError(t, centerErr)
 
 	t.Run("a non-positive radius is zero rings (origin only)", func(t *testing.T) {
 		t.Parallel()

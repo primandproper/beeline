@@ -66,9 +66,11 @@ one.
 Everything the console does is a plain HTTP call — drive it with curl too:
 
 ```bash
-# create an area from a GeoJSON polygon (starts disabled), then enable it
+# create an area from a GeoJSON polygon (starts disabled), then enable it.
+# maxRadiusMeters is the per-origin travel-radius bound (0 = full mesh); warmStrategy
+# is eager | lazy | hybrid; demandIdleTTL evicts cold demand-filled pairs (blank = never).
 curl -sX POST localhost:8080/_config_/areas -H content-type:application/json -d '{
-  "name":"downtown","resolution":8,"radiusRings":2,
+  "name":"downtown","resolution":8,"maxRadiusMeters":3000,"warmStrategy":"hybrid","coreRadiusMeters":1500,"demandIdleTTL":"1h",
   "geojson":{"type":"Polygon","coordinates":[[[-98.05,30.32],[-97.99,30.32],[-97.99,30.37],[-98.05,30.37],[-98.05,30.32]]]}}'
 curl -sX POST localhost:8080/_config_/areas/1/enable
 

@@ -62,6 +62,24 @@ func (s *Store) Reset() {
 	s.data = make(map[beeline.PairKey]beeline.Stored)
 }
 
+// DeleteArea drops every stored estimate belonging to one service area, leaving
+// other areas untouched. The control plane calls it when an area is disabled (or its
+// geometry changes) so the shared store keeps only enabled areas' cached values. The
+// prototype scans the map, which is fine because disable is a rare, operator-driven
+// event; a production store would key by area or maintain a secondary index.
+func (s *Store) DeleteArea(_ context.Context, area beeline.AreaID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for k := range s.data {
+		if k.Area == area {
+			delete(s.data, k)
+		}
+	}
+
+	return nil
+}
+
 // Len reports how many pairs are currently stored (useful for tests and metrics).
 func (s *Store) Len() int {
 	s.mu.RLock()

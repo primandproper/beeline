@@ -12,27 +12,33 @@ See `beeline-design.md` for the full design; section references (§) below point
 The application is a **Cobra CLI**. Two subcommands:
 
 - `version` — prints build metadata to stdout.
-- `serve` — the prototype. It tessellates the configured service area into H3 cells, seeds a
-  freshness index with the origin→destination pair set, runs a background refresh loop that keeps
-  those pairs fresh, and serves the read path over HTTP. The routing engine is a **Haversine**
-  stand-in (great-circle distance ÷ per-profile speed) behind the same `RoutingEngine` interface a
-  real engine (OSRM/Valhalla) would implement — so the whole pipeline runs with no external routing
-  dependency. Store and freshness index are in-memory for the single-node prototype. `serve` also
-  serves an **embedded operator console** at `/` (see `internal/webui/`) for drawing the service area
-  and watching the cache load.
+- `serve` — the prototype. It opens the SQLite **area store**, re-seeds the freshness index from any
+  already-**enabled** service areas, runs a background refresh loop that keeps those areas' pairs
+  fresh, and serves the read path over HTTP. Service areas live in the database (not the config file),
+  are **disabled by default**, and only enter the working set once enabled — so a fresh database boots
+  with **no areas** and nothing to refresh until the operator creates and enables one. Multiple areas
+  can be enabled at once; each partitions the shared store/index by its `AreaID`. The routing engine is
+  a **Haversine** stand-in (great-circle distance ÷ per-profile speed) behind the same `RoutingEngine`
+  interface a real engine (OSRM/Valhalla) would implement. The hot store and freshness index are
+  in-memory (only area *definitions* are persisted). `serve` also serves an **embedded operator
+  console** at `/` (see `internal/webui/`) for creating areas from GeoJSON, enabling them, refining
+  hexes, and watching the cache load.
 
 HTTP endpoints (default `:8080`):
 
-- Read path — `GET /estimate?origin=lat,lng&dest=lat,lng&profile=car` (cache hit, same-cell
-  correction, or synchronous demand-fill).
-- Freshness/progress — `GET /_ops_/freshness` (the §3 debt/throughput contract as JSON; camelCase
-  keys, the wire shape of `beeline.DebtStats`) and `GET /_ops_/cells` (per-origin-cell freshness
-  rollup — cell id, center, `total`/`fresh`/`oldestAgeSeconds` — that paints the console's progress
-  map).
-- Control plane — `GET /_config_/area` (current area + derived cell/pair counts) and
-  `POST /_config_/area` (`{lat,lng,resolution,areaRings,radiusRings}` → re-tessellate and re-seed the
-  index/store at runtime). Both are served by `internal/control`. Unauthenticated, like the other
-  endpoints; a real deploy would gate the `POST`.
+- Read path — `GET /estimate?origin=lat,lng&dest=lat,lng&profile=car`. Routes the origin to the
+  enabled area that contains it (cache hit, same-cell correction, or demand-fill against that area's
+  partition/resolution); a coordinate outside every enabled area is still answered directly but not
+  cached.
+- Freshness/progress — `GET /_ops_/freshness` (the §3 debt/throughput contract as JSON, wire shape of
+  `beeline.DebtStats`; aggregate across enabled areas, or one area with `?area=<id>`) and
+  `GET /_ops_/cells` (per-origin-cell freshness rollup — `cell`/`area`/center/`total`/`fresh`/
+  `oldestAgeSeconds` — for one area with `?area=<id>` or all enabled areas otherwise).
+- Control plane — the area registry under `/_config_/areas`, served by `internal/control` over the
+  SQLite store: `GET` (list) / `POST` (create disabled, from a GeoJSON polygon or explicit cells);
+  `GET`/`PATCH`/`DELETE /_config_/areas/{areaID}`; `POST …/{areaID}/enable` + `…/disable`;
+  `PUT …/{areaID}/geojson` (replace geometry); `POST …/{areaID}/cells` (`{add,remove}` hex
+  refinement). Unauthenticated, like the other endpoints; a real deploy would gate these.
 - Health — `/_ops_/live` + `/_ops_/ready`.
 - UI — `GET /` (the embedded console) and `/assets/*` (its bundled JS/CSS + vendored Leaflet/h3-js).
 
@@ -55,38 +61,46 @@ HTTP endpoints (default `:8080`):
   and then overlays the same environment variables. `Render` goes the other way: it validates typed
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
-  `matrix`): HTTP server, service-area/tessellation, profiles+speeds, and freshness knobs.
+  `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs. Service
+  areas are no longer configured here — they live in the database (`internal/store/sqlite`).
 
 ### Matrix service packages (design §5 seams)
 
 - `internal/beeline/` — domain model and the three pluggable interfaces: `RoutingEngine`, `Store`,
-  `FreshnessIndex` (§5). Core types (`PairKey`, `Estimate`, `Stored`, `DebtStats`, …) and cell
-  helpers (`Center`, `CellAt`). `H3Cell` aliases `h3.Cell`.
+  `FreshnessIndex` (§5). Core types (`Area`, `AreaID`, `PairKey` — keyed by `Area` — `Estimate`,
+  `Stored`, `DebtStats`, `RoutedArea`, …) and cell helpers (`Center`, `CellAt`). `H3Cell` aliases
+  `h3.Cell`.
 - `internal/geo/` — pure `Haversine(a, b)` great-circle distance.
 - `internal/engine/haversine/` — `RoutingEngine` implemented as Haversine ÷ per-profile speed. Swap
   a real engine in behind the interface without touching callers.
-- `internal/tessellate/` — seeds the pair set from a center cell + ring counts (`h3.GridDisk`), the
-  travel-radius-bounded stand-in for the design's GeoJSON polyfill (§7).
-- `internal/store/memory/` — in-memory `Store` (map + RWMutex).
+- `internal/tessellate/` — turns an area's geometry into its pair set: `CellsFromGeoJSON` polyfills an
+  uploaded polygon via `h3.PolygonToCells` (§7); `PairsFromCells` builds the directed, `AreaID`-tagged
+  pair set from an explicit cell set + travel-radius rings. Roadless cells (water, private land) are
+  carved out by hand from the console, not by an automated mask.
+- `internal/store/memory/` — in-memory `Store` (map + RWMutex); `DeleteArea` drops one area's estimates.
+- `internal/store/sqlite/` — the persistent **area store** (`modernc.org/sqlite`, pure-Go): a
+  `Repository` over sqlc-generated queries (`generated/`, regenerate with `make sqlc`) and embedded
+  goose migrations (`migrations/`). Stores area definitions (name, resolution, radius rings, cell set,
+  GeoJSON, enabled flag) — not the computed matrix.
 - `internal/freshness/memory/` — in-memory `FreshnessIndex`: leased queue (`Claim`/`MarkComputed`,
-  §8), demand `Bump` (stale-while-revalidate), and the `Debt` signals (§3). Clock is injectable for
-  tests.
+  §8), demand `Bump`, the `Debt` signals (§3), and per-area `Seed`/`Unseed` + `DebtForArea`/
+  `CellStatesForArea` (each area keeps its own throughput baseline). Clock is injectable for tests.
 - `internal/refresh/` — the worker+engine pool (§4): claim stalest → dense origin-centric 1×K table
-  request → write → mark computed. Idle-backs-off when caught up.
-- `internal/query/` — the read path (§9): cache hit (stale-while-revalidate), same-cell correction,
-  synchronous demand-fill on a miss. `Handler.resolution` is held atomically so the control plane can
-  swap it on a runtime re-tessellation.
-- `internal/control/` — the runtime control plane. A `Coordinator` owns the mutable service `Area`
-  and, on `Apply`, re-tessellates and swaps it in over three narrow seams (`Cache.Reset`,
-  `Reseeder.Reseed`+`CellStates`, `Resolver.SetResolution`) while the refresh pool keeps running.
-  `serve.go` seeds the initial area through it (replacing the old boot-time tessellate→Seed path).
+  request → write → mark computed. Claims span all enabled areas from the shared index.
+- `internal/query/` — the read path (§9): resolves the origin to its enabled area via the `AreaRouter`
+  seam, then keys the lookup against that area's partition/resolution (cache hit, same-cell correction,
+  demand-fill). Out-of-area coordinates are computed but not cached.
+- `internal/control/` — the multi-area control plane. A `Coordinator` (backed by the SQLite
+  `AreasRepository`) owns the enabled-area set and, on `Enable`/`Disable`/`AddCells`/`SetGeoJSON`/…,
+  drives per-area seed/unseed over the `AreaIndex`/`AreaStore` seams while the refresh pool keeps
+  running. It also implements `query.AreaRouter` (`Locate`). `serve.go` calls `ResumeEnabled` at boot.
 - `internal/httpapi/` — HTTP routes registered on the platform-go chi router (read path, freshness,
-  cells, control plane, health).
+  cells, the `/_config_/areas` registry, health). `{areaID}` params via the router's param manager.
 - `internal/webui/` — the embedded single-page operator console (`go:embed static`): Leaflet + h3-js
-  (vendored under `static/assets/vendor/`, no CDN or build step). Configure the boundary/tessellation
-  with a live client-side H3 preview, `POST /_config_/area` to rebuild, and watch the load via
-  `/_ops_/freshness` (aggregate bar) + `/_ops_/cells` (per-cell overlay). Map tiles come from OSM, so
-  the basemap needs internet at runtime; cells/markers still render offline.
+  (vendored under `static/assets/vendor/`, no CDN or build step). List/enable/disable areas, create one
+  from an uploaded GeoJSON polygon (client-side polyfill preview), refine hexes by clicking the map,
+  and watch a selected area's load via `/_ops_/freshness?area` + `/_ops_/cells?area`. Map tiles come
+  from OSM, so the basemap needs internet at runtime; cells/markers still render offline.
 - `version/` — build metadata (`CommitHash`/`BuildTime`/`CommitTime`), injected via `-ldflags` by
   `scripts/build.sh`.
 
@@ -95,9 +109,11 @@ HTTP endpoints (default `:8080`):
 ```bash
 make setup          # Create artifacts dir + download the module cache
 make configs        # Render config/<env>.json from the real Go objects in cmd/tools/codegen/configs
+make sqlc           # Regenerate internal/store/sqlite/generated from sqlc_queries + migrations (Docker)
 make build          # Compile all packages, then build artifacts/beeline with version metadata
 make run ARGS="version"   # go run the CLI with arguments
-make run ARGS="serve --config config/localdev.json"   # tessellate + refresh + serve HTTP on :8080
+make run ARGS="serve --config config/localdev.json"   # open area store + refresh + serve HTTP on :8080
+make demo           # fresh gitignored SQLite db (artifacts/demo.db) + auto-seed & enable a demo area, then serve
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
 make test           # Run tests (race detector, shuffle, failfast); excludes cmd packages

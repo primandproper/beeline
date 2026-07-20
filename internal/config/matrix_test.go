@@ -22,8 +22,7 @@ func TestMatrixConfigValidate(t *testing.T) {
 		t.Parallel()
 
 		cases := map[string]func(*MatrixConfig){
-			"bad resolution":      func(m *MatrixConfig) { m.Area.Resolution = 99 },
-			"zero radius rings":   func(m *MatrixConfig) { m.Area.RadiusRings = 0 },
+			"empty database path": func(m *MatrixConfig) { m.DatabasePath = "" },
 			"no profiles":         func(m *MatrixConfig) { m.Profiles = nil },
 			"non-positive speed":  func(m *MatrixConfig) { m.Profiles["car"] = 0 },
 			"unknown default":     func(m *MatrixConfig) { m.DefaultProfile = "hovercraft" },

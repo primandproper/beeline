@@ -106,7 +106,7 @@ flowchart TB
         q["Query handler<br/>tier fallthrough · same-cell correction"]
     end
 
-    geojson -->|"polyfill → road-mask → seed pair set"| idx
+    geojson -->|"polyfill → (hand-refine) → seed pair set"| idx
     idx -->|"Claim (SKIP LOCKED / Lua lease)"| w1
     w3 -->|Put| store
     w4 -->|MarkComputed| idx
@@ -252,13 +252,15 @@ compound because the matrix is quadratic.
   for the long tail, fine tiers for the dense near field.
 - **Road-aware tessellation.** Drop cells with no road network before building
   (spatial semi-join against OSM/Overture). Drop ~40% of cells → drop ~64% of
-  pairs. Biggest single build-cost lever.
+  pairs. Biggest single build-cost lever. (The prototype no longer ships an
+  automated road mask — operators carve out roadless cells by hand from the
+  console; a real deploy could reintroduce an automated semi-join here.)
 - **Multi-resolution tiering.** Store each point at 3 resolutions; at query time
   select the highest (finest) available tier. Balances hit rate vs accuracy and
   handles both short and long trips. (DoorDash: res ~10 fine, mid, res ~6 coarse.)
 
-Ingestion is therefore: `polyfill(geojson, res)` → optional `mask(road_layer)` →
-per resolution → seed FreshnessIndex with the resulting pair set.
+Ingestion is therefore: `polyfill(geojson, res)` → optional hand-refinement of the
+cell set → per resolution → seed FreshnessIndex with the resulting pair set.
 
 ## 8. Scaling & coordination
 
@@ -317,7 +319,6 @@ allocation proves insufficient.
 - H3 resolutions: ordered list, e.g. `[6, 8, 10]`.
 - Profiles: modes (`car`, `bike`, `walk`), optional time buckets.
 - Travel-radius bound per resolution (time or distance).
-- Optional road-mask layer (path to OSM/Overture extract).
 - `target_ttl` (the freshness target driving §3).
 - Engine adapter + endpoint(s); Store adapter; FreshnessIndex adapter.
 - Rate/cost budget per worker (and per lane: dense vs sparse).
@@ -355,5 +356,6 @@ allocation proves insufficient.
    `SKIP LOCKED`.
 5. **Horizontal scale-out.** Co-located engine per worker; shared leased queue;
    demonstrate linear debt burn-down as nodes are added.
-6. **Bounding.** Travel-radius + road-aware masking.
+6. **Bounding.** Travel-radius + hand-refined cell sets (automated road-aware
+   masking is a possible later optimization, not shipped).
 7. **Sparse/demand lane.** Stale-while-revalidate, separate rate limit.

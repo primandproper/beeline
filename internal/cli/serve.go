@@ -12,7 +12,7 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	"github.com/primandproper/beeline/internal/refresh"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
-	"github.com/primandproper/beeline/internal/tessellate"
+	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
 	"github.com/primandproper/beeline/internal/webui"
 
 	"github.com/primandproper/platform-go/v4/healthcheck"
@@ -25,10 +25,12 @@ import (
 // serveShutdownTimeout bounds how long we wait for in-flight requests to drain.
 const serveShutdownTimeout = 10 * time.Second
 
-// newServeCommand returns the `serve` subcommand: it tessellates the configured
-// service area, seeds the freshness index, starts the background refresh loop, and
-// serves the read path (`/estimate`) plus the freshness contract (`/_ops_/freshness`)
-// over HTTP. It runs until the process receives SIGINT/SIGTERM.
+// newServeCommand returns the `serve` subcommand: it opens the SQLite area store,
+// seeds the freshness index from any already-enabled areas, starts the background
+// refresh loop, and serves the read path (`/estimate`), the freshness contract
+// (`/_ops_/freshness`), and the area control plane (`/_config_/areas`) over HTTP. A
+// fresh database has no areas, so nothing refreshes until one is created and enabled.
+// It runs until the process receives SIGINT/SIGTERM.
 func (a *application) newServeCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
@@ -58,49 +60,42 @@ func (a *application) serve(ctx context.Context) error {
 	store := memstore.New()
 	index := memindex.New(mcfg.TargetTTL, nil)
 
-	// Read path.
-	handler := query.NewHandler(store, index, engine, a.logger, mcfg.Area.Resolution, mcfg.TargetTTL)
-
-	// Road mask (§7): if configured, cells with no road coverage are pruned from
-	// every tessellation. An unset path disables it (full geometric disk).
-	var mask *tessellate.Mask
-	if mcfg.RoadMaskPath != "" {
-		loaded, loadErr := tessellate.LoadMask(mcfg.RoadMaskPath)
-		if loadErr != nil {
-			return loadErr
-		}
-		mask = loaded
-		a.log().WithValues(map[string]any{
-			"path":       mcfg.RoadMaskPath,
-			"cells":      mask.Len(),
-			"resolution": mask.Resolution,
-		}).Info("road mask loaded; pruning roadless cells")
-	}
-
-	// Control plane: owns the mutable service area and re-tessellates on demand
-	// (from the web UI). The initial Apply seeds the index from the config's area,
-	// replacing the old boot-time tessellate → Seed path (§7).
-	coordinator := control.New(index, store, handler, profiles, mask)
-	summary, err := coordinator.Apply(ctx, control.Area{
-		Lat:         mcfg.Area.Lat,
-		Lng:         mcfg.Area.Lng,
-		Resolution:  mcfg.Area.Resolution,
-		AreaRings:   mcfg.Area.AreaRings,
-		RadiusRings: mcfg.Area.RadiusRings,
-	})
+	// Area store: SQLite-backed area definitions. Opening it runs migrations; a fresh
+	// database has no areas, so nothing is seeded and the refresh pool idles until an
+	// area is created and enabled via the control plane.
+	db, err := areasqlite.Open(mcfg.DatabasePath)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := db.Close(); closeErr != nil {
+			a.log().Error("closing area database", closeErr)
+		}
+	}()
+	repo := areasqlite.NewRepository(db, nil)
 
+	// Control plane: owns the enabled-area set and drives per-area seed/unseed on the
+	// shared index/store. It also routes read-path queries to the containing area.
+	coordinator := control.New(repo, index, store, profiles)
+
+	// Read path: routes each query through the coordinator to the enabled area that
+	// contains it (and its resolution).
+	handler := query.NewHandler(store, index, engine, coordinator, a.logger, mcfg.TargetTTL)
+
+	// Seed the areas that were already enabled in a prior run.
+	if err = coordinator.ResumeEnabled(ctx); err != nil {
+		return err
+	}
+
+	enabled := coordinator.EnabledAreas()
 	a.log().WithValues(map[string]any{
-		"cells":       summary.Cells,
-		"pairs":       summary.Pairs,
-		"profiles":    len(profiles),
-		"resolution":  mcfg.Area.Resolution,
-		"target_ttl":  mcfg.TargetTTL.String(),
-		"workers":     mcfg.RefreshWorkers,
-		"listen_port": mcfg.Server.Port,
-	}).Info("service area tessellated; starting refresh and HTTP server")
+		"database":      mcfg.DatabasePath,
+		"enabled_areas": len(enabled),
+		"profiles":      len(profiles),
+		"target_ttl":    mcfg.TargetTTL.String(),
+		"workers":       mcfg.RefreshWorkers,
+		"listen_port":   mcfg.Server.Port,
+	}).Info("area store opened; starting refresh and HTTP server")
 
 	// HTTP router + server, built from the observability pillars.
 	router := chirouter.NewRouter(
@@ -110,10 +105,11 @@ func (a *application) serve(ctx context.Context) error {
 		&chirouter.Config{
 			ServiceName:            a.cfg.Observability.Logging.ServiceName,
 			EnableCORSForLocalhost: true,
+			SilenceRouteLogging:    mcfg.SilenceRouteLogging,
 		},
 	)
 
-	httpapi.Register(router, httpapi.Deps{
+	httpapi.Register(router, &httpapi.Deps{
 		Handler:        handler,
 		Index:          index,
 		Coordinator:    coordinator,

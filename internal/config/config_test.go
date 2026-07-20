@@ -77,7 +77,7 @@ func TestLoadFromFile(t *testing.T) {
 	// service; this is a minimal valid matrix block the success cases can embed.
 	const matrixJSON = `"matrix":{` +
 		`"server":{"port":8080,"startupDeadline":5000000000},` +
-		`"area":{"resolution":8,"areaRings":1,"radiusRings":1},` +
+		`"databasePath":"beeline.db",` +
 		`"profiles":{"car":13.9},"defaultProfile":"car",` +
 		`"targetTTL":60000000000,"leaseDuration":30000000000,` +
 		`"refreshWorkers":1,"refreshBatch":1}`

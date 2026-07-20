@@ -34,6 +34,11 @@ go.work.sum
 # Build output
 artifacts/
 
+# SQLite area store (created at runtime by `serve`)
+*.db
+*.db-wal
+*.db-shm
+
 # Log files
 *.log
 

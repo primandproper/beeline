@@ -15,14 +15,16 @@ COVERAGE_OUT  := $(ARTIFACTS_DIR)/coverage.out
 TOTAL_PACKAGE_LIST := `go list $(THIS)/...`
 
 # CONTAINER VERSIONS
-LINTER_IMAGE     := golangci/golangci-lint:v2.10.1
-SHELLCHECK_IMAGE := koalaman/shellcheck:stable
+LINTER_IMAGE        := golangci/golangci-lint:v2.10.1
+SHELLCHECK_IMAGE    := koalaman/shellcheck:stable
+SQL_GENERATOR_IMAGE := sqlc/sqlc:1.26.0
 
 # COMMANDS
 CONTAINER_RUNNER      := docker
 RUN_CONTAINER         := $(CONTAINER_RUNNER) run --rm --volume $(PWD):$(PWD) --workdir=$(PWD) --network=host
 RUN_CONTAINER_AS_USER := $(RUN_CONTAINER) --user $(MYSELF):$(MY_GROUP)
 LINTER                := $(RUN_CONTAINER) $(LINTER_IMAGE) golangci-lint
+SQL_GENERATOR         := $(RUN_CONTAINER_AS_USER) $(SQL_GENERATOR_IMAGE)
 
 ## non-PHONY folders/files
 
@@ -104,23 +106,12 @@ lint: golang_lint shellcheck
 configs:
 	$(SCRIPTS_DIR)/configs.sh $(THIS)
 
-# mask builds the road mask (design §7) for a service area from Overture Maps and
-# writes the H3 cell set `serve` loads via BEELINE_MATRIX_ROAD_MASK_PATH. Requires
-# the duckdb CLI on PATH (`mise install` provides it). The defaults build the demo
-# Austin mask; override the MASK_* variables to build one for another area. The S3
-# pull is cached under artifacts/, so re-runs are offline unless you pass --refetch.
-MASK_LAT        ?= 30.34284460447388
-MASK_LNG        ?= -98.02736352689148
-MASK_RESOLUTION ?= 9
-MASK_AREA_RINGS ?= 14
-MASK_OUT        ?= config/masks/austin-res9.cells
-MASK_CACHE      ?= $(ARTIFACTS_DIR)/overture/austin-res9.csv
-
-.PHONY: mask
-mask:
-	mise exec -- go run $(THIS)/cmd/tools/maskgen \
-		--lat $(MASK_LAT) --lng $(MASK_LNG) --resolution $(MASK_RESOLUTION) \
-		--area-rings $(MASK_AREA_RINGS) --cache $(MASK_CACHE) --out $(MASK_OUT)
+# sqlc regenerates the typed area queries under internal/store/sqlite/generated from
+# the hand-written SQL in sqlc_queries and the schema in migrations. Edit the .sql,
+# then re-run this; commit the generated Go so it stays reviewable and in lockstep.
+.PHONY: sqlc
+sqlc:
+	$(SQL_GENERATOR) generate
 
 ## EXECUTION
 
@@ -135,6 +126,15 @@ build: $(ARTIFACTS_DIR)
 .PHONY: run
 run:
 	go run $(CMD_PACKAGE) $(ARGS)
+
+# demo runs the server against a fresh, gitignored SQLite database
+# (artifacts/demo.db) and seeds one enabled service area, so the operator console
+# shows the cache loading right away. Ctrl-C stops it. Override the port with
+# `make demo PORT=9090`.
+PORT ?= 8080
+.PHONY: demo
+demo: build
+	PORT=$(PORT) $(SCRIPTS_DIR)/demo.sh
 
 .PHONY: test
 test: $(ARTIFACTS_DIR)

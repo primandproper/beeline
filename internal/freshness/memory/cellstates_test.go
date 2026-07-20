@@ -12,47 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestIndexReseedReplacesWorkingSet(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	clk := &clock{t: time.Unix(1_700_000_000, 0)}
-	idx := memory.New(time.Minute, clk.now)
-
-	require.NoError(t, idx.Seed(ctx, keys()))
-
-	// Compute everything, then advance so achieved throughput is measurable.
-	claimed, err := idx.Claim(ctx, 10, 30*time.Second)
-	require.NoError(t, err)
-	require.NoError(t, idx.MarkComputed(ctx, claimed, clk.now()))
-
-	// Reseed with a different, smaller pair set.
-	newKeys := []beeline.PairKey{
-		{Origin: 9, Dest: 10, Profile: "bike", Res: 9},
-		{Origin: 9, Dest: 11, Profile: "bike", Res: 9},
-	}
-	require.NoError(t, idx.Reseed(ctx, newKeys))
-
-	stats, err := idx.Debt(ctx)
-	require.NoError(t, err)
-	// Only the new keys remain, all never-computed -> full debt, zero age.
-	assert.Equal(t, 2, stats.WorkingSet)
-	assert.Equal(t, 2, stats.Debt)
-	assert.Equal(t, 0.0, stats.OldestAgeSeconds)
-	assert.Equal(t, 0.0, stats.AchievedThroughput, "throughput baseline resets on reseed")
-
-	// The old keys are gone: computing them is a no-op, not a resurrection.
-	require.NoError(t, idx.MarkComputed(ctx, keys(), clk.now()))
-	stats, err = idx.Debt(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 2, stats.WorkingSet)
-
-	// The new keys are the only claimable work.
-	due, err := idx.Claim(ctx, 10, 30*time.Second)
-	require.NoError(t, err)
-	assert.Len(t, due, 2)
-}
-
 func TestIndexCellStatesRollup(t *testing.T) {
 	t.Parallel()
 

@@ -15,14 +15,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// fakeRouter routes every coordinate into one area at a fixed resolution, unless
+// present is false, in which case every coordinate is out of area.
+type fakeRouter struct {
+	id         beeline.AreaID
+	resolution int
+	present    bool
+}
+
+func (f fakeRouter) Locate(beeline.LatLng) (beeline.RoutedArea, bool) {
+	if !f.present {
+		return beeline.RoutedArea{}, false
+	}
+
+	return beeline.RoutedArea{ID: f.id, Resolution: f.resolution}, true
+}
+
+const testArea = beeline.AreaID(1)
+
 func newHandler(t *testing.T, resolution int, ttl time.Duration) (*query.Handler, *memstore.Store, *memindex.Index) {
 	t.Helper()
 
 	store := memstore.New()
 	index := memindex.New(ttl, nil)
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
+	router := fakeRouter{id: testArea, resolution: resolution, present: true}
 
-	return query.NewHandler(store, index, engine, nil, resolution, ttl), store, index
+	return query.NewHandler(store, index, engine, router, nil, ttl), store, index
 }
 
 func TestEstimateSameCellCorrection(t *testing.T) {
@@ -63,7 +82,7 @@ func TestEstimateCacheHit(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, oCell, dCell)
 
-	key := beeline.PairKey{Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
+	key := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
 		Key:    key,
 		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
@@ -96,6 +115,25 @@ func TestEstimateDemandFillOnMiss(t *testing.T) {
 	assert.Equal(t, 1, store.Len(), "a miss should be cached for next time")
 }
 
+func TestEstimateOutOfAreaComputesButDoesNotCache(t *testing.T) {
+	t.Parallel()
+
+	store := memstore.New()
+	index := memindex.New(time.Minute, nil)
+	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
+	handler := query.NewHandler(store, index, engine, fakeRouter{present: false}, nil, time.Minute)
+
+	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194}
+
+	res, err := handler.Estimate(context.Background(), origin, dest, "car")
+	require.NoError(t, err)
+
+	assert.Equal(t, query.SourceDemand, res.Source)
+	assert.Positive(t, res.Estimate.Distance, "a coordinate outside every area is still answered")
+	assert.Zero(t, store.Len(), "an out-of-area answer is not cached")
+}
+
 func TestEstimateStaleHitBumps(t *testing.T) {
 	t.Parallel()
 
@@ -110,7 +148,7 @@ func TestEstimateStaleHitBumps(t *testing.T) {
 	dCell, err := beeline.CellAt(dest, 9)
 	require.NoError(t, err)
 
-	key := beeline.PairKey{Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
+	key := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
 	require.NoError(t, index.Seed(ctx, []beeline.PairKey{key}))
 	// Mark it computed two minutes ago so it reads as stale against a 1m TTL.
 	require.NoError(t, index.MarkComputed(ctx, []beeline.PairKey{key}, time.Now().Add(-2*time.Minute)))

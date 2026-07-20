@@ -12,46 +12,92 @@
     <aside id="sidebar">
       <div class="brand">
         <h1><span class="bee">◆</span> Beeline Console</h1>
-        <p>Draw the service area, then watch the cache load.</p>
+        <p>Configure service areas, enable them, watch the cache load.</p>
       </div>
 
-      <div class="section" id="config-section">
-        <h2>Boundary &amp; tessellation</h2>
-
-        <div class="field">
-          <label>Center <span class="val" id="center-val">—</span></label>
-          <div class="coords" id="center-coords">click the map to move</div>
-          <div class="hint">Click the map or drag the marker to set the center.</div>
+      <!-- Areas list -->
+      <div class="section">
+        <div class="section-head">
+          <h2>Service areas</h2>
+          <button class="ghost" id="new-area-btn">+ New</button>
         </div>
-
-        <div class="field">
-          <label>H3 resolution <span class="val" id="res-val">8</span></label>
-          <input type="range" id="res" min="4" max="12" step="1" value="8" />
-          <div class="hint" id="res-hint"></div>
-          <div class="mask-warn" id="mask-warn" hidden></div>
+        <div id="areas-list" class="areas-list"></div>
+        <div class="empty" id="areas-empty" hidden>
+          No areas yet. Create one, then enable it to start refreshing.
         </div>
+      </div>
 
+      <!-- Create form (hidden until +New) -->
+      <div class="section" id="create-section" hidden>
+        <h2>New area</h2>
+        <div class="field">
+          <label for="new-name">Name</label>
+          <input type="text" id="new-name" class="text" placeholder="e.g. downtown" />
+        </div>
         <div class="row">
           <div class="field">
-            <label>Area rings <span class="val" id="area-rings-val">6</span></label>
-            <input type="range" id="area-rings" min="0" max="16" step="1" value="6" />
+            <label for="new-res">H3 resolution <span class="val" id="new-res-val">8</span></label>
+            <input type="range" id="new-res" min="4" max="12" step="1" value="8" />
           </div>
           <div class="field">
-            <label>Radius rings <span class="val" id="radius-rings-val">3</span></label>
-            <input type="range" id="radius-rings" min="1" max="8" step="1" value="3" />
+            <label for="new-radius">Max radius (m) <span class="val" id="new-radius-val">3000</span></label>
+            <input type="range" id="new-radius" min="0" max="20000" step="500" value="3000" />
+            <div class="hint">Per-origin travel-radius bound. 0 = full mesh (every in-area pair).</div>
           </div>
         </div>
-        <div class="hint">Area rings set how far the boundary reaches from center. Radius rings bound how far each origin routes (the travel-radius prune, §7).</div>
-
-        <div class="preview-stats">
-          <div class="stat"><span class="n" id="preview-cells">—</span><span class="k">cells</span></div>
-          <div class="stat"><span class="n" id="preview-pairs">—</span><span class="k">pairs</span></div>
+        <div class="field">
+          <label for="new-geojson">GeoJSON polygon</label>
+          <input type="file" id="new-geojson" accept=".json,.geojson,application/geo+json,application/json" />
+          <div class="hint">Upload a Polygon / MultiPolygon (Feature or FeatureCollection). Or leave empty and add hexes by hand.</div>
         </div>
-
-        <button class="apply" id="apply">Apply &amp; rebuild cache</button>
+        <div class="preview-stats" id="create-preview" hidden>
+          <div class="stat"><span class="n" id="preview-cells">—</span><span class="k">cells (preview)</span></div>
+        </div>
+        <div class="btn-row">
+          <button class="apply" id="create-btn">Create area</button>
+          <button class="ghost" id="create-cancel">Cancel</button>
+        </div>
       </div>
 
-      <div class="section">
+      <!-- Selected area detail -->
+      <div class="section" id="detail-section" hidden>
+        <div class="section-head">
+          <h2 id="detail-name">—</h2>
+          <span class="badge" id="detail-badge">disabled</span>
+        </div>
+        <div class="detail-grid">
+          <div><span class="dk">resolution</span><span class="dv" id="detail-res">—</span></div>
+          <div><span class="dk">max radius</span><span class="dv" id="detail-radius">—</span></div>
+          <div><span class="dk">cells</span><span class="dv" id="detail-cells">—</span></div>
+        </div>
+        <div class="btn-row">
+          <button class="apply" id="toggle-enable">Enable</button>
+          <button class="ghost" id="edit-hexes">Edit hexes</button>
+        </div>
+        <div class="btn-row">
+          <button class="ghost" id="exclude-region">Exclude region</button>
+        </div>
+        <div class="btn-row">
+          <label class="ghost file-btn">Replace GeoJSON
+            <input type="file" id="replace-geojson" accept=".json,.geojson,application/geo+json,application/json" hidden />
+          </label>
+          <button class="ghost danger" id="delete-area">Delete</button>
+        </div>
+        <div class="hint" id="edit-hint" hidden>Click the map: hexes inside the area toggle off, hexes outside toggle on.</div>
+
+        <!-- Subtract-region editor: trace a polygon, remove the area cells it covers. -->
+        <div class="exclude-ctl" id="exclude-ctl" hidden>
+          <div class="hint">Click the map to trace a region to exclude — its cells are removed from this area. Double-back with Undo; close with Exclude.</div>
+          <div class="btn-row">
+            <button class="apply" id="exclude-apply" disabled>Exclude 0 cells</button>
+            <button class="ghost" id="exclude-undo">Undo</button>
+            <button class="ghost" id="exclude-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Cache load (selected area) -->
+      <div class="section" id="progress-section" hidden>
         <h2>Cache load</h2>
         <div class="progress-head">
           <span class="pct" id="pct">0%</span>
@@ -73,14 +119,9 @@
         </div>
       </div>
 
-      <div class="section pill-section">
-        <h2>Profiles</h2>
-        <div class="pill-row" id="profiles"></div>
-      </div>
-
       <div class="spacer"></div>
       <div class="foot">
-        Reads: <code>GET /estimate</code> · Freshness: <code>/_ops_/freshness</code>
+        Areas: <code>/_config_/areas</code> · Reads: <code>GET /estimate</code>
       </div>
     </aside>
 

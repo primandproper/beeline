@@ -1,27 +1,35 @@
 // Package tessellate turns a service area into the set of origin→destination pairs
 // the freshness index must keep fresh. It stands in for the design's ingestion path
-// (§7: polyfill → road-mask → seed pair set). To stay dependency-light the prototype
-// seeds the area from a center cell and a ring count rather than a GeoJSON polygon;
-// swapping in h3.PolygonToCells over real geometry is the natural extension.
+// (§7: polyfill → seed pair set). An area's cells come either from polyfilling an
+// uploaded GeoJSON polygon (CellsFromGeoJSON) or from a center cell and a ring count
+// (Seed); either way PairsFromCells derives the directed pair set. Operators refine
+// the cell set by hand (add/remove hexes) to carve out water or anywhere else that
+// should not be covered.
 package tessellate
 
 import (
 	"fmt"
 
 	"github.com/primandproper/beeline/internal/beeline"
+	"github.com/primandproper/beeline/internal/geo"
 
 	"github.com/uber/h3-go/v4"
 )
 
+// maxRings caps the empirical meters→rings search so a pathological bound can't spin
+// the grow loop forever. A res-0 cell spans thousands of km, so even a global bound
+// resolves in a handful of rings; this is a safety backstop, not an operational limit.
+const maxRings = 10000
+
 // Area describes the service area and the pruning that keeps the pair set from
 // being quadratic (§7). The area is every cell within AreaRings of the center; for
-// each origin, destinations are only those within RadiusRings (the travel-radius
-// bound) that are also inside the area.
+// each origin, destinations are only those within MaxRadiusMeters (the travel-radius
+// bound, in meters) that are also inside the area.
 type Area struct {
-	Center      beeline.LatLng
-	Resolution  int
-	AreaRings   int
-	RadiusRings int
+	Center          beeline.LatLng
+	Resolution      int
+	AreaRings       int
+	MaxRadiusMeters float64
 }
 
 // Result is the output of tessellation: the cells covering the area and the
@@ -34,13 +42,7 @@ type Result struct {
 // Seed builds the pair set for the area across the given profiles. Origin-centric:
 // each origin contributes a dense ring of nearby destinations (§6), which is the
 // shape the refresh worker packs into a single 1×K table request.
-//
-// mask is the optional road-mask (§7): when non-nil, cells the operator's road
-// layer does not cover are dropped before pairs are built, so roadless cells
-// (ocean, open water) never enter the working set. The mask answers at any area
-// resolution through the H3 hierarchy (see Mask.Allows), so a runtime resolution
-// change still prunes; a nil mask keeps every cell.
-func Seed(area Area, profiles []beeline.Profile, mask *Mask) (Result, error) {
+func Seed(area Area, profiles []beeline.Profile) (Result, error) {
 	if area.Resolution < 0 || area.Resolution > 15 {
 		return Result{}, fmt.Errorf("tessellate: resolution %d out of range [0,15]", area.Resolution)
 	}
@@ -58,17 +60,38 @@ func Seed(area Area, profiles []beeline.Profile, mask *Mask) (Result, error) {
 		return Result{}, fmt.Errorf("tessellate: covering area: %w", err)
 	}
 
-	// Road-aware pruning (§7): keep only cells the mask says have roads. The mask
-	// answers at the area's resolution via the H3 hierarchy, so this holds even when
-	// the console re-tessellates at a resolution other than the mask's.
-	if mask != nil {
-		kept := make([]beeline.H3Cell, 0, len(cells))
-		for _, c := range cells {
-			if mask.Allows(c, area.Resolution) {
-				kept = append(kept, c)
-			}
-		}
-		cells = kept
+	pairs, err := PairsFromCells(0, cells, area.Resolution, area.MaxRadiusMeters, profiles)
+	if err != nil {
+		return Result{}, err
+	}
+
+	return Result{Cells: cells, Pairs: pairs}, nil
+}
+
+// PairsFromCells builds the directed origin→destination pair set for an explicit set
+// of area cells, tagging every pair with the given service area. This is the
+// area-agnostic half of tessellation: whatever produced the cell set (a ring disk, a
+// GeoJSON polyfill, or manual hex editing), the pair set is derived the same way.
+//
+// Origin-centric (§6): each origin contributes a dense ring of destinations within
+// radiusMeters that are also inside the area, which is the shape the refresh worker
+// packs into a single 1×K table request. One pair is emitted per
+// origin × reachable-destination × profile.
+//
+// radiusMeters is the travel-radius bound in meters. It is converted once to an H3
+// ring count k (the same for every origin at this resolution) via RingsForRadius, and
+// each origin's destinations are GridDisk(origin, k) clipped to the area. The special
+// value 0 is the full-mesh sentinel: every origin is paired with every in-area cell
+// (the GridDisk step is skipped entirely).
+func PairsFromCells(area beeline.AreaID, cells []beeline.H3Cell, resolution int, radiusMeters float64, profiles []beeline.Profile) ([]beeline.PairKey, error) {
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("tessellate: at least one profile required")
+	}
+	if radiusMeters < 0 {
+		return nil, fmt.Errorf("tessellate: radius meters %.2f must be >= 0", radiusMeters)
+	}
+	if len(cells) == 0 {
+		return nil, nil
 	}
 
 	inArea := make(map[beeline.H3Cell]struct{}, len(cells))
@@ -76,11 +99,22 @@ func Seed(area Area, profiles []beeline.Profile, mask *Mask) (Result, error) {
 		inArea[c] = struct{}{}
 	}
 
-	pairs := make([]beeline.PairKey, 0, len(cells)*7*len(profiles))
+	if radiusMeters == 0 {
+		return fullMeshPairs(area, cells, resolution, profiles), nil
+	}
+
+	// The ring count is a function of (resolution, radiusMeters) only, so derive it
+	// once from a representative origin and reuse it for every cell (§ Phase 1).
+	rings, err := RingsForRadius(cells[0], radiusMeters)
+	if err != nil {
+		return nil, err
+	}
+
+	pairs := make([]beeline.PairKey, 0, len(cells)*(1+3*rings*(rings+1))*len(profiles))
 	for _, origin := range cells {
-		neighbors, diskErr := h3.GridDisk(origin, area.RadiusRings)
+		neighbors, diskErr := h3.GridDisk(origin, rings)
 		if diskErr != nil {
-			return Result{}, fmt.Errorf("tessellate: expanding origin %s: %w", origin, diskErr)
+			return nil, fmt.Errorf("tessellate: expanding origin %s: %w", origin, diskErr)
 		}
 
 		for _, dest := range neighbors {
@@ -90,14 +124,100 @@ func Seed(area Area, profiles []beeline.Profile, mask *Mask) (Result, error) {
 
 			for _, profile := range profiles {
 				pairs = append(pairs, beeline.PairKey{
+					Area:    area,
 					Origin:  origin,
 					Dest:    dest,
 					Profile: profile,
-					Res:     area.Resolution,
+					Res:     resolution,
 				})
 			}
 		}
 	}
 
-	return Result{Cells: cells, Pairs: pairs}, nil
+	return pairs, nil
+}
+
+// fullMeshPairs pairs every origin with every in-area cell (including itself), for
+// every profile. This is the MaxRadiusMeters == 0 case: no travel bound, the whole
+// area's N² directed pairs. Callers should guard the O(N²) blow-up for large areas.
+func fullMeshPairs(area beeline.AreaID, cells []beeline.H3Cell, resolution int, profiles []beeline.Profile) []beeline.PairKey {
+	pairs := make([]beeline.PairKey, 0, len(cells)*len(cells)*len(profiles))
+	for _, origin := range cells {
+		for _, dest := range cells {
+			for _, profile := range profiles {
+				pairs = append(pairs, beeline.PairKey{
+					Area:    area,
+					Origin:  origin,
+					Dest:    dest,
+					Profile: profile,
+					Res:     resolution,
+				})
+			}
+		}
+	}
+
+	return pairs
+}
+
+// RingsForRadius returns the H3 GridDisk ring count k that best approximates a metric
+// disk of radiusMeters around origin. It grows k outward one ring at a time, measuring
+// the actual great-circle distance (geo.Haversine) from origin's center to the nearest
+// cell of the candidate ring, and stops at the last ring whose nearest cell is still
+// within the bound. Measuring real distance keeps this correct across resolutions and
+// avoids brittle per-resolution edge-length constants (§ Phase 1, decision 2).
+//
+// A non-positive radius yields 0 rings (origin only). The result is deterministic for
+// a given (origin resolution, radiusMeters) since cell geometry is fixed.
+func RingsForRadius(origin beeline.H3Cell, radiusMeters float64) (int, error) {
+	if radiusMeters <= 0 {
+		return 0, nil
+	}
+
+	center, err := beeline.Center(origin)
+	if err != nil {
+		return 0, err
+	}
+
+	seen := map[beeline.H3Cell]struct{}{origin: {}}
+	k := 0
+	for k < maxRings {
+		next := k + 1
+		disk, diskErr := h3.GridDisk(origin, next)
+		if diskErr != nil {
+			return 0, fmt.Errorf("tessellate: sizing radius at ring %d: %w", next, diskErr)
+		}
+
+		nearest := -1.0
+		grew := false
+		for _, c := range disk {
+			if _, ok := seen[c]; ok {
+				continue
+			}
+			grew = true
+
+			cc, centerErr := beeline.Center(c)
+			if centerErr != nil {
+				return 0, centerErr
+			}
+			if d := geo.Haversine(center, cc); nearest < 0 || d < nearest {
+				nearest = d
+			}
+		}
+
+		// GridDisk stopped growing (a pentagon can pin the frontier); take what we have.
+		if !grew {
+			return k, nil
+		}
+		// The whole next ring is beyond the bound: the current disk covers the radius.
+		if nearest > radiusMeters {
+			return k, nil
+		}
+
+		for _, c := range disk {
+			seen[c] = struct{}{}
+		}
+		k = next
+	}
+
+	return k, nil
 }

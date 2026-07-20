@@ -1,0 +1,21 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema: "internal/store/sqlite/migrations"
+    queries: "internal/store/sqlite/sqlc_queries"
+    gen:
+      go:
+        package: "generated"
+        out: "internal/store/sqlite/generated"
+        emit_interface: true
+        emit_exact_table_names: true
+        emit_empty_slices: true
+        emit_params_struct_pointers: true
+        emit_result_struct_pointers: true
+        emit_methods_with_db_argument: true
+        emit_pointers_for_null_types: true
+        output_db_file_name: "db_generated.go"
+        output_models_file_name: "models_generated.go"
+        output_querier_file_name: "querier_generated.go"
+        output_files_suffix: "_generated"
+        query_parameter_limit: 1

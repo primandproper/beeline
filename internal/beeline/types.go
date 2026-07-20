@@ -28,6 +28,12 @@ type LatLng struct {
 // for it to optionally carry a time-of-day bucket; the prototype keeps it to mode.
 type Profile string
 
+// AreaID identifies a configured service area. It is the SQLite areas.id (an
+// INTEGER PRIMARY KEY), and an int64 so PairKey stays a compact, comparable map
+// key even with millions of pairs held in memory. The zero value means "no area"
+// — a pair not attributed to any configured area (e.g. an out-of-area demand read).
+type AreaID int64
+
 // Annotations is a bitset selecting which scalars a caller wants computed.
 type Annotations uint8
 
@@ -41,10 +47,15 @@ const (
 // Has reports whether the given annotation bit is set.
 func (a Annotations) Has(want Annotations) bool { return a&want != 0 }
 
-// PairKey identifies one directed origin→destination estimate at a resolution and
-// profile. A→B and B→A are distinct keys (asymmetry is real; see §9).
+// PairKey identifies one directed origin→destination estimate within a service
+// area, at a resolution and profile. A→B and B→A are distinct keys (asymmetry is
+// real; see §9). Area partitions pairs so multiple service areas share one Store
+// and FreshnessIndex without colliding: two areas covering overlapping geography
+// at the same resolution produce the same Origin/Dest/Res/Profile but distinct
+// Area, so their estimates and freshness state stay separate.
 type PairKey struct {
 	Profile Profile
+	Area    AreaID
 	Origin  H3Cell
 	Dest    H3Cell
 	Res     int

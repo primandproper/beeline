@@ -6,13 +6,19 @@ package query
 
 import (
 	"context"
-	"sync/atomic"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 
 	"github.com/primandproper/platform-go/v4/observability/logging"
 )
+
+// AreaRouter resolves a coordinate to the enabled service area that contains it. The
+// control-plane Coordinator implements it; the read path consults it per query to pick
+// which area partition (and resolution) a lookup keys against.
+type AreaRouter interface {
+	Locate(p beeline.LatLng) (beeline.RoutedArea, bool)
+}
 
 // Source describes how an estimate was produced, for observability on the read path.
 type Source string
@@ -35,41 +41,43 @@ type Result struct {
 	Stale      bool
 }
 
-// Handler answers estimate queries against the store, index, and engine. The
-// resolution is held atomically because the control plane can swap the service
-// area (and its H3 resolution) at runtime while reads are in flight.
+// Handler answers estimate queries against the store, index, and engine. It consults
+// an AreaRouter per query to decide which service area (and resolution) a coordinate
+// belongs to, so multiple areas at different resolutions share one read path.
 type Handler struct {
-	store      beeline.Store
-	index      beeline.FreshnessIndex
-	engine     beeline.RoutingEngine
-	logger     logging.Logger
-	resolution atomic.Int64
-	targetTTL  time.Duration
+	store     beeline.Store
+	index     beeline.FreshnessIndex
+	engine    beeline.RoutingEngine
+	router    AreaRouter
+	logger    logging.Logger
+	targetTTL time.Duration
 }
 
 // NewHandler builds a read-path handler. A nil logger is replaced with a noop.
-func NewHandler(store beeline.Store, index beeline.FreshnessIndex, engine beeline.RoutingEngine, logger logging.Logger, resolution int, targetTTL time.Duration) *Handler {
-	h := &Handler{
+func NewHandler(store beeline.Store, index beeline.FreshnessIndex, engine beeline.RoutingEngine, router AreaRouter, logger logging.Logger, targetTTL time.Duration) *Handler {
+	return &Handler{
 		store:     store,
 		index:     index,
 		engine:    engine,
+		router:    router,
 		logger:    logging.EnsureLogger(logger),
 		targetTTL: targetTTL,
 	}
-	h.resolution.Store(int64(resolution))
-
-	return h
 }
 
-// SetResolution updates the resolution the read path keys against. Called by the
-// control plane after a runtime re-tessellation so lookups target the new cells.
-func (h *Handler) SetResolution(resolution int) {
-	h.resolution.Store(int64(resolution))
-}
-
-// Estimate answers a single origin→destination query for a profile.
+// Estimate answers a single origin→destination query for a profile. It routes by the
+// origin: if the origin falls in an enabled area, the lookup keys against that area's
+// partition and resolution (cache hit, same-cell correction, or demand-fill). A
+// coordinate outside every enabled area is still answered — computed directly on the
+// true endpoints — but not cached or bumped, since it belongs to no area partition.
 func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, profile beeline.Profile) (Result, error) {
-	resolution := int(h.resolution.Load())
+	routed, ok := h.router.Locate(origin)
+	if !ok {
+		// Outside every enabled area: answer directly, cache nothing.
+		return h.compute(ctx, origin, dest, profile, SourceDemand)
+	}
+
+	resolution := routed.Resolution
 
 	originCell, err := beeline.CellAt(origin, resolution)
 	if err != nil {
@@ -87,7 +95,7 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 		return h.compute(ctx, origin, dest, profile, SourceSameCell)
 	}
 
-	key := beeline.PairKey{Origin: originCell, Dest: destCell, Profile: profile, Res: resolution}
+	key := beeline.PairKey{Area: routed.ID, Origin: originCell, Dest: destCell, Profile: profile, Res: resolution}
 
 	got, err := h.store.BatchGet(ctx, []beeline.PairKey{key})
 	if err != nil {

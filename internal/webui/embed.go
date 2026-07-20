@@ -1,9 +1,10 @@
 // Package webui serves the embedded single-page operator console: a map-based UI
-// for drawing the service-area boundary and tessellation scheme (POST
-// /_config_/area) and watching the cache load for that area (GET /_ops_/freshness
-// and /_ops_/cells). The assets — the app plus vendored Leaflet and h3-js — are
-// compiled into the binary via go:embed so `beeline serve` stays a single
-// self-hostable artifact with no build step and no CDN dependency.
+// for managing service areas (the /_config_/areas registry — create from GeoJSON,
+// enable/disable, refine hexes) and watching a selected area's cache load (GET
+// /_ops_/freshness and /_ops_/cells, scoped with ?area). The assets — the app plus
+// vendored Leaflet and h3-js — are compiled into the binary via go:embed so
+// `beeline serve` stays a single self-hostable artifact with no build step and no
+// CDN dependency.
 package webui
 
 import (

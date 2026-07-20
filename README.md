@@ -32,80 +32,57 @@ make run ARGS="version"
 
 ## Demo: the matrix service
 
-The `serve` subcommand is the prototype. It tessellates a service area into H3
-cells, keeps origin→destination travel-time estimates fresh in the background, and
-serves the read path plus an embedded operator console over HTTP. The routing
-engine is a Haversine stand-in (great-circle distance ÷ per-profile speed) behind
-the same interface a real engine (OSRM/Valhalla) would implement, so the whole
-pipeline runs with **no external routing dependency**.
+The `serve` subcommand is the prototype. It opens a SQLite **area store**, keeps
+origin→destination travel-time estimates fresh in the background for every
+**enabled** service area, and serves the read path plus an embedded operator console
+over HTTP. The routing engine is a Haversine stand-in (great-circle distance ÷
+per-profile speed) behind the same interface a real engine (OSRM/Valhalla) would
+implement, so the whole pipeline runs with **no external routing dependency**.
+
+The fastest path is **`make demo`**: it runs the server against a fresh, gitignored
+SQLite database (`artifacts/demo.db`) and auto-seeds one **enabled** demo area (Lake
+Travis, Austin), so the console shows the cache loading immediately. `Ctrl-C` stops
+it; re-running resets from scratch. Override the port with `make demo PORT=9090`.
 
 ```bash
+make demo                                             # fresh db + seeded demo area + serve
+# …or start empty and configure areas yourself:
 make build
 make run ARGS="serve --config config/localdev.json"   # or ./artifacts/beeline serve --config config/localdev.json
 ```
 
 Then open **http://localhost:8080**.
 
-The demo area is **Lake Travis** in the Austin, TX metro. As the background refresh
-loop computes estimates, the console fills the service area with H3 cells — and the
-reservoir stays **carved out**: cells over open water are pruned because they have
-no roads (design §7, "road-aware tessellation"). The startup log shows it:
+Started with plain `serve`, a fresh database has **no areas** — nothing refreshes
+until you configure one. In the
+console: click **+ New**, give it a name, upload a **GeoJSON polygon** (or leave it
+empty), and create it. The area starts **disabled**. Flip it **On** and the refresh
+loop begins filling it with H3 cells. Areas over open water stay **carved out**: cells
+with no roads are pruned when the polygon is polyfilled (design §7, "road-aware
+tessellation"). Refine the shape by clicking **Edit hexes** and toggling cells on the
+map. Multiple areas can be enabled at once; the progress overlay paints the selected
+one.
 
-```
-road mask loaded; pruning roadless cells   cells=1421 resolution=9
-service area tessellated ...                cells=488  pairs=43848
-```
-
-488 cells are seeded out of the full 631-cell disk — the 143 roadless water cells
-(~23%) are dropped. (The basemap tiles need internet; the cells and markers render
-regardless.)
-
-Poke at it while it runs:
+Everything the console does is a plain HTTP call — drive it with curl too:
 
 ```bash
-curl 'localhost:8080/_ops_/freshness'    # §3 debt/throughput contract (watch it drain)
-curl 'localhost:8080/_ops_/cells'        # per-origin-cell freshness rollup (the console's overlay)
-curl 'localhost:8080/estimate?origin=30.3428,-98.0274&dest=30.35,-98.00&profile=car'
+# create an area from a GeoJSON polygon (starts disabled), then enable it
+curl -sX POST localhost:8080/_config_/areas -H content-type:application/json -d '{
+  "name":"downtown","resolution":8,"radiusRings":2,
+  "geojson":{"type":"Polygon","coordinates":[[[-98.05,30.32],[-97.99,30.32],[-97.99,30.37],[-98.05,30.37],[-98.05,30.32]]]}}'
+curl -sX POST localhost:8080/_config_/areas/1/enable
+
+curl 'localhost:8080/_ops_/freshness?area=1'   # §3 debt/throughput contract (watch it drain)
+curl 'localhost:8080/_ops_/cells?area=1'       # per-origin-cell freshness rollup (the console's overlay)
+curl 'localhost:8080/estimate?origin=30.34,-98.02&dest=30.35,-98.00&profile=car'
+curl -sX POST localhost:8080/_config_/areas/1/disable   # stop refreshing it; its pairs leave the working set
 ```
 
-You can also redraw the boundary, move the center, or change the H3 resolution at
-runtime from the console (or `POST /_config_/area`) and watch the cache reload. The
-road mask follows resolution changes through the H3 hierarchy — pruning stays exact
-at or below the mask's resolution and approximate (edge only as sharp as the mask)
-when you zoom finer. The console warns under the resolution slider when you've zoomed
-past the mask's resolution; rebuild the mask at that resolution for a crisp edge.
-
-### The road mask
-
-The road mask (`config/masks/austin-res9.cells`) is **committed**, so the demo
-needs neither the network nor DuckDB — it loads the cell set from disk. Point
-`serve` at your own mask with the `roadMaskPath` config key (env
-`BEELINE_MATRIX_ROAD_MASK_PATH`); an empty path disables pruning (full geometric
-disk).
-
-To rebuild the mask, or build one for a different area, use `make mask`. It reads
-[Overture Maps](https://overturemaps.org/) road data via the
-[DuckDB](https://duckdb.org/) CLI — pinned in `mise.toml`, so `mise install`
-provisions it:
-
-```bash
-mise install                 # provides the duckdb CLI
-make mask                    # rebuild the demo mask (pulls from Overture's public S3, then caches)
-
-# build a mask for a different area — matches the config's area spec:
-make mask MASK_LAT=30.2672 MASK_LNG=-97.7431 MASK_RESOLUTION=8 \
-          MASK_AREA_RINGS=6 MASK_OUT=config/masks/myarea.cells
-```
-
-`make mask` prints how much it prunes for the configured area (e.g. `488/631 disk
-cells have roads, 143 pruned`) and caches the S3 pull under `artifacts/`, so
-re-runs are offline unless the area changes or you pass `--refetch`.
-
-> **Note:** the mask is resolution-specific, and how much it prunes depends
-> entirely on the area. A wide water body at a fine resolution (like the Lake
-> Travis demo) drops a big fraction of the disk; a dense urban area (e.g. downtown
-> Austin, ~`30.27, -97.74`) is fully road-covered and prunes almost nothing — the
-> mask still loads, it just has little to remove.
+Area definitions persist in the database (default `beeline.db`, override with
+`BEELINE_MATRIX_DATABASE_PATH`), so an enabled area re-seeds and re-warms on restart;
+a disabled one stays idle. An area's cell set is the polyfill of its uploaded polygon;
+refine it by hand from the console (click cells to add or remove) to carve out water,
+private land, or anywhere else you don't want covered.
 
 ## What's included
 

@@ -97,7 +97,9 @@ func (p *Pool) work(ctx context.Context) {
 // profile) so each group is a single dense 1×K table request (§6).
 func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
 	// An H3 cell id encodes its resolution, so (origin, profile) fully identifies a
-	// dense 1×K request; resolution need not be part of the group key.
+	// dense 1×K request; resolution need not be part of the group key. Area is not:
+	// each claimed key keeps its own Area, so estimates are written under the correct
+	// area partition even when overlapping areas share an origin cell in one batch.
 	type groupKey struct {
 		profile beeline.Profile
 		origin  beeline.H3Cell

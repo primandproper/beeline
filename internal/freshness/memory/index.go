@@ -21,12 +21,22 @@ type entry struct {
 	bumped     bool      // demand-driven priority (stale-while-revalidate)
 }
 
+// baseline is the per-area achieved-throughput baseline: how many refreshes have
+// landed for this area and since when. It is reset each time the area is (re)seeded
+// so the console's load progress for a freshly enabled area reads from zero, the
+// per-area analog of the old global reseed behavior.
+type baseline struct {
+	started       time.Time
+	computedTotal int64
+}
+
 // Index tracks staleness for every pair in the working set and hands the stalest
 // due pairs to workers under a lease.
 type Index struct {
 	started       time.Time
 	now           func() time.Time
 	entries       map[beeline.PairKey]*entry
+	baselines     map[beeline.AreaID]*baseline
 	targetTTL     time.Duration
 	computedTotal int64
 	mu            sync.Mutex
@@ -42,43 +52,44 @@ func New(targetTTL time.Duration, clock func() time.Time) *Index {
 	return &Index{
 		now:       clock,
 		entries:   make(map[beeline.PairKey]*entry),
+		baselines: make(map[beeline.AreaID]*baseline),
 		targetTTL: targetTTL,
 		started:   clock(),
 	}
 }
 
 // Seed adds keys to the working set as never-computed (maximally stale). Existing
-// keys are left untouched so re-seeding is idempotent.
+// keys are left untouched so re-seeding is idempotent. The achieved-throughput
+// baseline for every area present in the batch is reset to now, so a freshly enabled
+// (or re-converged) area's load progress reads from zero.
 func (i *Index) Seed(_ context.Context, keys []beeline.PairKey) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
+	now := i.now()
 	for pos := range keys {
 		if _, ok := i.entries[keys[pos]]; !ok {
 			i.entries[keys[pos]] = &entry{}
 		}
+		i.baselines[keys[pos].Area] = &baseline{started: now}
 	}
 
 	return nil
 }
 
-// Reseed atomically replaces the entire working set with the given keys as
-// never-computed, and resets the throughput baseline. This is the runtime
-// re-tessellation path (the control plane swapping the service area): old pairs
-// vanish, the new pair set starts maximally stale, and achieved-throughput is
-// measured from the reseed forward so the load progress reads from zero.
-func (i *Index) Reseed(_ context.Context, keys []beeline.PairKey) error {
+// Unseed removes every pair belonging to one service area and drops its throughput
+// baseline. The control plane calls it when an area is disabled (or before
+// re-seeding on a geometry change), leaving other areas' working sets untouched.
+func (i *Index) Unseed(_ context.Context, area beeline.AreaID) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	entries := make(map[beeline.PairKey]*entry, len(keys))
-	for pos := range keys {
-		entries[keys[pos]] = &entry{}
+	for k := range i.entries {
+		if k.Area == area {
+			delete(i.entries, k)
+		}
 	}
-
-	i.entries = entries
-	i.computedTotal = 0
-	i.started = i.now()
+	delete(i.baselines, area)
 
 	return nil
 }
@@ -101,6 +112,60 @@ func (i *Index) CellStates(_ context.Context) ([]beeline.CellState, error) {
 
 	byOrigin := make(map[beeline.H3Cell]*rollup)
 	for key, e := range i.entries {
+		r, ok := byOrigin[key.Origin]
+		if !ok {
+			r = &rollup{}
+			byOrigin[key.Origin] = r
+		}
+
+		r.total++
+		if e.computedAt.IsZero() {
+			continue
+		}
+
+		age := now.Sub(e.computedAt)
+		if age > r.oldestAge {
+			r.oldestAge = age
+		}
+		if age < i.targetTTL {
+			r.fresh++
+		}
+	}
+
+	states := make([]beeline.CellState, 0, len(byOrigin))
+	for origin, r := range byOrigin {
+		states = append(states, beeline.CellState{
+			Origin:           origin,
+			Total:            r.total,
+			Fresh:            r.fresh,
+			OldestAgeSeconds: r.oldestAge.Seconds(),
+		})
+	}
+
+	return states, nil
+}
+
+// CellStatesForArea is CellStates scoped to one service area: only pairs whose
+// Area matches are rolled up, so the console can paint one area's progress map at a
+// time on the shared index. The result is unordered.
+func (i *Index) CellStatesForArea(_ context.Context, area beeline.AreaID) ([]beeline.CellState, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	now := i.now()
+
+	type rollup struct {
+		total     int
+		fresh     int
+		oldestAge time.Duration
+	}
+
+	byOrigin := make(map[beeline.H3Cell]*rollup)
+	for key, e := range i.entries {
+		if key.Area != area {
+			continue
+		}
+
 		r, ok := byOrigin[key.Origin]
 		if !ok {
 			r = &rollup{}
@@ -204,11 +269,17 @@ func (i *Index) MarkComputed(_ context.Context, keys []beeline.PairKey, at time.
 	defer i.mu.Unlock()
 
 	for pos := range keys {
-		if e, ok := i.entries[keys[pos]]; ok {
-			e.computedAt = at
-			e.leaseUntil = time.Time{}
-			e.bumped = false
-			i.computedTotal++
+		e, ok := i.entries[keys[pos]]
+		if !ok {
+			continue
+		}
+
+		e.computedAt = at
+		e.leaseUntil = time.Time{}
+		e.bumped = false
+		i.computedTotal++
+		if b, has := i.baselines[keys[pos].Area]; has {
+			b.computedTotal++
 		}
 	}
 
@@ -288,6 +359,64 @@ func (i *Index) Debt(_ context.Context) (beeline.DebtStats, error) {
 	var achieved float64
 	if elapsed := now.Sub(i.started).Seconds(); elapsed > 0 {
 		achieved = float64(i.computedTotal) / elapsed
+	}
+
+	return beeline.DebtStats{
+		WorkingSet:         workingSet,
+		Debt:               debt,
+		OldestAgeSeconds:   oldestAge.Seconds(),
+		RequiredThroughput: required,
+		AchievedThroughput: achieved,
+	}, nil
+}
+
+// DebtForArea reports the freshness contract signals for a single service area:
+// working-set size, debt, p100 age, and required vs achieved throughput, all scoped
+// to that area. Achieved throughput is measured from the area's own baseline (set
+// when it was enabled), so a newly enabled area's progress reads from zero
+// independent of other areas.
+func (i *Index) DebtForArea(_ context.Context, area beeline.AreaID) (beeline.DebtStats, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	now := i.now()
+
+	var (
+		debt       int
+		workingSet int
+		oldestAge  time.Duration
+	)
+
+	for k, e := range i.entries {
+		if k.Area != area {
+			continue
+		}
+
+		workingSet++
+		if e.computedAt.IsZero() {
+			debt++
+			continue
+		}
+
+		age := now.Sub(e.computedAt)
+		if age > oldestAge {
+			oldestAge = age
+		}
+		if age >= i.targetTTL {
+			debt++
+		}
+	}
+
+	var required float64
+	if ttl := i.targetTTL.Seconds(); ttl > 0 {
+		required = float64(workingSet) / ttl
+	}
+
+	var achieved float64
+	if b, ok := i.baselines[area]; ok {
+		if elapsed := now.Sub(b.started).Seconds(); elapsed > 0 {
+			achieved = float64(b.computedTotal) / elapsed
+		}
 	}
 
 	return beeline.DebtStats{

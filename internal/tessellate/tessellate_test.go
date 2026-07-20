@@ -4,26 +4,28 @@ import (
 	"testing"
 
 	"github.com/primandproper/beeline/internal/beeline"
+	"github.com/primandproper/beeline/internal/geo"
 	"github.com/primandproper/beeline/internal/tessellate"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uber/h3-go/v4"
 )
 
 func TestSeed(t *testing.T) {
 	t.Parallel()
 
 	area := tessellate.Area{
-		Center:      beeline.LatLng{Lat: 37.7749, Lng: -122.4194},
-		Resolution:  8,
-		AreaRings:   2,
-		RadiusRings: 1,
+		Center:          beeline.LatLng{Lat: 37.7749, Lng: -122.4194},
+		Resolution:      8,
+		AreaRings:       2,
+		MaxRadiusMeters: 1500,
 	}
 
 	t.Run("covers the expected number of cells", func(t *testing.T) {
 		t.Parallel()
 
-		res, err := tessellate.Seed(area, []beeline.Profile{"car"}, nil)
+		res, err := tessellate.Seed(area, []beeline.Profile{"car"})
 		require.NoError(t, err)
 
 		// GridDisk of radius k covers 3k^2 + 3k + 1 cells; k=2 → 19.
@@ -33,7 +35,7 @@ func TestSeed(t *testing.T) {
 	t.Run("pairs are clipped to the area and tagged with res and profile", func(t *testing.T) {
 		t.Parallel()
 
-		res, err := tessellate.Seed(area, []beeline.Profile{"car", "bike"}, nil)
+		res, err := tessellate.Seed(area, []beeline.Profile{"car", "bike"})
 		require.NoError(t, err)
 		require.NotEmpty(t, res.Pairs)
 
@@ -62,77 +64,159 @@ func TestSeed(t *testing.T) {
 
 		bad := area
 		bad.Resolution = 42
-		_, err := tessellate.Seed(bad, []beeline.Profile{"car"}, nil)
+		_, err := tessellate.Seed(bad, []beeline.Profile{"car"})
 		assert.Error(t, err)
 	})
+}
 
-	t.Run("a road mask at the area resolution prunes cells outside it", func(t *testing.T) {
+// resDisk returns the res-9 GridDisk of radius r around San Francisco, plus its
+// center cell, for the meters-bound tests.
+func resDisk(t *testing.T, res, r int) (beeline.H3Cell, []beeline.H3Cell) {
+	t.Helper()
+
+	center, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, res)
+	require.NoError(t, err)
+	cells, err := h3.GridDisk(center, r)
+	require.NoError(t, err)
+
+	return center, cells
+}
+
+func TestRingsForRadius(t *testing.T) {
+	t.Parallel()
+
+	center, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, 9)
+	require.NoError(t, err)
+
+	t.Run("a non-positive radius is zero rings (origin only)", func(t *testing.T) {
 		t.Parallel()
 
-		// Build a mask holding only the center cell, then confirm Seed keeps exactly
-		// that cell (and, therefore, only its self-pairs).
-		full, err := tessellate.Seed(area, []beeline.Profile{"car"}, nil)
+		k, err := tessellate.RingsForRadius(center, 0)
 		require.NoError(t, err)
-		require.Greater(t, len(full.Cells), 1)
+		assert.Equal(t, 0, k)
 
-		center, err := beeline.CellAt(area.Center, area.Resolution)
+		k, err = tessellate.RingsForRadius(center, -100)
 		require.NoError(t, err)
+		assert.Equal(t, 0, k)
+	})
 
-		mask := tessellate.NewMask(area.Resolution, []beeline.H3Cell{center})
+	t.Run("ring count grows monotonically with the bound", func(t *testing.T) {
+		t.Parallel()
 
-		masked, err := tessellate.Seed(area, []beeline.Profile{"car"}, mask)
-		require.NoError(t, err)
-		assert.Equal(t, []beeline.H3Cell{center}, masked.Cells)
-		for _, p := range masked.Pairs {
-			assert.Equal(t, center, p.Origin)
-			assert.Equal(t, center, p.Dest)
+		var prev int
+		for _, radius := range []float64{100, 500, 1000, 2000, 4000, 8000} {
+			k, err := tessellate.RingsForRadius(center, radius)
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, k, prev, "radius %.0f should not shrink the ring count", radius)
+			prev = k
 		}
+		assert.Positive(t, prev, "a multi-km bound must reach beyond the origin cell")
 	})
 
-	t.Run("a coarser mask prunes finer cells via their parent", func(t *testing.T) {
+	t.Run("every cell in the derived disk is within the bound", func(t *testing.T) {
 		t.Parallel()
 
-		// Area at res 9; mask at res 8 holding only the center's res-8 parent. Every
-		// kept res-9 cell must descend from that one allowed parent (the console
-		// re-tessellating finer than the mask still prunes).
-		fine := area
-		fine.Resolution = 9
-
-		center9, err := beeline.CellAt(fine.Center, fine.Resolution)
+		const radius = 2000.0
+		k, err := tessellate.RingsForRadius(center, radius)
 		require.NoError(t, err)
-		parent8, err := center9.Parent(8)
+		require.Positive(t, k)
+
+		originLL, err := beeline.Center(center)
 		require.NoError(t, err)
 
-		mask := tessellate.NewMask(8, []beeline.H3Cell{parent8})
-
-		full, err := tessellate.Seed(fine, []beeline.Profile{"car"}, nil)
+		// The ring at exactly k must have at least one cell within the bound (that is
+		// why it was included), and ring k+1's nearest cell must exceed it.
+		inner, err := h3.GridDisk(center, k)
 		require.NoError(t, err)
-		masked, err := tessellate.Seed(fine, []beeline.Profile{"car"}, mask)
+		outer, err := h3.GridDisk(center, k+1)
 		require.NoError(t, err)
 
-		assert.Less(t, len(masked.Cells), len(full.Cells))
-		assert.Contains(t, masked.Cells, center9)
-		for _, c := range masked.Cells {
-			parent, perr := c.Parent(8)
-			require.NoError(t, perr)
-			assert.Equal(t, parent8, parent)
+		innerSet := make(map[beeline.H3Cell]struct{}, len(inner))
+		for _, c := range inner {
+			innerSet[c] = struct{}{}
 		}
+
+		var nearestNextRing float64 = -1
+		for _, c := range outer {
+			if _, ok := innerSet[c]; ok {
+				continue
+			}
+			cc, cErr := beeline.Center(c)
+			require.NoError(t, cErr)
+			if d := geo.Haversine(originLL, cc); nearestNextRing < 0 || d < nearestNextRing {
+				nearestNextRing = d
+			}
+		}
+		assert.Greater(t, nearestNextRing, radius, "the next ring out must be beyond the bound")
 	})
+}
 
-	t.Run("a finer mask prunes coarser cells with no road descendant", func(t *testing.T) {
-		t.Parallel()
+func TestPairsFromCellsFullMeshSentinel(t *testing.T) {
+	t.Parallel()
 
-		// Area at res 8; mask at res 9 holding one res-9 child of the center res-8
-		// cell. Only the center cell has a road descendant, so only it survives.
-		center8, err := beeline.CellAt(area.Center, area.Resolution)
-		require.NoError(t, err)
-		children9, err := center8.Children(9)
-		require.NoError(t, err)
+	_, cells := resDisk(t, 9, 1) // 7 cells
+	profiles := []beeline.Profile{"car", "bike"}
 
-		mask := tessellate.NewMask(9, []beeline.H3Cell{children9[0]})
+	pairs, err := tessellate.PairsFromCells(0, cells, 9, 0, profiles)
+	require.NoError(t, err)
 
-		masked, err := tessellate.Seed(area, []beeline.Profile{"car"}, mask)
-		require.NoError(t, err)
-		assert.Equal(t, []beeline.H3Cell{center8}, masked.Cells)
-	})
+	// Full mesh: every origin × every in-area dest × every profile.
+	assert.Len(t, pairs, len(cells)*len(cells)*len(profiles))
+
+	// Every pair is in-area, tagged with the resolution and a requested profile.
+	inArea := make(map[beeline.H3Cell]struct{}, len(cells))
+	for _, c := range cells {
+		inArea[c] = struct{}{}
+	}
+	for _, p := range pairs {
+		assert.Equal(t, 9, p.Res)
+		assert.Contains(t, inArea, p.Origin)
+		assert.Contains(t, inArea, p.Dest)
+	}
+}
+
+func TestPairsFromCellsBoundedMatchesRingDisk(t *testing.T) {
+	t.Parallel()
+
+	const res = 9
+	center, cells := resDisk(t, res, 4) // a generous area so the bound, not the area, clips
+	const radius = 1500.0
+
+	k, err := tessellate.RingsForRadius(center, radius)
+	require.NoError(t, err)
+	require.Positive(t, k)
+
+	pairs, err := tessellate.PairsFromCells(0, cells, res, radius, []beeline.Profile{"car"})
+	require.NoError(t, err)
+
+	// The center origin's outgoing pairs must be exactly its k-ring disk clipped to
+	// the area (which fully contains it here), one per in-area disk cell.
+	inArea := make(map[beeline.H3Cell]struct{}, len(cells))
+	for _, c := range cells {
+		inArea[c] = struct{}{}
+	}
+	disk, err := h3.GridDisk(center, k)
+	require.NoError(t, err)
+	var wantFromCenter int
+	for _, d := range disk {
+		if _, ok := inArea[d]; ok {
+			wantFromCenter++
+		}
+	}
+
+	var gotFromCenter int
+	for _, p := range pairs {
+		if p.Origin == center {
+			gotFromCenter++
+		}
+	}
+	assert.Equal(t, wantFromCenter, gotFromCenter, "center origin pairs with exactly its clipped k-ring disk")
+}
+
+func TestPairsFromCellsRejectsNegativeRadius(t *testing.T) {
+	t.Parallel()
+
+	_, cells := resDisk(t, 9, 1)
+	_, err := tessellate.PairsFromCells(0, cells, 9, -1, []beeline.Profile{"car"})
+	assert.Error(t, err)
 }

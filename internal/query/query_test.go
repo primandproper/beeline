@@ -196,6 +196,325 @@ func TestEstimateWithinBoundDemandFillIsTracked(t *testing.T) {
 	assert.Zero(t, debt.Debt, "the demand-filled pair is fresh, not debt")
 }
 
+// countingEngine wraps a RoutingEngine and counts Table calls, so table tests can
+// assert the batch path groups misses into at most one engine call per source.
+type countingEngine struct {
+	inner beeline.RoutingEngine
+	calls int
+}
+
+func (c *countingEngine) Table(ctx context.Context, req beeline.TableRequest) (beeline.TableResponse, error) {
+	c.calls++
+
+	return c.inner.Table(ctx, req)
+}
+
+func (c *countingEngine) Capabilities() beeline.Capabilities { return c.inner.Capabilities() }
+
+// coordRouter routes exact coordinates to preconfigured areas, so a single table can
+// span several areas at different resolutions. An absent coordinate is out of area.
+type coordRouter struct {
+	areas map[beeline.LatLng]beeline.RoutedArea
+}
+
+func (c coordRouter) Locate(p beeline.LatLng) (beeline.RoutedArea, bool) {
+	a, ok := c.areas[p]
+
+	return a, ok
+}
+
+func newTableHandler(t *testing.T, resolution int, ttl time.Duration, maxRadius float64) (*query.Handler, *memstore.Store, *memindex.Index, *countingEngine) {
+	t.Helper()
+
+	store := memstore.New()
+	index := memindex.New(ttl, nil)
+	engine := &countingEngine{inner: haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)}
+	router := fakeRouter{id: testArea, resolution: resolution, maxRadius: maxRadius, targetTTL: ttl, present: true}
+
+	return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil), store, index, engine
+}
+
+// wide table coordinates: sources and destinations far enough apart that every cell is
+// a distinct-cell cache lookup at resolution 9.
+var (
+	tableSources = []beeline.LatLng{{Lat: 37.7749, Lng: -122.4194}, {Lat: 37.7770, Lng: -122.4194}}
+	tableDests   = []beeline.LatLng{{Lat: 37.7949, Lng: -122.4194}, {Lat: 37.7989, Lng: -122.4194}, {Lat: 37.8029, Lng: -122.4194}}
+)
+
+func TestTableFillComputesCachesAndGroups(t *testing.T) {
+	t.Parallel()
+
+	// Unbounded area: every within-area miss is cacheable.
+	handler, store, _, engine := newTableHandler(t, 9, time.Minute, 0)
+
+	result, err := handler.Table(context.Background(), &query.TableQuery{
+		Sources:      tableSources,
+		Destinations: tableDests,
+		Profile:      "car",
+		Fill:         true,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 6, result.Misses, "nothing was seeded, so every cell misses")
+	assert.Equal(t, 6, result.Filled, "every miss is demand-filled")
+	assert.Zero(t, result.Hits)
+	assert.Equal(t, 6, store.Len(), "every within-bound miss is cached")
+	assert.Equal(t, len(tableSources), engine.calls, "misses group into one 1×K call per source")
+
+	for i := range result.Cells {
+		for j := range result.Cells[i] {
+			cell := result.Cells[i][j]
+			assert.True(t, cell.Present, "filled cell must be present")
+			assert.Equal(t, query.SourceDemand, cell.Source)
+			assert.Positive(t, cell.Estimate.Distance)
+		}
+	}
+}
+
+func TestTableCacheHitsNeverCallEngine(t *testing.T) {
+	t.Parallel()
+
+	handler, store, _, engine := newTableHandler(t, 9, time.Minute, 0)
+	ctx := context.Background()
+
+	// Seed every cell so the whole grid is a hit.
+	for i := range tableSources {
+		oCell, err := beeline.CellAt(tableSources[i], 9)
+		require.NoError(t, err)
+		for j := range tableDests {
+			dCell, dErr := beeline.CellAt(tableDests[j], 9)
+			require.NoError(t, dErr)
+			key := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
+			require.NoError(t, store.Put(ctx, []beeline.Entry{{
+				Key:    key,
+				Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+			}}))
+		}
+	}
+
+	result, err := handler.Table(ctx, &query.TableQuery{
+		Sources:      tableSources,
+		Destinations: tableDests,
+		Profile:      "car",
+		Fill:         true, // fill is irrelevant when everything hits
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 6, result.Hits)
+	assert.Zero(t, result.Misses)
+	assert.Zero(t, engine.calls, "a fully-cached table touches no engine")
+	assert.InDelta(t, 42, result.Cells[0][0].Estimate.Duration, 1e-9)
+}
+
+func TestTableCacheOnlyLeavesMissesAbsent(t *testing.T) {
+	t.Parallel()
+
+	handler, store, _, engine := newTableHandler(t, 9, time.Minute, 0)
+	ctx := context.Background()
+
+	// Seed only cell (0,0); the rest miss.
+	oCell, err := beeline.CellAt(tableSources[0], 9)
+	require.NoError(t, err)
+	dCell, err := beeline.CellAt(tableDests[0], 9)
+	require.NoError(t, err)
+	seeded := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
+	require.NoError(t, store.Put(ctx, []beeline.Entry{{
+		Key:    seeded,
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+	}}))
+
+	result, err := handler.Table(ctx, &query.TableQuery{
+		Sources:      tableSources,
+		Destinations: tableDests,
+		Profile:      "car",
+		Fill:         false, // cache-only
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.Hits)
+	assert.Equal(t, 5, result.Misses)
+	assert.Zero(t, result.Filled, "cache-only fills nothing")
+	assert.Zero(t, engine.calls, "cache-only never calls the engine")
+	assert.Equal(t, 1, store.Len(), "cache-only writes nothing new")
+
+	assert.True(t, result.Cells[0][0].Present, "the seeded cell is present")
+	assert.False(t, result.Cells[1][2].Present, "an unfilled miss is absent")
+}
+
+func TestTableSkipOmitsCells(t *testing.T) {
+	t.Parallel()
+
+	handler, store, _, engine := newTableHandler(t, 9, time.Minute, 0)
+	ctx := context.Background()
+
+	// Seed cell (0,0) so it hits; skip (0,1).
+	oCell, err := beeline.CellAt(tableSources[0], 9)
+	require.NoError(t, err)
+	dCell, err := beeline.CellAt(tableDests[0], 9)
+	require.NoError(t, err)
+	require.NoError(t, store.Put(ctx, []beeline.Entry{{
+		Key:    beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9},
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+	}}))
+
+	result, err := handler.Table(ctx, &query.TableQuery{
+		Sources:      tableSources[:1],
+		Destinations: tableDests[:2],
+		Profile:      "car",
+		Skip:         map[[2]int]struct{}{{0, 1}: {}},
+		Fill:         true,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.Skipped)
+	assert.Equal(t, 1, result.Hits)
+	assert.Zero(t, result.Misses)
+	assert.Zero(t, engine.calls, "the only non-hit cell was skipped")
+	assert.True(t, result.Cells[0][0].Present)
+	assert.False(t, result.Cells[0][1].Present, "a skipped cell is absent")
+}
+
+func TestTableSameCellComputesLiveAndDoesNotCache(t *testing.T) {
+	t.Parallel()
+
+	// Coarse resolution so origin and dest share a cell.
+	handler, store, _, _ := newTableHandler(t, 5, time.Minute, 0)
+
+	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	dest := beeline.LatLng{Lat: 37.7758, Lng: -122.4194} // ~100 m north
+
+	oCell, err := beeline.CellAt(origin, 5)
+	require.NoError(t, err)
+	dCell, err := beeline.CellAt(dest, 5)
+	require.NoError(t, err)
+	require.Equal(t, oCell, dCell, "precondition: points share a cell")
+
+	result, err := handler.Table(context.Background(), &query.TableQuery{
+		Sources:      []beeline.LatLng{origin},
+		Destinations: []beeline.LatLng{dest},
+		Profile:      "car",
+		Fill:         true,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.SameCell)
+	assert.Zero(t, store.Len(), "a same-cell correction is never cached")
+	cell := result.Cells[0][0]
+	assert.True(t, cell.Present)
+	assert.Equal(t, query.SourceSameCell, cell.Source)
+	assert.Positive(t, cell.Estimate.Distance, "correction must not collapse to zero")
+}
+
+func TestTableSameCellAbsentWhenCacheOnly(t *testing.T) {
+	t.Parallel()
+
+	handler, _, _, engine := newTableHandler(t, 5, time.Minute, 0)
+
+	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	dest := beeline.LatLng{Lat: 37.7758, Lng: -122.4194}
+
+	result, err := handler.Table(context.Background(), &query.TableQuery{
+		Sources:      []beeline.LatLng{origin},
+		Destinations: []beeline.LatLng{dest},
+		Profile:      "car",
+		Fill:         false,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, result.SameCell)
+	assert.Zero(t, engine.calls, "cache-only never computes a same-cell correction")
+	assert.False(t, result.Cells[0][0].Present, "same-cell needs a live compute, absent under cache-only")
+}
+
+func TestTableOutOfAreaComputesButDoesNotCache(t *testing.T) {
+	t.Parallel()
+
+	store := memstore.New()
+	index := memindex.New(time.Minute, nil)
+	engine := &countingEngine{inner: haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)}
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, fakeRouter{present: false}, nil)
+
+	result, err := handler.Table(context.Background(), &query.TableQuery{
+		Sources:      tableSources[:1],
+		Destinations: tableDests[:2],
+		Profile:      "car",
+		Fill:         true,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, result.OutOfArea)
+	assert.Zero(t, result.Misses, "out-of-area cells are not cache lookups")
+	assert.Zero(t, store.Len(), "out-of-area answers are never cached")
+	assert.Equal(t, 1, engine.calls, "both out-of-area dests share one source, one call")
+	assert.True(t, result.Cells[0][0].Present)
+	assert.Equal(t, query.SourceDemand, result.Cells[0][0].Source)
+}
+
+func TestTableBeyondBoundComputesButDoesNotCache(t *testing.T) {
+	t.Parallel()
+
+	// A tight 500 m bound: the ~2.2 km trips below fall outside it.
+	handler, store, _, _ := newTableHandler(t, 9, time.Minute, 500)
+
+	result, err := handler.Table(context.Background(), &query.TableQuery{
+		Sources:      tableSources[:1],
+		Destinations: tableDests[:2],
+		Profile:      "car",
+		Fill:         true,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, result.Misses)
+	assert.Equal(t, 2, result.Filled, "beyond-bound misses are still answered")
+	assert.Zero(t, store.Len(), "beyond-bound misses must not be cached")
+	assert.True(t, result.Cells[0][0].Present)
+}
+
+func TestTableSpansMultipleAreas(t *testing.T) {
+	t.Parallel()
+
+	store := memstore.New()
+	index := memindex.New(time.Minute, nil)
+	engine := &countingEngine{inner: haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)}
+
+	const areaA, areaB = beeline.AreaID(1), beeline.AreaID(2)
+	srcA := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	srcB := beeline.LatLng{Lat: 40.7128, Lng: -74.0060}
+	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194} // near srcA; far from srcB
+
+	router := coordRouter{areas: map[beeline.LatLng]beeline.RoutedArea{
+		srcA: {ID: areaA, Resolution: 9, MaxRadiusMeters: 0, TargetTTL: time.Minute},
+		srcB: {ID: areaB, Resolution: 7, MaxRadiusMeters: 0, TargetTTL: time.Minute},
+	}}
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
+	ctx := context.Background()
+
+	// Seed the srcA→dest cell in area A's partition only.
+	oCellA, err := beeline.CellAt(srcA, 9)
+	require.NoError(t, err)
+	dCellA, err := beeline.CellAt(dest, 9)
+	require.NoError(t, err)
+	require.NoError(t, store.Put(ctx, []beeline.Entry{{
+		Key:    beeline.PairKey{Area: areaA, Origin: oCellA, Dest: dCellA, Profile: "car", Res: 9},
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+	}}))
+
+	result, err := handler.Table(ctx, &query.TableQuery{
+		Sources:      []beeline.LatLng{srcA, srcB},
+		Destinations: []beeline.LatLng{dest},
+		Profile:      "car",
+		Fill:         false,
+	})
+	require.NoError(t, err)
+
+	// srcA keys against area A (seeded → hit); srcB keys against area B's own
+	// partition/resolution, where nothing is seeded → miss, absent under cache-only.
+	assert.Equal(t, 1, result.Hits)
+	assert.Equal(t, 1, result.Misses)
+	assert.InDelta(t, 42, result.Cells[0][0].Estimate.Duration, 1e-9, "srcA hit its area-A cache entry")
+	assert.False(t, result.Cells[1][0].Present, "srcB found nothing in its area-B partition")
+}
+
 func TestEstimateStaleHitBumps(t *testing.T) {
 	t.Parallel()
 

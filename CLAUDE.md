@@ -32,6 +32,14 @@ HTTP endpoints (default `:8080`):
   partition/resolution); a demand-fill is only cached when the trip is within the area's
   `maxRadiusMeters` bound. A coordinate outside every enabled area — or a trip beyond the bound — is
   still answered directly but not cached.
+- Batch read path — `POST /table`. A sparse, OSRM-`/table`-shaped batch: a JSON body of `sources` and
+  `destinations` (`"lat,lng"` strings) plus an optional `skip` denylist of `[sourceIdx, destIdx]` grid
+  cells and a `fill` flag (default `true`). It applies the same per-pair rules as `/estimate` but
+  batched — the whole grid's cache lookups are one `Store.BatchGet`, and (when `fill`) misses are
+  computed with at most one dense 1×K engine call per source coordinate (grouping like the refresh
+  pool). Response is dense `durations`/`distances` matrices (`null` for a skipped cell, or an
+  uncomputed miss when `fill=false`) plus a `meta` rollup (`hits`/`misses`/`filled`/`skipped`/…).
+  `fill=false` is a pure cache read that never touches the engine. `maxTableCells` bounds the grid.
 - Freshness/progress — `GET /_ops_/freshness` (the §3 debt/throughput contract as JSON, wire shape of
   `beeline.DebtStats`; aggregate across enabled areas, or one area with `?area=<id>`) and
   `GET /_ops_/cells` (per-origin-cell freshness rollup — `cell`/`area`/center/`total`/`fresh`/

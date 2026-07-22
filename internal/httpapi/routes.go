@@ -30,6 +30,12 @@ import (
 // maxGeoJSONBytes bounds an uploaded polygon so a malicious body can't exhaust memory.
 const maxGeoJSONBytes = 8 << 20 // 8 MiB
 
+// maxTableCells bounds the grid a single /table request may ask for (sources ×
+// destinations), so one call can't pin an unbounded amount of memory or engine work.
+// It is a prototype guard; a real deploy would make it configurable and tie the fill
+// path to the engine's Capabilities.MaxTableSize.
+const maxTableCells = 10_000
+
 // Deps are the dependencies the routes close over.
 type Deps struct {
 	Handler        *query.Handler
@@ -46,6 +52,7 @@ func Register(router routing.Router, deps *Deps) {
 	areaID := chirouter.NewRouteParamManager().BuildRouteParamIDFetcher(logger, "areaID", "area")
 
 	router.Get("/estimate", estimateHandler(deps, logger))
+	router.Post("/table", tableHandler(deps, logger))
 
 	router.Get("/_ops_/freshness", freshnessHandler(deps, logger))
 	router.Get("/_ops_/cells", cellsHandler(deps, logger))
@@ -108,6 +115,172 @@ func estimateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			Profile:        string(profile),
 			Stale:          result.Stale,
 		})
+	}
+}
+
+// tableRequest is the JSON body for a sparse batch estimate. Sources and Destinations
+// are "lat,lng" strings (the same form as /estimate's query params); Skip names grid
+// cells [sourceIdx, destIdx] to omit; Fill (default true when omitted) decides whether
+// misses are demand-filled through the engine or left absent.
+type tableRequest struct {
+	Fill         *bool    `json:"fill"`
+	Profile      string   `json:"profile"`
+	Sources      []string `json:"sources"`
+	Destinations []string `json:"destinations"`
+	Skip         [][2]int `json:"skip"`
+}
+
+// tableMeta is the per-request rollup describing how the grid resolved.
+type tableMeta struct {
+	Cells     int `json:"cells"`
+	Skipped   int `json:"skipped"`
+	Hits      int `json:"hits"`
+	Misses    int `json:"misses"`
+	Filled    int `json:"filled"`
+	SameCell  int `json:"sameCell"`
+	OutOfArea int `json:"outOfArea"`
+}
+
+// tableResponse is the dense result. Durations/Distances are sources × destinations;
+// a nil entry (JSON null) marks a skipped cell, or an uncomputed miss when fill=false.
+type tableResponse struct {
+	Profile   string       `json:"profile"`
+	Durations [][]*float64 `json:"durations"`
+	Distances [][]*float64 `json:"distances"`
+	Meta      tableMeta    `json:"meta"`
+}
+
+func tableHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req tableRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid table body: "+err.Error())
+			return
+		}
+
+		if len(req.Sources) == 0 || len(req.Destinations) == 0 {
+			writeError(w, logger, http.StatusBadRequest, "sources and destinations must both be non-empty")
+			return
+		}
+		if len(req.Sources)*len(req.Destinations) > maxTableCells {
+			writeError(w, logger, http.StatusBadRequest,
+				"table too large: sources × destinations exceeds "+strconv.Itoa(maxTableCells))
+			return
+		}
+
+		sources, err := parseLatLngs(req.Sources)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid source: "+err.Error())
+			return
+		}
+
+		destinations, err := parseLatLngs(req.Destinations)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid destination: "+err.Error())
+			return
+		}
+
+		skip, err := parseSkip(req.Skip, len(sources), len(destinations))
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid skip: "+err.Error())
+			return
+		}
+
+		profile := deps.DefaultProfile
+		if p := strings.TrimSpace(req.Profile); p != "" {
+			profile = beeline.Profile(p)
+		}
+
+		fill := true
+		if req.Fill != nil {
+			fill = *req.Fill
+		}
+
+		result, err := deps.Handler.Table(r.Context(), &query.TableQuery{
+			Sources:      sources,
+			Destinations: destinations,
+			Profile:      profile,
+			Skip:         skip,
+			Fill:         fill,
+		})
+		if err != nil {
+			logger.Error("computing table", err)
+			writeError(w, logger, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, logger, http.StatusOK, toTableResponse(result, string(profile)))
+	}
+}
+
+// parseLatLngs parses a slice of "lat,lng" strings, reporting the offending index.
+func parseLatLngs(raw []string) ([]beeline.LatLng, error) {
+	out := make([]beeline.LatLng, len(raw))
+	for i := range raw {
+		p, err := parseLatLng(raw[i])
+		if err != nil {
+			return nil, errors.New("index " + strconv.Itoa(i) + ": " + err.Error())
+		}
+		out[i] = p
+	}
+
+	return out, nil
+}
+
+// parseSkip validates the [sourceIdx, destIdx] skip pairs against the grid bounds and
+// collapses them into a set. An empty list yields an empty set (nothing skipped).
+func parseSkip(raw [][2]int, rows, cols int) (map[[2]int]struct{}, error) {
+	set := make(map[[2]int]struct{}, len(raw))
+	for _, cell := range raw {
+		if cell[0] < 0 || cell[0] >= rows || cell[1] < 0 || cell[1] >= cols {
+			return nil, errors.New("cell out of range: [" +
+				strconv.Itoa(cell[0]) + "," + strconv.Itoa(cell[1]) + "]")
+		}
+		set[cell] = struct{}{}
+	}
+
+	return set, nil
+}
+
+// toTableResponse projects a query.TableResult onto the dense wire matrices, leaving a
+// nil (JSON null) wherever a cell is absent (skipped, or an unfilled miss).
+func toTableResponse(result query.TableResult, profile string) tableResponse {
+	rows := len(result.Cells)
+
+	durations := make([][]*float64, rows)
+	distances := make([][]*float64, rows)
+	cells := 0
+
+	for i := range result.Cells {
+		cols := len(result.Cells[i])
+		cells += cols
+		durations[i] = make([]*float64, cols)
+		distances[i] = make([]*float64, cols)
+
+		for j := range result.Cells[i] {
+			cell := result.Cells[i][j]
+			if !cell.Present {
+				continue
+			}
+			dur, dist := cell.Estimate.Duration, cell.Estimate.Distance
+			durations[i][j] = &dur
+			distances[i][j] = &dist
+		}
+	}
+
+	return tableResponse{
+		Profile:   profile,
+		Durations: durations,
+		Distances: distances,
+		Meta: tableMeta{
+			Cells:     cells,
+			Skipped:   result.Skipped,
+			Hits:      result.Hits,
+			Misses:    result.Misses,
+			Filled:    result.Filled,
+			SameCell:  result.SameCell,
+			OutOfArea: result.OutOfArea,
+		},
 	}
 }
 

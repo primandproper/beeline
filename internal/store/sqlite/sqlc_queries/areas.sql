@@ -6,6 +6,10 @@ INSERT INTO areas (
     warm_strategy,
     core_radius_meters,
     demand_idle_ttl_seconds,
+    target_ttl_seconds,
+    lease_duration_seconds,
+    sweep_interval_seconds,
+    routing_provider,
     geojson,
     enabled,
     created_at,
@@ -17,6 +21,10 @@ INSERT INTO areas (
     sqlc.arg(warm_strategy),
     sqlc.arg(core_radius_meters),
     sqlc.arg(demand_idle_ttl_seconds),
+    sqlc.arg(target_ttl_seconds),
+    sqlc.arg(lease_duration_seconds),
+    sqlc.arg(sweep_interval_seconds),
+    sqlc.arg(routing_provider),
     sqlc.narg(geojson),
     sqlc.arg(enabled),
     sqlc.arg(created_at),
@@ -36,7 +44,11 @@ SELECT
     geojson,
     enabled,
     created_at,
-    updated_at
+    updated_at,
+    routing_provider,
+    target_ttl_seconds,
+    lease_duration_seconds,
+    sweep_interval_seconds
 FROM areas
 WHERE id = sqlc.arg(id);
 
@@ -52,7 +64,11 @@ SELECT
     geojson,
     enabled,
     created_at,
-    updated_at
+    updated_at,
+    routing_provider,
+    target_ttl_seconds,
+    lease_duration_seconds,
+    sweep_interval_seconds
 FROM areas
 ORDER BY id;
 
@@ -65,6 +81,10 @@ SET
     warm_strategy = sqlc.arg(warm_strategy),
     core_radius_meters = sqlc.arg(core_radius_meters),
     demand_idle_ttl_seconds = sqlc.arg(demand_idle_ttl_seconds),
+    target_ttl_seconds = sqlc.arg(target_ttl_seconds),
+    lease_duration_seconds = sqlc.arg(lease_duration_seconds),
+    sweep_interval_seconds = sqlc.arg(sweep_interval_seconds),
+    routing_provider = sqlc.arg(routing_provider),
     geojson = sqlc.narg(geojson),
     updated_at = sqlc.arg(updated_at)
 WHERE id = sqlc.arg(id);

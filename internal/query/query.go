@@ -42,27 +42,29 @@ type Result struct {
 	Stale      bool
 }
 
-// Handler answers estimate queries against the store, index, and engine. It consults
-// an AreaRouter per query to decide which service area (and resolution) a coordinate
-// belongs to, so multiple areas at different resolutions share one read path.
+// Handler answers estimate queries against the store, index, and routing engines. It
+// consults an AreaRouter per query to decide which service area (and resolution) a
+// coordinate belongs to, so multiple areas at different resolutions share one read
+// path, and an EngineResolver to pick that area's routing engine, so areas served by
+// different providers compute their misses through the right one.
 type Handler struct {
-	store     beeline.Store
-	index     beeline.FreshnessIndex
-	engine    beeline.RoutingEngine
-	router    AreaRouter
-	logger    logging.Logger
-	targetTTL time.Duration
+	store    beeline.Store
+	index    beeline.FreshnessIndex
+	resolver beeline.EngineResolver
+	router   AreaRouter
+	logger   logging.Logger
 }
 
-// NewHandler builds a read-path handler. A nil logger is replaced with a noop.
-func NewHandler(store beeline.Store, index beeline.FreshnessIndex, engine beeline.RoutingEngine, router AreaRouter, logger logging.Logger, targetTTL time.Duration) *Handler {
+// NewHandler builds a read-path handler. A nil logger is replaced with a noop. Staleness
+// is judged per query against the containing area's own target TTL (from the router), so
+// the read path carries no global TTL.
+func NewHandler(store beeline.Store, index beeline.FreshnessIndex, resolver beeline.EngineResolver, router AreaRouter, logger logging.Logger) *Handler {
 	return &Handler{
-		store:     store,
-		index:     index,
-		engine:    engine,
-		router:    router,
-		logger:    logging.EnsureLogger(logger),
-		targetTTL: targetTTL,
+		store:    store,
+		index:    index,
+		resolver: resolver,
+		router:   router,
+		logger:   logging.EnsureLogger(logger),
 	}
 }
 
@@ -74,8 +76,8 @@ func NewHandler(store beeline.Store, index beeline.FreshnessIndex, engine beelin
 func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, profile beeline.Profile) (Result, error) {
 	routed, ok := h.router.Locate(origin)
 	if !ok {
-		// Outside every enabled area: answer directly, cache nothing.
-		return h.compute(ctx, origin, dest, profile, SourceDemand)
+		// Outside every enabled area: answer directly (default engine), cache nothing.
+		return h.compute(ctx, 0, origin, dest, profile, SourceDemand)
 	}
 
 	resolution := routed.Resolution
@@ -93,7 +95,7 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 	// Same-cell collapse: center-to-center distance is ~0, wrong for a real trip.
 	// Compute directly on the true coordinates instead of trusting the cache (§9).
 	if originCell == destCell {
-		return h.compute(ctx, origin, dest, profile, SourceSameCell)
+		return h.compute(ctx, routed.ID, origin, dest, profile, SourceSameCell)
 	}
 
 	key := beeline.PairKey{Area: routed.ID, Origin: originCell, Dest: destCell, Profile: profile, Res: resolution}
@@ -105,7 +107,7 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 
 	if len(got) > 0 && got[0] != nil {
 		stored := got[0]
-		stale := time.Since(stored.ComputedAt) >= h.targetTTL
+		stale := time.Since(stored.ComputedAt) >= routed.TargetTTL
 		if stale {
 			// Return the stale value immediately; bump its refresh priority so the
 			// budget flows to pairs people actually query (§3). A bump failure is
@@ -130,7 +132,7 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 	// Miss: compute on the true endpoints now. Cache it only if the destination falls
 	// within the area's travel bound; beyond the bound the pair is answered but never
 	// tracked or stored, the same treatment as an out-of-area coordinate (§ warm-set).
-	res, err := h.compute(ctx, origin, dest, profile, SourceDemand)
+	res, err := h.compute(ctx, routed.ID, origin, dest, profile, SourceDemand)
 	if err != nil {
 		return Result{}, err
 	}
@@ -171,9 +173,11 @@ func withinBound(maxRadiusMeters float64, origin, dest beeline.LatLng) bool {
 	return geo.Haversine(origin, dest) <= maxRadiusMeters
 }
 
-// compute runs a 1×1 engine call on the true coordinates and packages the result.
-func (h *Handler) compute(ctx context.Context, origin, dest beeline.LatLng, profile beeline.Profile, source Source) (Result, error) {
-	resp, err := h.engine.Table(ctx, beeline.TableRequest{
+// compute runs a 1×1 engine call on the true coordinates and packages the result. The
+// area selects the routing engine: an in-area query uses its area's provider, while an
+// out-of-area query (area 0) falls back to the default engine via the resolver.
+func (h *Handler) compute(ctx context.Context, area beeline.AreaID, origin, dest beeline.LatLng, profile beeline.Profile, source Source) (Result, error) {
+	resp, err := h.resolver.EngineFor(area).Table(ctx, beeline.TableRequest{
 		Sources:      []beeline.LatLng{origin},
 		Destinations: []beeline.LatLng{dest},
 		Profile:      profile,

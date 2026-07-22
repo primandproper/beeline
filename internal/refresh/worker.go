@@ -26,15 +26,17 @@ type Config struct {
 
 // Pool owns the worker goroutines and the dependencies they share.
 type Pool struct {
-	engine beeline.RoutingEngine
-	store  beeline.Store
-	index  beeline.FreshnessIndex
-	logger logging.Logger
-	cfg    Config
+	resolver beeline.EngineResolver
+	store    beeline.Store
+	index    beeline.FreshnessIndex
+	logger   logging.Logger
+	cfg      Config
 }
 
-// NewPool wires a refresh pool. It does not start any goroutines; call Run.
-func NewPool(engine beeline.RoutingEngine, store beeline.Store, index beeline.FreshnessIndex, logger logging.Logger, cfg Config) *Pool {
+// NewPool wires a refresh pool. The resolver selects the routing engine per area, so a
+// claimed batch spanning several areas routes each through its own provider. It does
+// not start any goroutines; call Run.
+func NewPool(resolver beeline.EngineResolver, store beeline.Store, index beeline.FreshnessIndex, logger logging.Logger, cfg Config) *Pool {
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
@@ -45,7 +47,7 @@ func NewPool(engine beeline.RoutingEngine, store beeline.Store, index beeline.Fr
 		cfg.IdleBackoff = 250 * time.Millisecond
 	}
 
-	return &Pool{engine: engine, store: store, index: index, logger: logging.EnsureLogger(logger), cfg: cfg}
+	return &Pool{resolver: resolver, store: store, index: index, logger: logging.EnsureLogger(logger), cfg: cfg}
 }
 
 // Run starts the workers and blocks until ctx is cancelled, then waits for them to
@@ -96,18 +98,21 @@ func (p *Pool) work(ctx context.Context) {
 // refresh computes and stores a claimed batch. Keys are grouped by (origin,
 // profile) so each group is a single dense 1×K table request (§6).
 func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
-	// An H3 cell id encodes its resolution, so (origin, profile) fully identifies a
-	// dense 1×K request; resolution need not be part of the group key. Area is not:
-	// each claimed key keeps its own Area, so estimates are written under the correct
-	// area partition even when overlapping areas share an origin cell in one batch.
+	// An H3 cell id encodes its resolution, so (area, origin, profile) fully identifies
+	// a dense 1×K request; resolution need not be part of the group key. Area IS part of
+	// it: different areas may route through different engines (per-area providers), so a
+	// group must be single-area for its one Table call to hit the right engine — and each
+	// key still carries its Area, so estimates are written under the correct partition
+	// even when overlapping areas share an origin cell in one batch.
 	type groupKey struct {
 		profile beeline.Profile
+		area    beeline.AreaID
 		origin  beeline.H3Cell
 	}
 
 	groups := make(map[groupKey][]beeline.PairKey)
 	for pos := range keys {
-		g := groupKey{origin: keys[pos].Origin, profile: keys[pos].Profile}
+		g := groupKey{origin: keys[pos].Origin, profile: keys[pos].Profile, area: keys[pos].Area}
 		groups[g] = append(groups[g], keys[pos])
 	}
 
@@ -136,7 +141,7 @@ func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
 			dests = append(dests, center)
 		}
 
-		resp, err := p.engine.Table(ctx, beeline.TableRequest{
+		resp, err := p.resolver.EngineFor(g.area).Table(ctx, beeline.TableRequest{
 			Sources:      []beeline.LatLng{origin},
 			Destinations: dests,
 			Profile:      g.profile,

@@ -20,12 +20,30 @@
 			"car": 13.9,
 			"walk": 1.4
 		},
+		"providers": {
+			"osrm-local": {
+				"type": "osrm",
+				"baseURL": "http://localhost:5000",
+				"profiles": {
+					"bike": "cycling",
+					"car": "driving",
+					"walk": "foot"
+				},
+				"timeout": 5000000000,
+				"maxTableSize": 10000
+			}
+		},
 		"defaultProfile": "car",
 		"databasePath": "beeline.db",
 		"server": {
 			"startupDeadline": 5000000000,
 			"port": 8080,
 			"debug": false
+		},
+		"engineLatency": {
+			"min": 25000000,
+			"max": 120000000,
+			"enabled": true
 		},
 		"targetTTL": 30000000000,
 		"leaseDuration": 15000000000,

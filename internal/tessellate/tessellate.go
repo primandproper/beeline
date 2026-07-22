@@ -159,6 +159,49 @@ func fullMeshPairs(area beeline.AreaID, cells []beeline.H3Cell, resolution int, 
 	return pairs
 }
 
+// MinRadiusForNeighbors returns the smallest travel-radius bound (in meters) that
+// still reaches at least the first ring of neighbors around sample — i.e. the distance
+// from sample's center to its nearest ring-1 cell. A bound below this value yields
+// RingsForRadius == 0, collapsing the pair set to useless origin-only self-pairs, so it
+// is the operational floor for a bounded (non-full-mesh) area at sample's resolution.
+//
+// It measures real great-circle distance (geo.Haversine), the same method RingsForRadius
+// uses, so the two agree: a radius >= MinRadiusForNeighbors resolves to k >= 1. The
+// result is deterministic for a given (resolution, cell) since cell geometry is fixed.
+func MinRadiusForNeighbors(sample beeline.H3Cell) (float64, error) {
+	center, err := beeline.Center(sample)
+	if err != nil {
+		return 0, err
+	}
+
+	ring, err := h3.GridDisk(sample, 1)
+	if err != nil {
+		return 0, fmt.Errorf("tessellate: sizing neighbor floor: %w", err)
+	}
+
+	nearest := -1.0
+	for _, c := range ring {
+		if c == sample {
+			continue
+		}
+
+		cc, centerErr := beeline.Center(c)
+		if centerErr != nil {
+			return 0, centerErr
+		}
+		if d := geo.Haversine(center, cc); nearest < 0 || d < nearest {
+			nearest = d
+		}
+	}
+
+	if nearest < 0 {
+		// A pentagon cell can have no ring-1 neighbor to measure; treat as no floor.
+		return 0, nil
+	}
+
+	return nearest, nil
+}
+
 // RingsForRadius returns the H3 GridDisk ring count k that best approximates a metric
 // disk of radiusMeters around origin. It grows k outward one ring at a time, measuring
 // the actual great-circle distance (geo.Haversine) from origin's center to the nearest

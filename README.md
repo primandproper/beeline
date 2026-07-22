@@ -40,8 +40,8 @@ per-profile speed) behind the same interface a real engine (OSRM/Valhalla) would
 implement, so the whole pipeline runs with **no external routing dependency**.
 
 The fastest path is **`make demo`**: it runs the server against a fresh, gitignored
-SQLite database (`artifacts/demo.db`) and auto-seeds one **enabled** demo area (Lake
-Travis, Austin), so the console shows the cache loading immediately. `Ctrl-C` stops
+SQLite database (`artifacts/demo.db`) and auto-seeds one **enabled** demo area
+(Southeast Austin), so the console shows the cache loading immediately. `Ctrl-C` stops
 it; re-running resets from scratch. Override the port with `make demo PORT=9090`.
 
 ```bash

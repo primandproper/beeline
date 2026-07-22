@@ -49,14 +49,29 @@ func (w WarmStrategy) Valid() bool {
 // DemandIdleTTL is how long a demand-filled (unpinned) pair survives without being
 // queried before the decay sweep evicts it; 0 disables decay (demand pairs live until
 // the area is disabled). Eager-core pairs are never evicted regardless.
+//
+// TargetTTL, LeaseDuration, and SweepInterval are this area's freshness contract,
+// configured per area rather than globally: TargetTTL is the age at which a pair is
+// stale (and drives the required refresh throughput); LeaseDuration is the visibility
+// timeout a worker holds on a claimed pair; SweepInterval is the cadence of this area's
+// demand-decay janitor. New areas inherit the global config values as defaults.
+//
+// RoutingProvider names the engine this area is served by, referencing an entry in
+// the globally configured provider registry (§ per-area providers). The empty string
+// means the built-in default (haversine), so areas created before providers existed
+// keep routing through the in-process engine unchanged.
 type Area struct {
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	Name             string
 	WarmStrategy     WarmStrategy
+	RoutingProvider  string
 	GeoJSON          []byte
 	Cells            []H3Cell
 	DemandIdleTTL    time.Duration
+	TargetTTL        time.Duration
+	LeaseDuration    time.Duration
+	SweepInterval    time.Duration
 	ID               AreaID
 	Resolution       int
 	MaxRadiusMeters  float64
@@ -72,6 +87,7 @@ type Area struct {
 // the AreaRouter seam in package query. MaxRadiusMeters == 0 means unbounded (full
 // mesh): every in-area query is cacheable.
 type RoutedArea struct {
+	TargetTTL       time.Duration
 	ID              AreaID
 	Resolution      int
 	MaxRadiusMeters float64

@@ -33,6 +33,10 @@ INSERT INTO areas (
     warm_strategy,
     core_radius_meters,
     demand_idle_ttl_seconds,
+    target_ttl_seconds,
+    lease_duration_seconds,
+    sweep_interval_seconds,
+    routing_provider,
     geojson,
     enabled,
     created_at,
@@ -47,7 +51,11 @@ INSERT INTO areas (
     ?7,
     ?8,
     ?9,
-    ?10
+    ?10,
+    ?11,
+    ?12,
+    ?13,
+    ?14
 )
 RETURNING id
 `
@@ -59,6 +67,10 @@ type CreateAreaParams struct {
 	WarmStrategy         string
 	CoreRadiusMeters     float64
 	DemandIdleTtlSeconds int64
+	TargetTtlSeconds     int64
+	LeaseDurationSeconds int64
+	SweepIntervalSeconds int64
+	RoutingProvider      string
 	Geojson              *string
 	Enabled              int64
 	CreatedAt            string
@@ -73,6 +85,10 @@ func (q *Queries) CreateArea(ctx context.Context, db DBTX, arg *CreateAreaParams
 		arg.WarmStrategy,
 		arg.CoreRadiusMeters,
 		arg.DemandIdleTtlSeconds,
+		arg.TargetTtlSeconds,
+		arg.LeaseDurationSeconds,
+		arg.SweepIntervalSeconds,
+		arg.RoutingProvider,
 		arg.Geojson,
 		arg.Enabled,
 		arg.CreatedAt,
@@ -115,7 +131,11 @@ SELECT
     geojson,
     enabled,
     created_at,
-    updated_at
+    updated_at,
+    routing_provider,
+    target_ttl_seconds,
+    lease_duration_seconds,
+    sweep_interval_seconds
 FROM areas
 WHERE id = ?1
 `
@@ -135,6 +155,10 @@ func (q *Queries) GetArea(ctx context.Context, db DBTX, id int64) (*Areas, error
 		&i.Enabled,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.RoutingProvider,
+		&i.TargetTtlSeconds,
+		&i.LeaseDurationSeconds,
+		&i.SweepIntervalSeconds,
 	)
 	return &i, err
 }
@@ -181,7 +205,11 @@ SELECT
     geojson,
     enabled,
     created_at,
-    updated_at
+    updated_at,
+    routing_provider,
+    target_ttl_seconds,
+    lease_duration_seconds,
+    sweep_interval_seconds
 FROM areas
 ORDER BY id
 `
@@ -207,6 +235,10 @@ func (q *Queries) ListAreas(ctx context.Context, db DBTX) ([]*Areas, error) {
 			&i.Enabled,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.RoutingProvider,
+			&i.TargetTtlSeconds,
+			&i.LeaseDurationSeconds,
+			&i.SweepIntervalSeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -264,9 +296,13 @@ SET
     warm_strategy = ?4,
     core_radius_meters = ?5,
     demand_idle_ttl_seconds = ?6,
-    geojson = ?7,
-    updated_at = ?8
-WHERE id = ?9
+    target_ttl_seconds = ?7,
+    lease_duration_seconds = ?8,
+    sweep_interval_seconds = ?9,
+    routing_provider = ?10,
+    geojson = ?11,
+    updated_at = ?12
+WHERE id = ?13
 `
 
 type UpdateAreaParams struct {
@@ -276,6 +312,10 @@ type UpdateAreaParams struct {
 	WarmStrategy         string
 	CoreRadiusMeters     float64
 	DemandIdleTtlSeconds int64
+	TargetTtlSeconds     int64
+	LeaseDurationSeconds int64
+	SweepIntervalSeconds int64
+	RoutingProvider      string
 	Geojson              *string
 	UpdatedAt            string
 	ID                   int64
@@ -289,6 +329,10 @@ func (q *Queries) UpdateArea(ctx context.Context, db DBTX, arg *UpdateAreaParams
 		arg.WarmStrategy,
 		arg.CoreRadiusMeters,
 		arg.DemandIdleTtlSeconds,
+		arg.TargetTtlSeconds,
+		arg.LeaseDurationSeconds,
+		arg.SweepIntervalSeconds,
+		arg.RoutingProvider,
 		arg.Geojson,
 		arg.UpdatedAt,
 		arg.ID,

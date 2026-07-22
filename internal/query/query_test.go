@@ -22,6 +22,7 @@ type fakeRouter struct {
 	id         beeline.AreaID
 	resolution int
 	maxRadius  float64
+	targetTTL  time.Duration
 	present    bool
 }
 
@@ -30,10 +31,16 @@ func (f fakeRouter) Locate(beeline.LatLng) (beeline.RoutedArea, bool) {
 		return beeline.RoutedArea{}, false
 	}
 
-	return beeline.RoutedArea{ID: f.id, Resolution: f.resolution, MaxRadiusMeters: f.maxRadius}, true
+	return beeline.RoutedArea{ID: f.id, Resolution: f.resolution, MaxRadiusMeters: f.maxRadius, TargetTTL: f.targetTTL}, true
 }
 
 const testArea = beeline.AreaID(1)
+
+// fixedResolver serves every area (and out-of-area, id 0) through one engine, so the
+// read-path tests exercise a single provider without a control coordinator.
+type fixedResolver struct{ engine beeline.RoutingEngine }
+
+func (r fixedResolver) EngineFor(beeline.AreaID) beeline.RoutingEngine { return r.engine }
 
 func newHandler(t *testing.T, resolution int, ttl time.Duration) (*query.Handler, *memstore.Store, *memindex.Index) {
 	t.Helper()
@@ -41,9 +48,9 @@ func newHandler(t *testing.T, resolution int, ttl time.Duration) (*query.Handler
 	store := memstore.New()
 	index := memindex.New(ttl, nil)
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
-	router := fakeRouter{id: testArea, resolution: resolution, present: true}
+	router := fakeRouter{id: testArea, resolution: resolution, targetTTL: ttl, present: true}
 
-	return query.NewHandler(store, index, engine, router, nil, ttl), store, index
+	return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil), store, index
 }
 
 func TestEstimateSameCellCorrection(t *testing.T) {
@@ -123,7 +130,7 @@ func TestEstimateOutOfAreaComputesButDoesNotCache(t *testing.T) {
 	store := memstore.New()
 	index := memindex.New(time.Minute, nil)
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
-	handler := query.NewHandler(store, index, engine, fakeRouter{present: false}, nil, time.Minute)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, fakeRouter{present: false}, nil)
 
 	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
 	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194}
@@ -144,7 +151,7 @@ func TestEstimateBeyondBoundComputesButDoesNotCache(t *testing.T) {
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
 	// A tight 500 m bound: the ~2.2 km trip below falls outside it.
 	router := fakeRouter{id: testArea, resolution: 9, maxRadius: 500, present: true}
-	handler := query.NewHandler(store, index, engine, router, nil, time.Minute)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
 
 	ctx := context.Background()
 	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
@@ -170,7 +177,7 @@ func TestEstimateWithinBoundDemandFillIsTracked(t *testing.T) {
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
 	// A generous 10 km bound easily contains the ~2.2 km trip.
 	router := fakeRouter{id: testArea, resolution: 9, maxRadius: 10000, present: true}
-	handler := query.NewHandler(store, index, engine, router, nil, time.Minute)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
 
 	ctx := context.Background()
 	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}

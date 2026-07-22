@@ -42,17 +42,31 @@
     newRadius: id("new-radius"), newRadiusVal: id("new-radius-val"),
     newStrategy: id("new-strategy"),
     newCore: id("new-core"), newCoreVal: id("new-core-val"), newCoreField: id("new-core-field"),
+    newProvider: id("new-provider"),
     newTTL: id("new-ttl"),
+    newTargetTTL: id("new-target-ttl"), newLease: id("new-lease"), newSweep: id("new-sweep"),
     newGeoJSON: id("new-geojson"), createPreview: id("create-preview"),
     previewCells: id("preview-cells"),
     createBtn: id("create-btn"), createCancel: id("create-cancel"),
     detailSection: id("detail-section"), detailName: id("detail-name"),
     detailBadge: id("detail-badge"), detailRes: id("detail-res"),
     detailRadius: id("detail-radius"), detailStrategy: id("detail-strategy"),
+    detailProvider: id("detail-provider"),
     detailTTL: id("detail-ttl"), detailCells: id("detail-cells"),
+    detailTargetTTL: id("detail-target-ttl"), detailLease: id("detail-lease"), detailSweep: id("detail-sweep"),
     toggleEnable: id("toggle-enable"), editHexes: id("edit-hexes"),
     replaceGeoJSON: id("replace-geojson"), deleteArea: id("delete-area"),
     editHint: id("edit-hint"),
+    editSettingsBtn: id("edit-settings-btn"), editSettings: id("edit-settings"),
+    editName: id("edit-name"),
+    editRes: id("edit-res"), editResVal: id("edit-res-val"), editResHint: id("edit-res-hint"),
+    editRadius: id("edit-radius"), editRadiusVal: id("edit-radius-val"),
+    editStrategy: id("edit-strategy"),
+    editCore: id("edit-core"), editCoreVal: id("edit-core-val"), editCoreField: id("edit-core-field"),
+    editProvider: id("edit-provider"),
+    editTTL: id("edit-ttl"), editReconvergeHint: id("edit-reconverge-hint"),
+    editTargetTTL: id("edit-target-ttl"), editLease: id("edit-lease"), editSweep: id("edit-sweep"),
+    editSave: id("edit-save"), editCancel: id("edit-cancel"),
     excludeRegion: id("exclude-region"), excludeCtl: id("exclude-ctl"),
     excludeApply: id("exclude-apply"), excludeUndo: id("exclude-undo"),
     excludeCancel: id("exclude-cancel"),
@@ -189,6 +203,7 @@
     detail.cells = a.cells || [];
     cellSet = new Set(detail.cells);
 
+    closeEditSettings();
     els.detailSection.hidden = false;
     els.progressSection.hidden = !a.enabled;
     els.detailName.textContent = a.name;
@@ -199,7 +214,11 @@
     els.detailStrategy.textContent = a.warmStrategy === "hybrid"
       ? "hybrid (" + (a.coreRadiusMeters || 0).toLocaleString() + " m core)"
       : (a.warmStrategy || "eager");
+    els.detailProvider.textContent = a.routingProvider || "haversine";
     els.detailTTL.textContent = (a.demandIdleTTL && a.demandIdleTTL !== "0s") ? a.demandIdleTTL : "no decay";
+    els.detailTargetTTL.textContent = a.targetTTL || "—";
+    els.detailLease.textContent = a.leaseDuration || "—";
+    els.detailSweep.textContent = a.sweepInterval || "—";
     els.detailCells.textContent = a.cellCount.toLocaleString();
     els.toggleEnable.textContent = a.enabled ? "Disable" : "Enable";
 
@@ -208,11 +227,92 @@
   }
 
   function setEditMode(on) {
-    if (on) exitExclude();
+    if (on) { exitExclude(); closeEditSettings(); }
     editMode = on;
     els.editHexes.classList.toggle("active", on);
     els.editHint.hidden = !on;
     els.editHexes.textContent = on ? "Done editing" : "Edit hexes";
+  }
+
+  // ---- Edit settings --------------------------------------------------------
+  // Populate the form from the selected area and PATCH every knob back. The
+  // server overwrites all fields, so we always send the full set (mirroring
+  // the create form). Resolution and radius changes re-tessellate / re-seed
+  // server-side; the read-only detail grid then repaints from the response.
+  function openEditSettings() {
+    if (!detail) return;
+    setEditMode(false);
+    exitExclude();
+    els.editName.value = detail.name;
+    els.editRes.value = detail.resolution;
+    els.editResVal.textContent = detail.resolution;
+    els.editRadius.value = detail.maxRadiusMeters || 0;
+    els.editRadiusVal.textContent = detail.maxRadiusMeters || 0;
+    snapRadius(els.editRadius, els.editRadiusVal, els.editRes.value);
+    els.editStrategy.value = detail.warmStrategy || "eager";
+    els.editCore.value = detail.coreRadiusMeters || 0;
+    els.editCoreVal.textContent = detail.coreRadiusMeters || 0;
+    els.editCoreField.hidden = els.editStrategy.value !== "hybrid";
+    setSelectValue(els.editProvider, detail.routingProvider || "haversine");
+    els.editTTL.value = (detail.demandIdleTTL && detail.demandIdleTTL !== "0s") ? detail.demandIdleTTL : "";
+    els.editTargetTTL.value = detail.targetTTL || "";
+    els.editLease.value = detail.leaseDuration || "";
+    els.editSweep.value = detail.sweepInterval || "";
+
+    // Resolution can only change on a polyfilled area — a hand-built area has
+    // no stored geometry to reproject its cells from (server returns 400).
+    var handBuilt = !detail.geojson;
+    els.editRes.disabled = handBuilt;
+    els.editResHint.hidden = !handBuilt;
+
+    els.editReconvergeHint.hidden = !detail.enabled;
+    els.editSettings.hidden = false;
+    els.editSettingsBtn.classList.add("active");
+  }
+
+  function closeEditSettings() {
+    if (els.editSettings) els.editSettings.hidden = true;
+    if (els.editSettingsBtn) els.editSettingsBtn.classList.remove("active");
+  }
+
+  function saveSettings() {
+    if (selectedId == null || !detail) return;
+    var name = els.editName.value.trim();
+    if (!name) { toast("name is required", true); return; }
+    var strategy = els.editStrategy.value;
+    var body = {
+      name: name,
+      resolution: parseInt(els.editRes.value, 10),
+      maxRadiusMeters: parseFloat(els.editRadius.value),
+      warmStrategy: strategy,
+      coreRadiusMeters: strategy === "hybrid" ? parseFloat(els.editCore.value) : 0,
+      routingProvider: els.editProvider.value,
+    };
+    var ttl = els.editTTL.value.trim();
+    if (ttl) body.demandIdleTTL = ttl;
+    if (els.editTargetTTL.value.trim()) body.targetTTL = els.editTargetTTL.value.trim();
+    if (els.editLease.value.trim()) body.leaseDuration = els.editLease.value.trim();
+    if (els.editSweep.value.trim()) body.sweepInterval = els.editSweep.value.trim();
+
+    els.editSave.disabled = true;
+    fetch("/_config_/areas/" + selectedId, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(jsonOrErr).then(function (updated) {
+      closeEditSettings();
+      applyDetail(updated);
+      refreshAreas();
+      if (updated.cellCount === 0) {
+        toast("settings saved, but 0 cells — too small to cover any hex at this resolution", true);
+      } else {
+        toast("settings saved (" + updated.cellCount.toLocaleString() + " cells)");
+        if (updated.cells && updated.cells.length) {
+          map.fitBounds(cellsBounds(updated.cells), { padding: [40, 40], maxZoom: 13 });
+        }
+      }
+    }).catch(function (err) { toast(err.message, true); })
+      .finally(function () { els.editSave.disabled = false; });
   }
 
   // ---- Subtract-region editor -----------------------------------------------
@@ -222,6 +322,7 @@
   function enterExclude() {
     if (!detail) return;
     setEditMode(false);
+    closeEditSettings();
     excludeMode = true;
     excludeVerts = [];
     els.excludeRegion.classList.add("active");
@@ -307,9 +408,11 @@
   function openCreate() {
     setEditMode(false);
     exitExclude();
+    closeEditSettings();
     els.createSection.hidden = false;
     els.detailSection.hidden = true;
     els.progressSection.hidden = true;
+    snapRadius(els.newRadius, els.newRadiusVal, els.newRes.value);
     selectedId = null;
     detail = null;
     areaLayer.clearLayers();
@@ -373,8 +476,12 @@
       warmStrategy: strategy,
     };
     if (strategy === "hybrid") body.coreRadiusMeters = parseFloat(els.newCore.value);
+    if (els.newProvider.value) body.routingProvider = els.newProvider.value;
     var ttl = els.newTTL.value.trim();
     if (ttl) body.demandIdleTTL = ttl;
+    if (els.newTargetTTL.value.trim()) body.targetTTL = els.newTargetTTL.value.trim();
+    if (els.newLease.value.trim()) body.leaseDuration = els.newLease.value.trim();
+    if (els.newSweep.value.trim()) body.sweepInterval = els.newSweep.value.trim();
     if (pendingGeoJSON) body.geojson = pendingGeoJSON;
 
     els.createBtn.disabled = true;
@@ -554,6 +661,38 @@
     toastTimer = setTimeout(function () { els.toast.className = "toast"; }, 3200);
   }
 
+  // ---- Radius floor (Issue 1) ----------------------------------------------
+  // At a given H3 resolution a bounded max-radius smaller than the distance to the
+  // nearest neighbor cell yields zero neighbor rings, so every origin would pair only
+  // with itself. minRadiusForRes returns that neighbor floor (meters) for res, sampled
+  // near the current map view; snapRadius raises a radius slider up to it (and widens the
+  // slider's max if the floor exceeds it). Zero (full mesh) is left untouched. The ~5%
+  // margin keeps the snapped value above the server's own floor, which is measured from
+  // the area's representative cell and so can differ slightly by location.
+  var RADIUS_STEP = 500;
+
+  function minRadiusForRes(res) {
+    var c = map.getCenter();
+    var cell = h3.latLngToCell(c.lat, c.lng, parseInt(res, 10));
+    var here = h3.cellToLatLng(cell);
+    var nearest = -1;
+    h3.gridDisk(cell, 1).forEach(function (n) {
+      if (n === cell) return;
+      var d = h3.greatCircleDistance(here, h3.cellToLatLng(n), "m");
+      if (nearest < 0 || d < nearest) nearest = d;
+    });
+    if (nearest < 0) return 0; // pentagon: no neighbor to measure
+    return Math.ceil((nearest * 1.05) / RADIUS_STEP) * RADIUS_STEP;
+  }
+
+  function snapRadius(radiusEl, valEl, res) {
+    var floor = minRadiusForRes(res);
+    if (floor > Number(radiusEl.max)) radiusEl.max = String(floor);
+    var v = parseFloat(radiusEl.value);
+    if (v > 0 && v < floor) radiusEl.value = String(floor);
+    valEl.textContent = radiusEl.value;
+  }
+
   // ---- Bind & go ------------------------------------------------------------
   function bind() {
     els.newBtn.addEventListener("click", openCreate);
@@ -562,10 +701,11 @@
     els.newGeoJSON.addEventListener("change", previewCreateGeoJSON);
     els.newRes.addEventListener("input", function () {
       els.newResVal.textContent = els.newRes.value;
+      snapRadius(els.newRadius, els.newRadiusVal, els.newRes.value);
       if (pendingGeoJSON) previewCreateGeoJSON();
     });
     els.newRadius.addEventListener("input", function () {
-      els.newRadiusVal.textContent = els.newRadius.value;
+      snapRadius(els.newRadius, els.newRadiusVal, els.newRes.value);
     });
     els.newStrategy.addEventListener("change", function () {
       els.newCoreField.hidden = els.newStrategy.value !== "hybrid";
@@ -576,6 +716,22 @@
     els.toggleEnable.addEventListener("click", function () {
       if (selectedId != null) setEnabled(selectedId, !detail.enabled);
     });
+    els.editSettingsBtn.addEventListener("click", function () {
+      if (els.editSettings.hidden) openEditSettings(); else closeEditSettings();
+    });
+    els.editRes.addEventListener("input", function () {
+      els.editResVal.textContent = els.editRes.value;
+      snapRadius(els.editRadius, els.editRadiusVal, els.editRes.value);
+    });
+    els.editRadius.addEventListener("input", function () {
+      snapRadius(els.editRadius, els.editRadiusVal, els.editRes.value);
+    });
+    els.editStrategy.addEventListener("change", function () {
+      els.editCoreField.hidden = els.editStrategy.value !== "hybrid";
+    });
+    els.editCore.addEventListener("input", function () { els.editCoreVal.textContent = els.editCore.value; });
+    els.editSave.addEventListener("click", saveSettings);
+    els.editCancel.addEventListener("click", closeEditSettings);
     els.editHexes.addEventListener("click", function () { setEditMode(!editMode); });
     els.excludeRegion.addEventListener("click", function () { if (excludeMode) exitExclude(); else enterExclude(); });
     els.excludeApply.addEventListener("click", applyExclude);
@@ -585,8 +741,33 @@
     els.deleteArea.addEventListener("click", deleteArea);
   }
 
+  // setSelectValue selects opt in sel, appending it if the option is absent (e.g. an
+  // area references a provider no longer in config), so the current value stays visible.
+  function setSelectValue(sel, opt) {
+    if (!sel) return;
+    var found = false;
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === opt) { found = true; break; }
+    }
+    if (!found) sel.appendChild(new Option(opt + " (unconfigured)", opt));
+    sel.value = opt;
+  }
+
+  // loadProviders fills the create/edit provider pickers from live server config, so
+  // the options track whatever named providers the operator configured.
+  function loadProviders() {
+    return fetch("/_config_/providers").then(jsonOrErr).then(function (names) {
+      [els.newProvider, els.editProvider].forEach(function (sel) {
+        if (!sel) return;
+        sel.innerHTML = "";
+        (names || []).forEach(function (n) { sel.appendChild(new Option(n, n)); });
+      });
+    }).catch(function () { /* non-fatal: the default is applied server-side */ });
+  }
+
   initMap();
   bind();
+  loadProviders();
   refreshAreas().finally(function () {
     pollOnce();
     setInterval(pollOnce, 1500);

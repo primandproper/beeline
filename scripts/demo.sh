@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 #
 # make demo — run beeline against a fresh, gitignored SQLite database and seed one
-# enabled service area (Lake Travis, Austin) so the operator console shows the cache
+# enabled service area (Southeast Austin) so the operator console shows the cache
 # loading right away. The server polyfills the demo polygon into its cell set (design
-# §7); refine it by hand from the console to carve out the reservoir. Ctrl-C stops the
-# server.
+# §7); refine it by hand from the console. Ctrl-C stops the server.
 #
 # Overridable via environment: BINARY, CONFIG, DEMO_DB, PORT.
 set -euo pipefail
@@ -43,17 +42,17 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
-echo "▶ creating + enabling the demo area (Lake Travis, Austin)"
+echo "▶ creating + enabling the demo area (Southeast Austin)"
 response="$(curl -sf -X POST "${BASE}/_config_/areas" \
   -H 'content-type: application/json' \
   --data-binary @- <<'JSON'
 {
-  "name": "Lake Travis (demo)",
+  "name": "Southeast Austin (demo)",
   "resolution": 9,
   "maxRadiusMeters": 1200,
   "geojson": {
     "type": "Polygon",
-    "coordinates": [[[-98.06, 30.31], [-97.99, 30.31], [-97.99, 30.38], [-98.06, 30.38], [-98.06, 30.31]]]
+    "coordinates": [[[-97.73643590690735, 30.378884924515347], [-97.64431233281992, 30.329297974985618], [-97.68853062714535, 30.178253958296438], [-97.82436047273201, 30.235695031249538], [-97.73643590690735, 30.378884924515347]]]
   }
 }
 JSON

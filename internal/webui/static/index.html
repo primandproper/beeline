@@ -61,9 +61,31 @@
           </div>
         </div>
         <div class="field">
+          <label for="new-provider">Routing provider</label>
+          <select id="new-provider" class="text"></select>
+          <div class="hint">Which engine serves this area. Populated from server config.</div>
+        </div>
+        <div class="field">
           <label for="new-ttl">Demand idle TTL</label>
           <input type="text" id="new-ttl" class="text" placeholder="e.g. 1h (blank = never decay)" />
           <div class="hint">Demand-filled pairs unqueried for this long are evicted. Blank / 0 disables decay.</div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="new-target-ttl">Target TTL</label>
+            <input type="text" id="new-target-ttl" class="text" placeholder="blank = default" />
+            <div class="hint">Freshness window: a pair older than this is refreshed.</div>
+          </div>
+          <div class="field">
+            <label for="new-lease">Lease</label>
+            <input type="text" id="new-lease" class="text" placeholder="blank = default" />
+            <div class="hint">Refresh claim visibility timeout.</div>
+          </div>
+          <div class="field">
+            <label for="new-sweep">Sweep interval</label>
+            <input type="text" id="new-sweep" class="text" placeholder="blank = default" />
+            <div class="hint">Demand-decay cadence for this area.</div>
+          </div>
         </div>
         <div class="field">
           <label for="new-geojson">GeoJSON polygon</label>
@@ -89,14 +111,86 @@
           <div><span class="dk">resolution</span><span class="dv" id="detail-res">—</span></div>
           <div><span class="dk">max radius</span><span class="dv" id="detail-radius">—</span></div>
           <div><span class="dk">warm</span><span class="dv" id="detail-strategy">—</span></div>
+          <div><span class="dk">provider</span><span class="dv" id="detail-provider">—</span></div>
           <div><span class="dk">demand TTL</span><span class="dv" id="detail-ttl">—</span></div>
+          <div><span class="dk">target TTL</span><span class="dv" id="detail-target-ttl">—</span></div>
+          <div><span class="dk">lease</span><span class="dv" id="detail-lease">—</span></div>
+          <div><span class="dk">sweep</span><span class="dv" id="detail-sweep">—</span></div>
           <div><span class="dk">cells</span><span class="dv" id="detail-cells">—</span></div>
         </div>
         <div class="btn-row">
           <button class="apply" id="toggle-enable">Enable</button>
-          <button class="ghost" id="edit-hexes">Edit hexes</button>
+          <button class="ghost" id="edit-settings-btn">Edit settings</button>
         </div>
+
+        <!-- Edit settings: PATCH the area's resolution / radius / warm knobs. -->
+        <div class="edit-form" id="edit-settings" hidden>
+          <div class="field">
+            <label for="edit-name">Name</label>
+            <input type="text" id="edit-name" class="text" />
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="edit-res">H3 resolution <span class="val" id="edit-res-val">8</span></label>
+              <input type="range" id="edit-res" min="4" max="12" step="1" value="8" />
+              <div class="hint" id="edit-res-hint" hidden>Hand-built area — resolution is fixed. Replace its geometry to re-tessellate.</div>
+            </div>
+            <div class="field">
+              <label for="edit-radius">Max radius (m) <span class="val" id="edit-radius-val">3000</span></label>
+              <input type="range" id="edit-radius" min="0" max="20000" step="500" value="3000" />
+              <div class="hint">Per-origin travel-radius bound. 0 = full mesh (every in-area pair).</div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="edit-strategy">Warm strategy</label>
+              <select id="edit-strategy" class="text">
+                <option value="eager">eager — pin the whole bound</option>
+                <option value="lazy">lazy — demand only</option>
+                <option value="hybrid">hybrid — pin core, fill tail</option>
+              </select>
+            </div>
+            <div class="field" id="edit-core-field" hidden>
+              <label for="edit-core">Core radius (m) <span class="val" id="edit-core-val">1500</span></label>
+              <input type="range" id="edit-core" min="0" max="20000" step="500" value="1500" />
+              <div class="hint">Hybrid only: near field pinned fresh (≤ max radius).</div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="edit-provider">Routing provider</label>
+            <select id="edit-provider" class="text"></select>
+          </div>
+          <div class="field">
+            <label for="edit-ttl">Demand idle TTL</label>
+            <input type="text" id="edit-ttl" class="text" placeholder="e.g. 1h (blank = never decay)" />
+            <div class="hint">Demand-filled pairs unqueried for this long are evicted. Blank / 0 disables decay.</div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="edit-target-ttl">Target TTL</label>
+              <input type="text" id="edit-target-ttl" class="text" placeholder="blank = default" />
+              <div class="hint">Freshness window: a pair older than this is refreshed.</div>
+            </div>
+            <div class="field">
+              <label for="edit-lease">Lease</label>
+              <input type="text" id="edit-lease" class="text" placeholder="blank = default" />
+              <div class="hint">Refresh claim visibility timeout.</div>
+            </div>
+            <div class="field">
+              <label for="edit-sweep">Sweep interval</label>
+              <input type="text" id="edit-sweep" class="text" placeholder="blank = default" />
+              <div class="hint">Demand-decay cadence for this area.</div>
+            </div>
+          </div>
+          <div class="hint" id="edit-reconverge-hint" hidden>Saving re-seeds this enabled area — its cache reloads from zero.</div>
+          <div class="btn-row">
+            <button class="apply" id="edit-save">Save settings</button>
+            <button class="ghost" id="edit-cancel">Cancel</button>
+          </div>
+        </div>
+
         <div class="btn-row">
+          <button class="ghost" id="edit-hexes">Edit hexes</button>
           <button class="ghost" id="exclude-region">Exclude region</button>
         </div>
         <div class="btn-row">

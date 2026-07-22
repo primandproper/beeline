@@ -32,6 +32,14 @@ type baseline struct {
 	computedTotal int64
 }
 
+// areaFreshness is one area's freshness contract, configured per area by the control
+// plane. Zero values fall back to the index-wide defaults (the New targetTTL, and the
+// lease passed to Claim), so an area with no override behaves as before.
+type areaFreshness struct {
+	targetTTL time.Duration
+	lease     time.Duration
+}
+
 // Index tracks staleness for every pair in the working set and hands the stalest
 // due pairs to workers under a lease.
 type Index struct {
@@ -39,6 +47,7 @@ type Index struct {
 	now           func() time.Time
 	entries       map[beeline.PairKey]*entry
 	baselines     map[beeline.AreaID]*baseline
+	areaFresh     map[beeline.AreaID]areaFreshness
 	targetTTL     time.Duration
 	computedTotal int64
 	mu            sync.Mutex
@@ -55,9 +64,43 @@ func New(targetTTL time.Duration, clock func() time.Time) *Index {
 		now:       clock,
 		entries:   make(map[beeline.PairKey]*entry),
 		baselines: make(map[beeline.AreaID]*baseline),
+		areaFresh: make(map[beeline.AreaID]areaFreshness),
 		targetTTL: targetTTL,
 		started:   clock(),
 	}
+}
+
+// SetAreaFreshness records an area's per-area freshness contract: the target TTL used
+// to decide staleness for its pairs and the lease duration applied when its pairs are
+// claimed. A non-positive value for either falls back to the index-wide default. The
+// control plane calls it on enable/seed/convergence; Unseed drops it.
+func (i *Index) SetAreaFreshness(_ context.Context, area beeline.AreaID, targetTTL, lease time.Duration) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.areaFresh[area] = areaFreshness{targetTTL: targetTTL, lease: lease}
+
+	return nil
+}
+
+// ttlFor returns the target TTL governing an area's pairs: its per-area override when
+// set, else the index-wide default. Callers hold i.mu.
+func (i *Index) ttlFor(area beeline.AreaID) time.Duration {
+	if f, ok := i.areaFresh[area]; ok && f.targetTTL > 0 {
+		return f.targetTTL
+	}
+
+	return i.targetTTL
+}
+
+// leaseFor returns the lease duration for an area's claims: its per-area override when
+// set, else fallback (the value the worker passed to Claim). Callers hold i.mu.
+func (i *Index) leaseFor(area beeline.AreaID, fallback time.Duration) time.Duration {
+	if f, ok := i.areaFresh[area]; ok && f.lease > 0 {
+		return f.lease
+	}
+
+	return fallback
 }
 
 // Seed adds keys to the working set as never-computed (maximally stale) and pinned,
@@ -117,6 +160,7 @@ func (i *Index) Unseed(_ context.Context, area beeline.AreaID) error {
 		}
 	}
 	delete(i.baselines, area)
+	delete(i.areaFresh, area)
 
 	return nil
 }
@@ -182,7 +226,7 @@ func (i *Index) CellStates(_ context.Context) ([]beeline.CellState, error) {
 		if age > r.oldestAge {
 			r.oldestAge = age
 		}
-		if age < i.targetTTL {
+		if age < i.ttlFor(key.Area) {
 			r.fresh++
 		}
 	}
@@ -215,6 +259,8 @@ func (i *Index) CellStatesForArea(_ context.Context, area beeline.AreaID) ([]bee
 		oldestAge time.Duration
 	}
 
+	ttl := i.ttlFor(area)
+
 	byOrigin := make(map[beeline.H3Cell]*rollup)
 	for key, e := range i.entries {
 		if key.Area != area {
@@ -236,7 +282,7 @@ func (i *Index) CellStatesForArea(_ context.Context, area beeline.AreaID) ([]bee
 		if age > r.oldestAge {
 			r.oldestAge = age
 		}
-		if age < i.targetTTL {
+		if age < ttl {
 			r.fresh++
 		}
 	}
@@ -255,8 +301,8 @@ func (i *Index) CellStatesForArea(_ context.Context, area beeline.AreaID) ([]bee
 }
 
 // due reports whether a pair should be refreshed now: not currently leased, and
-// either never computed, demand-bumped, or older than the target TTL.
-func (i *Index) due(e *entry, now time.Time) bool {
+// either never computed, demand-bumped, or older than its area's target TTL.
+func (i *Index) due(e *entry, now time.Time, area beeline.AreaID) bool {
 	if now.Before(e.leaseUntil) {
 		return false
 	}
@@ -264,7 +310,7 @@ func (i *Index) due(e *entry, now time.Time) bool {
 		return true
 	}
 
-	return now.Sub(e.computedAt) >= i.targetTTL
+	return now.Sub(e.computedAt) >= i.ttlFor(area)
 }
 
 // Claim leases up to limit of the stalest due keys for the given visibility
@@ -283,7 +329,7 @@ func (i *Index) Claim(_ context.Context, limit int, lease time.Duration) ([]beel
 
 	candidates := make([]candidate, 0)
 	for k, e := range i.entries {
-		if i.due(e, now) {
+		if i.due(e, now, k.Area) {
 			candidates = append(candidates, candidate{key: k, e: e})
 		}
 	}
@@ -309,7 +355,7 @@ func (i *Index) Claim(_ context.Context, limit int, lease time.Duration) ([]beel
 
 	claimed := make([]beeline.PairKey, len(candidates))
 	for idx := range candidates {
-		candidates[idx].e.leaseUntil = now.Add(lease)
+		candidates[idx].e.leaseUntil = now.Add(i.leaseFor(candidates[idx].key.Area, lease))
 		claimed[idx] = candidates[idx].key
 	}
 
@@ -397,9 +443,14 @@ func (i *Index) Debt(_ context.Context) (beeline.DebtStats, error) {
 	var (
 		debt      int
 		oldestAge time.Duration
+		required  float64 // entries/sec needed, summed per-pair since TTLs vary by area
 	)
 
-	for _, e := range i.entries {
+	for k, e := range i.entries {
+		if ttl := i.ttlFor(k.Area).Seconds(); ttl > 0 {
+			required += 1 / ttl
+		}
+
 		if e.computedAt.IsZero() {
 			debt++
 			continue
@@ -409,17 +460,12 @@ func (i *Index) Debt(_ context.Context) (beeline.DebtStats, error) {
 		if age > oldestAge {
 			oldestAge = age
 		}
-		if age >= i.targetTTL {
+		if age >= i.ttlFor(k.Area) {
 			debt++
 		}
 	}
 
 	workingSet := len(i.entries)
-
-	var required float64
-	if ttl := i.targetTTL.Seconds(); ttl > 0 {
-		required = float64(workingSet) / ttl
-	}
 
 	var achieved float64
 	if elapsed := now.Sub(i.started).Seconds(); elapsed > 0 {
@@ -452,6 +498,8 @@ func (i *Index) DebtForArea(_ context.Context, area beeline.AreaID) (beeline.Deb
 		oldestAge  time.Duration
 	)
 
+	areaTTL := i.ttlFor(area)
+
 	for k, e := range i.entries {
 		if k.Area != area {
 			continue
@@ -467,13 +515,13 @@ func (i *Index) DebtForArea(_ context.Context, area beeline.AreaID) (beeline.Deb
 		if age > oldestAge {
 			oldestAge = age
 		}
-		if age >= i.targetTTL {
+		if age >= areaTTL {
 			debt++
 		}
 	}
 
 	var required float64
-	if ttl := i.targetTTL.Seconds(); ttl > 0 {
+	if ttl := areaTTL.Seconds(); ttl > 0 {
 		required = float64(workingSet) / ttl
 	}
 

@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/control"
+	"github.com/primandproper/beeline/internal/engine/registry"
 	memindex "github.com/primandproper/beeline/internal/freshness/memory"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
@@ -17,10 +19,11 @@ import (
 )
 
 const (
-	testRes = 8
-	sfLat   = 37.7749
-	sfLng   = -122.4194
-	testTTL = 60_000_000_000 // 1 minute in nanoseconds
+	testRes      = 8
+	sfLat        = 37.7749
+	sfLng        = -122.4194
+	testTTL      = 60_000_000_000 // 1 minute in nanoseconds
+	testProvider = "osrm-test"    // the named provider newHarness registers alongside the default
 )
 
 // harness bundles a coordinator with the concrete seams it drives, so tests can assert
@@ -42,7 +45,23 @@ func newHarness(t *testing.T) *harness {
 	repo := areasqlite.NewRepository(db, nil)
 	index := memindex.New(testTTL, nil)
 	store := memstore.New()
-	coord := control.New(repo, index, store, []beeline.Profile{"car"})
+
+	// A registry with the built-in default plus one named OSRM provider, so tests can
+	// exercise per-area provider selection and unknown-provider rejection.
+	providers, err := registry.Build(
+		map[string]config.ProviderConfig{
+			testProvider: {Type: config.ProviderTypeOSRM, BaseURL: "http://osrm-test:5000", MaxTableSize: 10000},
+		},
+		map[beeline.Profile]float64{"car": 10},
+		config.EngineLatencyConfig{},
+	)
+	require.NoError(t, err)
+
+	coord := control.New(repo, index, store, []beeline.Profile{"car"}, providers, config.DefaultProviderName, control.FreshnessDefaults{
+		TargetTTL:     testTTL,
+		LeaseDuration: 15 * time.Second,
+		SweepInterval: time.Second,
+	})
 
 	return &harness{repo: repo, index: index, store: store, coord: coord}
 }
@@ -167,13 +186,13 @@ func TestSweepExpiredEvictsColdDemandFromIndexAndStore(t *testing.T) {
 	require.Equal(t, 1, h.store.Len())
 
 	// Within the TTL nothing is swept.
-	swept, err := h.coord.SweepExpired(ctx, time.Now())
+	swept, err := h.coord.SweepDue(ctx, time.Now())
 	require.NoError(t, err)
 	assert.Zero(t, swept, "a freshly-accessed pair is not cold yet")
 	assert.Equal(t, 1, h.store.Len())
 
 	// Past the TTL the pair is evicted from both the index and the hot store.
-	swept, err = h.coord.SweepExpired(ctx, time.Now().Add(2*time.Hour))
+	swept, err = h.coord.SweepDue(ctx, time.Now().Add(2*time.Hour))
 	require.NoError(t, err)
 	assert.Equal(t, 1, swept, "the cold demand pair is swept")
 
@@ -212,7 +231,7 @@ func TestSweepExpiredSkipsDecayDisabledAndPinned(t *testing.T) {
 	require.NoError(t, h.index.Access(ctx, []beeline.PairKey{key}))
 
 	// Even far in the future, nothing is swept.
-	swept, err := h.coord.SweepExpired(ctx, time.Now().Add(9000*time.Hour))
+	swept, err := h.coord.SweepDue(ctx, time.Now().Add(9000*time.Hour))
 	require.NoError(t, err)
 	assert.Zero(t, swept, "pinned pairs and decay-disabled areas are never swept")
 
@@ -240,6 +259,18 @@ func TestValidationRejectsBadWarmConfig(t *testing.T) {
 			WarmStrategy: beeline.WarmLazy, Cells: cells,
 		})
 		assert.Error(t, err, "full-mesh (max 0) with a non-eager strategy is rejected")
+	})
+
+	t.Run("bounded radius below the neighbor floor is rejected", func(t *testing.T) {
+		t.Parallel()
+
+		// 500m at res 8 reaches no neighbor cell (cells are ~900m apart), so every
+		// origin would pair only with itself — the degenerate case the floor forbids.
+		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
+			Name: "too-tight", Resolution: testRes, MaxRadiusMeters: 500,
+			WarmStrategy: beeline.WarmEager, Cells: cells,
+		})
+		assert.Error(t, err, "a max radius below the res-8 neighbor floor is rejected")
 	})
 
 	t.Run("core may not exceed max", func(t *testing.T) {
@@ -424,7 +455,13 @@ func TestResumeEnabledSeedsOnlyEnabled(t *testing.T) {
 	// same persisted areas.
 	freshIndex := memindex.New(testTTL, nil)
 	freshStore := memstore.New()
-	fresh := control.New(h.repo, freshIndex, freshStore, []beeline.Profile{"car"})
+	freshProviders, err := registry.Build(nil, map[beeline.Profile]float64{"car": 10}, config.EngineLatencyConfig{})
+	require.NoError(t, err)
+	fresh := control.New(h.repo, freshIndex, freshStore, []beeline.Profile{"car"}, freshProviders, config.DefaultProviderName, control.FreshnessDefaults{
+		TargetTTL:     testTTL,
+		LeaseDuration: 15 * time.Second,
+		SweepInterval: time.Second,
+	})
 
 	require.NoError(t, fresh.ResumeEnabled(ctx))
 
@@ -451,4 +488,89 @@ func TestCreateRejectsMixedResolutionCells(t *testing.T) {
 		Name: "bad", Resolution: testRes, MaxRadiusMeters: 1500, Cells: []beeline.H3Cell{center9},
 	})
 	assert.Error(t, err)
+}
+
+func TestCreateDefaultsProviderToHaversine(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	// No RoutingProvider set → normalized and persisted as the built-in default.
+	area := createArea(t, h, diskCells(t, 1))
+	assert.Equal(t, config.DefaultProviderName, area.RoutingProvider)
+
+	got, err := h.coord.Get(context.Background(), area.ID)
+	require.NoError(t, err)
+	assert.Equal(t, config.DefaultProviderName, got.RoutingProvider)
+}
+
+func TestCreateRejectsUnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	_, err := h.coord.Create(context.Background(), &control.CreateAreaInput{
+		Name: "bad", Resolution: testRes, MaxRadiusMeters: 1500,
+		Cells: diskCells(t, 1), RoutingProvider: "nope",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown routing provider")
+}
+
+func TestEngineForSelectsPerAreaProvider(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	// An area on the named OSRM provider (max table size 10000, per newHarness).
+	osrmArea, err := h.coord.Create(ctx, &control.CreateAreaInput{
+		Name: "osrm", Resolution: testRes, MaxRadiusMeters: 1500,
+		Cells: diskCells(t, 1), RoutingProvider: testProvider,
+	})
+	require.NoError(t, err)
+	_, err = h.coord.Enable(ctx, osrmArea.ID)
+	require.NoError(t, err)
+
+	// A second area on the built-in default (unbounded table size).
+	defaultArea := createArea(t, h, diskCells(t, 1))
+	_, err = h.coord.Enable(ctx, defaultArea.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, 10000, h.coord.EngineFor(osrmArea.ID).Capabilities().MaxTableSize,
+		"the OSRM area routes through its named provider")
+	assert.Equal(t, 0, h.coord.EngineFor(defaultArea.ID).Capabilities().MaxTableSize,
+		"the default area routes through the built-in engine")
+	assert.Equal(t, 0, h.coord.EngineFor(0).Capabilities().MaxTableSize,
+		"an out-of-area query falls back to the default engine")
+}
+
+func TestUpdateChangesProvider(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	area := createArea(t, h, diskCells(t, 1))
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+	require.Equal(t, 0, h.coord.EngineFor(area.ID).Capabilities().MaxTableSize)
+
+	updated, err := h.coord.Update(ctx, area.ID, &control.UpdateAreaInput{
+		Name: area.Name, Resolution: area.Resolution, MaxRadiusMeters: area.MaxRadiusMeters,
+		RoutingProvider: testProvider,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, testProvider, updated.RoutingProvider)
+	assert.Equal(t, 10000, h.coord.EngineFor(area.ID).Capabilities().MaxTableSize,
+		"re-converging the enabled area picks up the new provider's engine")
+}
+
+func TestProviderNamesListsDefaultFirst(t *testing.T) {
+	t.Parallel()
+
+	names := newHarness(t).coord.ProviderNames()
+	require.NotEmpty(t, names)
+	assert.Equal(t, config.DefaultProviderName, names[0], "the default is listed first")
+	assert.Contains(t, names, testProvider)
 }

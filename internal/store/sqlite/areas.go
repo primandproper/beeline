@@ -53,7 +53,11 @@ func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area,
 			RadiusMeters:         a.MaxRadiusMeters,
 			WarmStrategy:         string(a.WarmStrategy),
 			CoreRadiusMeters:     a.CoreRadiusMeters,
-			DemandIdleTtlSeconds: ttlSeconds(a.DemandIdleTTL),
+			DemandIdleTtlSeconds: durationSeconds(a.DemandIdleTTL),
+			TargetTtlSeconds:     durationSeconds(a.TargetTTL),
+			LeaseDurationSeconds: durationSeconds(a.LeaseDuration),
+			SweepIntervalSeconds: durationSeconds(a.SweepInterval),
+			RoutingProvider:      a.RoutingProvider,
 			Geojson:              geojsonParam(a.GeoJSON),
 			Enabled:              boolToInt(a.Enabled),
 			CreatedAt:            now.Format(timeFormat),
@@ -129,7 +133,11 @@ func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
 			RadiusMeters:         a.MaxRadiusMeters,
 			WarmStrategy:         string(a.WarmStrategy),
 			CoreRadiusMeters:     a.CoreRadiusMeters,
-			DemandIdleTtlSeconds: ttlSeconds(a.DemandIdleTTL),
+			DemandIdleTtlSeconds: durationSeconds(a.DemandIdleTTL),
+			TargetTtlSeconds:     durationSeconds(a.TargetTTL),
+			LeaseDurationSeconds: durationSeconds(a.LeaseDuration),
+			SweepIntervalSeconds: durationSeconds(a.SweepInterval),
+			RoutingProvider:      a.RoutingProvider,
 			Geojson:              geojsonParam(a.GeoJSON),
 			UpdatedAt:            now.Format(timeFormat),
 		}); updErr != nil {
@@ -268,7 +276,11 @@ func convertArea(row *generated.Areas, cells []beeline.H3Cell) (beeline.Area, er
 		MaxRadiusMeters:  row.RadiusMeters,
 		CoreRadiusMeters: row.CoreRadiusMeters,
 		WarmStrategy:     beeline.WarmStrategy(row.WarmStrategy),
+		RoutingProvider:  row.RoutingProvider,
 		DemandIdleTTL:    time.Duration(row.DemandIdleTtlSeconds) * time.Second,
+		TargetTTL:        time.Duration(row.TargetTtlSeconds) * time.Second,
+		LeaseDuration:    time.Duration(row.LeaseDurationSeconds) * time.Second,
+		SweepInterval:    time.Duration(row.SweepIntervalSeconds) * time.Second,
 		Cells:            cells,
 		GeoJSON:          geojson,
 		Enabled:          row.Enabled != 0,
@@ -287,9 +299,10 @@ func geojsonParam(raw []byte) *string {
 	return &s
 }
 
-// ttlSeconds rounds a demand-idle TTL down to whole seconds for storage. Sub-second
-// precision is meaningless for a decay window measured in minutes-to-hours.
-func ttlSeconds(d time.Duration) int64 {
+// durationSeconds rounds a per-area duration (a TTL, lease, or sweep interval) down to
+// whole seconds for storage. Sub-second precision is meaningless for freshness windows
+// measured in seconds-to-hours.
+func durationSeconds(d time.Duration) int64 {
 	return int64(d / time.Second)
 }
 

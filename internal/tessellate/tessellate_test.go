@@ -1,6 +1,7 @@
 package tessellate_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/primandproper/beeline/internal/beeline"
@@ -149,6 +150,32 @@ func TestRingsForRadius(t *testing.T) {
 		}
 		assert.Greater(t, nearestNextRing, radius, "the next ring out must be beyond the bound")
 	})
+}
+
+func TestMinRadiusForNeighbors(t *testing.T) {
+	t.Parallel()
+
+	for _, res := range []int{6, 8, 9, 11} {
+		t.Run(fmt.Sprintf("res-%d floor is the k=0/k>=1 boundary", res), func(t *testing.T) {
+			t.Parallel()
+
+			cell, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, res)
+			require.NoError(t, err)
+
+			floor, err := tessellate.MinRadiusForNeighbors(cell)
+			require.NoError(t, err)
+			require.Positive(t, floor, "a hexagon cell must have a measurable neighbor floor")
+
+			// Just below the floor reaches no neighbor; at the floor it reaches ring 1.
+			below, err := tessellate.RingsForRadius(cell, floor*0.99)
+			require.NoError(t, err)
+			assert.Equal(t, 0, below, "a bound below the floor must yield origin-only self-pairs")
+
+			at, err := tessellate.RingsForRadius(cell, floor)
+			require.NoError(t, err)
+			assert.GreaterOrEqual(t, at, 1, "a bound at the floor must reach at least ring 1")
+		})
+	}
 }
 
 func TestPairsFromCellsFullMeshSentinel(t *testing.T) {

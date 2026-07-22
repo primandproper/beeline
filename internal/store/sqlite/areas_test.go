@@ -48,7 +48,11 @@ func TestRepositoryCreateAndGet(t *testing.T) {
 		MaxRadiusMeters:  1500.5,
 		CoreRadiusMeters: 600,
 		WarmStrategy:     beeline.WarmHybrid,
+		RoutingProvider:  "osrm-west",
 		DemandIdleTTL:    90 * time.Minute,
+		TargetTTL:        45 * time.Second,
+		LeaseDuration:    20 * time.Second,
+		SweepInterval:    30 * time.Second,
 		Cells:            cells,
 		GeoJSON:          []byte(`{"type":"Polygon","coordinates":[]}`),
 		Enabled:          false,
@@ -64,7 +68,11 @@ func TestRepositoryCreateAndGet(t *testing.T) {
 	assert.Equal(t, 1500.5, got.MaxRadiusMeters)
 	assert.Equal(t, 600.0, got.CoreRadiusMeters)
 	assert.Equal(t, beeline.WarmHybrid, got.WarmStrategy)
+	assert.Equal(t, "osrm-west", got.RoutingProvider)
 	assert.Equal(t, 90*time.Minute, got.DemandIdleTTL)
+	assert.Equal(t, 45*time.Second, got.TargetTTL)
+	assert.Equal(t, 20*time.Second, got.LeaseDuration)
+	assert.Equal(t, 30*time.Second, got.SweepInterval)
 	assert.False(t, got.Enabled)
 	assert.ElementsMatch(t, cells, got.Cells)
 	assert.JSONEq(t, `{"type":"Polygon","coordinates":[]}`, string(got.GeoJSON))

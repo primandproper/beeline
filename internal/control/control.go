@@ -45,6 +45,9 @@ type AreaIndex interface {
 	SweepArea(ctx context.Context, area beeline.AreaID, cutoff time.Time) ([]beeline.PairKey, error)
 	CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error)
 	DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.DebtStats, error)
+	// SetAreaFreshness registers an area's per-area target TTL and claim lease, so the
+	// index applies this area's freshness contract to its pairs rather than the global one.
+	SetAreaFreshness(ctx context.Context, area beeline.AreaID, targetTTL, lease time.Duration) error
 }
 
 // AreaStore is the hot-store seam: drop an area's cached estimates on disable, and
@@ -60,9 +63,13 @@ type AreaStore interface {
 type CreateAreaInput struct {
 	Name             string
 	WarmStrategy     beeline.WarmStrategy
+	RoutingProvider  string
 	GeoJSON          []byte
 	Cells            []beeline.H3Cell
 	DemandIdleTTL    time.Duration
+	TargetTTL        time.Duration
+	LeaseDuration    time.Duration
+	SweepInterval    time.Duration
 	Resolution       int
 	MaxRadiusMeters  float64
 	CoreRadiusMeters float64
@@ -73,43 +80,84 @@ type CreateAreaInput struct {
 type UpdateAreaInput struct {
 	Name             string
 	WarmStrategy     beeline.WarmStrategy
+	RoutingProvider  string
 	DemandIdleTTL    time.Duration
+	TargetTTL        time.Duration
+	LeaseDuration    time.Duration
+	SweepInterval    time.Duration
 	Resolution       int
 	MaxRadiusMeters  float64
 	CoreRadiusMeters float64
 }
 
 // enabledArea is the in-memory routing snapshot for one enabled area: its resolution,
-// cell membership set, and outer travel bound, consulted by Locate on the read path.
-// The bound is carried here so the read path can decide, without a store round-trip,
-// whether a demand-fill falls within the area's cacheable radius.
+// cell membership set, outer travel bound, and the routing engine it is served by,
+// consulted by Locate and EngineFor on the read/refresh paths. The bound is carried
+// here so the read path can decide, without a store round-trip, whether a demand-fill
+// falls within the area's cacheable radius; the engine is resolved once at seed time
+// so per-pair routing is a map lookup, not a registry walk.
 type enabledArea struct {
 	cells           map[beeline.H3Cell]struct{}
+	engine          beeline.RoutingEngine
 	demandIdleTTL   time.Duration
+	targetTTL       time.Duration
+	sweepInterval   time.Duration
 	resolution      int
 	maxRadiusMeters float64
 }
 
 // Coordinator serializes area lifecycle operations over the repository, index, and
-// store, and answers point-in-area routing for the read path.
+// store, and answers point-in-area routing for the read path. It owns the routing
+// provider registry: each enabled area resolves its named provider to a concrete
+// engine at seed time, and EngineFor hands that engine to the refresh pool and read
+// path so different areas route through different providers.
 type Coordinator struct {
-	repo     AreasRepository
-	index    AreaIndex
-	store    AreaStore
-	enabled  map[beeline.AreaID]*enabledArea
-	profiles []beeline.Profile
-	mu       sync.RWMutex
+	repo            AreasRepository
+	index           AreaIndex
+	store           AreaStore
+	providers       map[string]beeline.RoutingEngine
+	enabled         map[beeline.AreaID]*enabledArea
+	lastSwept       map[beeline.AreaID]time.Time
+	defaultProvider string
+	profiles        []beeline.Profile
+	defaults        FreshnessDefaults
+	mu              sync.RWMutex
 }
 
-// New builds a Coordinator over the given seams. No areas are seeded yet — call
-// ResumeEnabled at boot to seed the ones already enabled.
-func New(repo AreasRepository, index AreaIndex, store AreaStore, profiles []beeline.Profile) *Coordinator {
+// FreshnessDefaults are the house freshness values applied to a new or updated area when
+// the caller leaves a per-area knob unset (zero). They come from the global matrix config;
+// each area then stores and honors its own values, so the global values are only a seed
+// for newly-created areas.
+type FreshnessDefaults struct {
+	TargetTTL     time.Duration
+	LeaseDuration time.Duration
+	SweepInterval time.Duration
+}
+
+// New builds a Coordinator over the given seams and provider registry. providers maps
+// a provider name to its engine and must contain defaultProvider (the engine used by
+// areas that name no provider and by out-of-area reads). defaults seeds a new area's
+// per-area freshness knobs when the create/update input leaves them unset. No areas are
+// seeded yet — call ResumeEnabled at boot to seed the ones already enabled.
+func New(
+	repo AreasRepository,
+	index AreaIndex,
+	store AreaStore,
+	profiles []beeline.Profile,
+	providers map[string]beeline.RoutingEngine,
+	defaultProvider string,
+	defaults FreshnessDefaults,
+) *Coordinator {
 	return &Coordinator{
-		repo:     repo,
-		index:    index,
-		store:    store,
-		profiles: profiles,
-		enabled:  make(map[beeline.AreaID]*enabledArea),
+		repo:            repo,
+		index:           index,
+		store:           store,
+		providers:       providers,
+		profiles:        profiles,
+		defaultProvider: defaultProvider,
+		defaults:        defaults,
+		enabled:         make(map[beeline.AreaID]*enabledArea),
+		lastSwept:       make(map[beeline.AreaID]time.Time),
 	}
 }
 
@@ -128,7 +176,11 @@ func (c *Coordinator) Get(ctx context.Context, id beeline.AreaID) (beeline.Area,
 // seed the index — an area does no refresh work until enabled.
 func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.Area, error) {
 	strategy := normalizeStrategy(in.WarmStrategy)
+	provider := c.normalizeProvider(in.RoutingProvider)
 	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy, in.DemandIdleTTL); err != nil {
+		return beeline.Area{}, err
+	}
+	if err := c.validateProvider(provider); err != nil {
 		return beeline.Area{}, err
 	}
 
@@ -142,6 +194,13 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 	} else if err := validateCellResolution(cells, in.Resolution); err != nil {
 		return beeline.Area{}, err
 	}
+	if err := validateRadiusFloor(in.Resolution, in.MaxRadiusMeters, cells); err != nil {
+		return beeline.Area{}, err
+	}
+	targetTTL, lease, sweep, err := c.resolveFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
+	if err != nil {
+		return beeline.Area{}, err
+	}
 
 	return c.repo.Create(ctx, &beeline.Area{
 		Name:             in.Name,
@@ -149,7 +208,11 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 		MaxRadiusMeters:  in.MaxRadiusMeters,
 		CoreRadiusMeters: in.CoreRadiusMeters,
 		WarmStrategy:     strategy,
+		RoutingProvider:  provider,
 		DemandIdleTTL:    in.DemandIdleTTL,
+		TargetTTL:        targetTTL,
+		LeaseDuration:    lease,
+		SweepInterval:    sweep,
 		Cells:            cells,
 		GeoJSON:          in.GeoJSON,
 		Enabled:          false,
@@ -160,9 +223,13 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 // from the area's GeoJSON provenance; changing the resolution of a hand-built area
 // (no GeoJSON) is rejected because its cells cannot be reprojected. If the area is
 // enabled, its working set is re-converged.
-func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in UpdateAreaInput) (beeline.Area, error) {
+func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateAreaInput) (beeline.Area, error) {
 	strategy := normalizeStrategy(in.WarmStrategy)
+	provider := c.normalizeProvider(in.RoutingProvider)
 	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy, in.DemandIdleTTL); err != nil {
+		return beeline.Area{}, err
+	}
+	if err := c.validateProvider(provider); err != nil {
 		return beeline.Area{}, err
 	}
 
@@ -184,13 +251,24 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in UpdateAr
 		}
 		area.Cells = cells
 	}
+	if err = validateRadiusFloor(in.Resolution, in.MaxRadiusMeters, area.Cells); err != nil {
+		return beeline.Area{}, err
+	}
+	targetTTL, lease, sweep, err := c.resolveFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
+	if err != nil {
+		return beeline.Area{}, err
+	}
 
 	area.Name = in.Name
 	area.Resolution = in.Resolution
 	area.MaxRadiusMeters = in.MaxRadiusMeters
 	area.CoreRadiusMeters = in.CoreRadiusMeters
 	area.WarmStrategy = strategy
+	area.RoutingProvider = provider
 	area.DemandIdleTTL = in.DemandIdleTTL
+	area.TargetTTL = targetTTL
+	area.LeaseDuration = lease
+	area.SweepInterval = sweep
 
 	return c.persistAndConvergeLocked(ctx, &area)
 }
@@ -349,11 +427,68 @@ func (c *Coordinator) Locate(p beeline.LatLng) (beeline.RoutedArea, bool) {
 			continue
 		}
 		if _, ok := ea.cells[cell]; ok {
-			return beeline.RoutedArea{ID: id, Resolution: ea.resolution, MaxRadiusMeters: ea.maxRadiusMeters}, true
+			return beeline.RoutedArea{
+				ID:              id,
+				Resolution:      ea.resolution,
+				MaxRadiusMeters: ea.maxRadiusMeters,
+				TargetTTL:       ea.targetTTL,
+			}, true
 		}
 	}
 
 	return beeline.RoutedArea{}, false
+}
+
+// EngineFor returns the routing engine an area is served by, implementing the
+// beeline.EngineResolver seam for the refresh pool and read path. An enabled area uses
+// the engine resolved from its provider at seed time; an unknown or zero area id (an
+// out-of-area read that belongs to no partition) falls back to the default engine, so
+// a query outside every area is still answered.
+func (c *Coordinator) EngineFor(id beeline.AreaID) beeline.RoutingEngine {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if ea, ok := c.enabled[id]; ok && ea.engine != nil {
+		return ea.engine
+	}
+
+	return c.providers[c.defaultProvider]
+}
+
+// ProviderNames returns the configured provider names (the default first, then the
+// rest ascending), so the operator console can populate its provider picker from live
+// config rather than a hard-coded list.
+func (c *Coordinator) ProviderNames() []string {
+	names := make([]string, 0, len(c.providers))
+	for name := range c.providers {
+		if name != c.defaultProvider {
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+
+	return append([]string{c.defaultProvider}, names...)
+}
+
+// normalizeProvider maps the empty (unset) provider to the default, preserving today's
+// behavior for areas that name no provider. Any other value is returned unchanged for
+// validateProvider to accept or reject.
+func (c *Coordinator) normalizeProvider(name string) string {
+	if name == "" {
+		return c.defaultProvider
+	}
+
+	return name
+}
+
+// validateProvider rejects a provider name that is not in the configured registry, so
+// an area cannot reference an engine that does not exist.
+func (c *Coordinator) validateProvider(name string) error {
+	if _, ok := c.providers[name]; !ok {
+		return fmt.Errorf("control: unknown routing provider %q", name)
+	}
+
+	return nil
 }
 
 // EnabledAreas returns the ids of the currently enabled areas, ascending.
@@ -370,13 +505,15 @@ func (c *Coordinator) EnabledAreas() []beeline.AreaID {
 	return ids
 }
 
-// SweepExpired evicts cold demand pairs across every enabled area: for each area with
-// decay enabled (a positive DemandIdleTTL), any unpinned pair not queried within the
-// TTL is dropped from both the freshness index and the hot store, so cost tracks real
-// usage instead of ratcheting up forever. Areas with DemandIdleTTL == 0 are skipped
-// (decay disabled). It is serialized under the same lock as enable/disable, so a sweep
-// never races an area's teardown. The janitor loop calls it on a fixed cadence.
-func (c *Coordinator) SweepExpired(ctx context.Context, now time.Time) (int, error) {
+// SweepDue evicts cold demand pairs from each enabled area that is due for a sweep on
+// its own cadence: an area is swept when at least its SweepInterval has elapsed since it
+// was last swept and decay is enabled for it (a positive DemandIdleTTL). For a due area,
+// any unpinned pair not queried within its DemandIdleTTL is dropped from both the
+// freshness index and the hot store, so cost tracks real usage instead of ratcheting up
+// forever. It is serialized under the same lock as enable/disable, so a sweep never races
+// an area's teardown. The janitor loop calls it on a fixed base tick; each area's own
+// SweepInterval gates how often it is actually swept.
+func (c *Coordinator) SweepDue(ctx context.Context, now time.Time) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -385,6 +522,10 @@ func (c *Coordinator) SweepExpired(ctx context.Context, now time.Time) (int, err
 		if ea.demandIdleTTL <= 0 {
 			continue // decay disabled for this area
 		}
+		if last, ok := c.lastSwept[id]; ok && now.Sub(last) < ea.sweepInterval {
+			continue // not yet due on this area's cadence
+		}
+		c.lastSwept[id] = now
 
 		removed, err := c.index.SweepArea(ctx, id, now.Add(-ea.demandIdleTTL))
 		if err != nil {
@@ -460,6 +601,12 @@ func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error 
 	if err = c.index.Seed(ctx, pairs); err != nil {
 		return err
 	}
+	// Register this area's freshness contract so the index applies its own target TTL
+	// (staleness) and lease (claim visibility) rather than the global defaults. Done for
+	// every strategy, including lazy — its demand-filled pairs must honor the same contract.
+	if err = c.index.SetAreaFreshness(ctx, area.ID, area.TargetTTL, area.LeaseDuration); err != nil {
+		return err
+	}
 
 	cellSet := make(map[beeline.H3Cell]struct{}, len(area.Cells))
 	for _, cell := range area.Cells {
@@ -468,8 +615,11 @@ func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error 
 	c.enabled[area.ID] = &enabledArea{
 		resolution:      area.Resolution,
 		cells:           cellSet,
+		engine:          c.providers[c.normalizeProvider(area.RoutingProvider)],
 		maxRadiusMeters: area.MaxRadiusMeters,
 		demandIdleTTL:   area.DemandIdleTTL,
+		targetTTL:       area.TargetTTL,
+		sweepInterval:   area.SweepInterval,
 	}
 
 	return nil
@@ -508,6 +658,7 @@ func (c *Coordinator) unseedLocked(ctx context.Context, id beeline.AreaID) error
 		return err
 	}
 	delete(c.enabled, id)
+	delete(c.lastSwept, id)
 
 	return nil
 }
@@ -566,6 +717,57 @@ func validateAreaFields(name string, resolution int, maxRadiusMeters, coreRadius
 	}
 	if demandIdleTTL < 0 {
 		return fmt.Errorf("control: demand idle TTL %v must be >= 0 (0 = decay disabled)", demandIdleTTL)
+	}
+
+	return nil
+}
+
+// resolveFreshness fills any unset (non-positive) per-area freshness knob from the
+// coordinator's house defaults, then validates the result. Blank/zero means "use the
+// default"; the final values must all be positive, since a zero target TTL, lease, or
+// sweep interval has no valid meaning in the freshness contract (unlike DemandIdleTTL,
+// where zero disables decay).
+func (c *Coordinator) resolveFreshness(targetTTL, lease, sweep time.Duration) (rTTL, rLease, rSweep time.Duration, err error) {
+	rTTL, rLease, rSweep = targetTTL, lease, sweep
+	if rTTL <= 0 {
+		rTTL = c.defaults.TargetTTL
+	}
+	if rLease <= 0 {
+		rLease = c.defaults.LeaseDuration
+	}
+	if rSweep <= 0 {
+		rSweep = c.defaults.SweepInterval
+	}
+	if rTTL <= 0 || rLease <= 0 || rSweep <= 0 {
+		return 0, 0, 0, fmt.Errorf(
+			"control: target TTL, lease, and sweep interval must be positive (got %v, %v, %v)",
+			rTTL, rLease, rSweep,
+		)
+	}
+
+	return rTTL, rLease, rSweep, nil
+}
+
+// validateRadiusFloor rejects a bounded travel radius so small it reaches no neighbor
+// cell at the area's resolution — the degenerate case where every origin pairs only
+// with itself (RingsForRadius == 0). A full-mesh area (maxRadiusMeters == 0) has no
+// floor; an area with no cells yet is skipped (it has no pairs to build). The floor is
+// measured from a representative cell (the same cells[0] PairsFromCells derives its ring
+// count from), so acceptance here matches the pair set the tessellator will actually build.
+func validateRadiusFloor(resolution int, maxRadiusMeters float64, cells []beeline.H3Cell) error {
+	if maxRadiusMeters <= 0 || len(cells) == 0 {
+		return nil
+	}
+
+	floor, err := tessellate.MinRadiusForNeighbors(cells[0])
+	if err != nil {
+		return err
+	}
+	if maxRadiusMeters < floor {
+		return fmt.Errorf(
+			"control: max radius %.0fm is below the res-%d neighbor floor of ~%.0fm; raise it or use 0 (full mesh)",
+			maxRadiusMeters, resolution, floor,
+		)
 	}
 
 	return nil

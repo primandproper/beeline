@@ -21,4 +21,8 @@ type Areas struct {
 	Enabled              int64
 	CreatedAt            string
 	UpdatedAt            string
+	RoutingProvider      string
+	TargetTtlSeconds     int64
+	LeaseDurationSeconds int64
+	SweepIntervalSeconds int64
 }

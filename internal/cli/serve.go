@@ -5,8 +5,9 @@ import (
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/control"
-	haversineengine "github.com/primandproper/beeline/internal/engine/haversine"
+	"github.com/primandproper/beeline/internal/engine/registry"
 	memindex "github.com/primandproper/beeline/internal/freshness/memory"
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/query"
@@ -56,7 +57,24 @@ func (a *application) serve(ctx context.Context) error {
 		profiles = append(profiles, p)
 	}
 
-	engine := haversineengine.New(speeds, 0)
+	// Routing providers: the named engine registry the control plane resolves per area.
+	// The built-in Haversine stand-in is always registered raw under the default name;
+	// when EngineLatency is enabled, a separate "latent-haversine" provider is added that
+	// pays a random [Min, Max] delay per Table call, modeling a network-bound engine an
+	// area can opt into. Any configured providers — additional Haversine engines or real
+	// OSRM endpoints — add further named entries an area can select.
+	providers, err := registry.Build(mcfg.Providers, speeds, mcfg.EngineLatency)
+	if err != nil {
+		return err
+	}
+	if lat := mcfg.EngineLatency; lat.Enabled {
+		a.log().WithValues(map[string]any{
+			"provider": config.LatentHaversineProviderName,
+			"min":      lat.Min.String(),
+			"max":      lat.Max.String(),
+		}).Info("registered simulated-network-latency routing provider")
+	}
+
 	store := memstore.New()
 	index := memindex.New(mcfg.TargetTTL, nil)
 
@@ -75,12 +93,18 @@ func (a *application) serve(ctx context.Context) error {
 	repo := areasqlite.NewRepository(db, nil)
 
 	// Control plane: owns the enabled-area set and drives per-area seed/unseed on the
-	// shared index/store. It also routes read-path queries to the containing area.
-	coordinator := control.New(repo, index, store, profiles)
+	// shared index/store. It also routes read-path queries to the containing area. The
+	// global freshness knobs seed a new area's per-area contract when the operator leaves
+	// them unset; each area then stores and honors its own values.
+	coordinator := control.New(repo, index, store, profiles, providers, config.DefaultProviderName, control.FreshnessDefaults{
+		TargetTTL:     mcfg.TargetTTL,
+		LeaseDuration: mcfg.LeaseDuration,
+		SweepInterval: mcfg.SweepInterval,
+	})
 
 	// Read path: routes each query through the coordinator to the enabled area that
-	// contains it (and its resolution).
-	handler := query.NewHandler(store, index, engine, coordinator, a.logger, mcfg.TargetTTL)
+	// contains it (and its resolution); staleness is judged against that area's own TTL.
+	handler := query.NewHandler(store, index, coordinator, coordinator, a.logger)
 
 	// Seed the areas that were already enabled in a prior run.
 	if err = coordinator.ResumeEnabled(ctx); err != nil {
@@ -137,7 +161,7 @@ func (a *application) serve(ctx context.Context) error {
 	// Start the background refresh loop and the HTTP server. Serve() blocks and
 	// panics on a bind/serve error, so run it in its own goroutine and coordinate
 	// shutdown through the signal-cancellable context.
-	pool := refresh.NewPool(engine, store, index, a.logger, refresh.Config{
+	pool := refresh.NewPool(coordinator, store, index, a.logger, refresh.Config{
 		Workers: mcfg.RefreshWorkers,
 		Batch:   mcfg.RefreshBatch,
 		Lease:   mcfg.LeaseDuration,
@@ -146,10 +170,11 @@ func (a *application) serve(ctx context.Context) error {
 	go pool.Run(ctx)
 	go srv.Serve()
 
-	// Demand-decay janitor: on a fixed cadence, sweep each enabled area's cold demand
-	// pairs (unqueried past their DemandIdleTTL) out of the index and store, so cost
-	// tracks real usage. Areas with decay disabled (TTL 0) are skipped inside Sweep.
-	go a.runSweeper(ctx, coordinator, mcfg.SweepInterval)
+	// Demand-decay janitor: ticks on a fixed base cadence and asks the coordinator to
+	// sweep each enabled area that is due on its own SweepInterval, evicting cold demand
+	// pairs (unqueried past their DemandIdleTTL) from the index and store so cost tracks
+	// real usage. Areas with decay disabled (TTL 0) are skipped inside the sweep.
+	go a.runSweeper(ctx, coordinator)
 
 	<-ctx.Done()
 	a.log().Info("shutdown signal received; draining HTTP server")
@@ -160,16 +185,16 @@ func (a *application) serve(ctx context.Context) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
-// runSweeper ticks every interval and asks the coordinator to evict cold demand pairs
-// across all enabled areas. It runs until ctx is cancelled. A non-positive interval
-// disables the janitor entirely (the config validates it as positive, so this is a
-// belt-and-suspenders guard).
-func (a *application) runSweeper(ctx context.Context, coordinator *control.Coordinator, interval time.Duration) {
-	if interval <= 0 {
-		return
-	}
+// sweepBaseTick is how often the janitor wakes to check which areas are due for a demand-
+// decay sweep. Each area is only swept once its own SweepInterval has elapsed (enforced in
+// SweepDue), so this base tick just needs to be at least as fine as the smallest per-area
+// interval; a second is well below any realistic decay cadence and the check is cheap.
+const sweepBaseTick = time.Second
 
-	ticker := time.NewTicker(interval)
+// runSweeper ticks on the fixed base cadence and asks the coordinator to sweep every
+// enabled area that is due on its own SweepInterval. It runs until ctx is cancelled.
+func (a *application) runSweeper(ctx context.Context, coordinator *control.Coordinator) {
+	ticker := time.NewTicker(sweepBaseTick)
 	defer ticker.Stop()
 
 	for {
@@ -177,7 +202,7 @@ func (a *application) runSweeper(ctx context.Context, coordinator *control.Coord
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			swept, err := coordinator.SweepExpired(ctx, time.Now())
+			swept, err := coordinator.SweepDue(ctx, time.Now())
 			if err != nil {
 				a.log().Error("sweeping cold demand pairs", err)
 				continue

@@ -63,6 +63,11 @@ html, body {
   padding: 16px 18px;
   border-bottom: 1px solid var(--border);
 }
+.edit-form {
+  margin: 4px 0 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
 .section h2 {
   margin: 0 0 12px;
   font-size: 11px;

@@ -46,9 +46,30 @@ func buildLocalDevConfig() *config.Config {
 				Port:            8080,
 				StartupDeadline: 5 * time.Second,
 			},
-			DatabasePath:        "beeline.db",
-			Profiles:            defaultProfiles(),
-			DefaultProfile:      "car",
+			DatabasePath:   "beeline.db",
+			Profiles:       defaultProfiles(),
+			DefaultProfile: "car",
+			// An example named provider: a local OSRM server. Nothing routes through it
+			// until an area selects it (routingProvider: "osrm-local"); the built-in
+			// haversine default still serves every area that names no provider. Point it
+			// at a running OSRM to route real road networks for that area.
+			Providers: map[string]config.ProviderConfig{
+				"osrm-local": {
+					Type:         config.ProviderTypeOSRM,
+					BaseURL:      "http://localhost:5000",
+					Profiles:     map[string]string{"car": "driving", "bike": "cycling", "walk": "foot"},
+					MaxTableSize: 10000,
+					Timeout:      5 * time.Second,
+				},
+			},
+			// Model the routing engine as network-bound locally, so the refresh pool
+			// and read path can be watched under realistic I/O latency. Off in
+			// production, where the in-process engine returns in nanoseconds.
+			EngineLatency: config.EngineLatencyConfig{
+				Enabled: true,
+				Min:     25 * time.Millisecond,
+				Max:     120 * time.Millisecond,
+			},
 			TargetTTL:           30 * time.Second,
 			LeaseDuration:       15 * time.Second,
 			SweepInterval:       15 * time.Second,

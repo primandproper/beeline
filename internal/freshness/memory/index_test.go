@@ -41,6 +41,49 @@ func keys() []beeline.PairKey {
 	}
 }
 
+func TestIndexPerAreaTargetTTLAndLease(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	clk := &clock{t: time.Unix(1_700_000_000, 0)}
+	idx := memory.New(time.Hour, clk.now) // index-wide default TTL is deliberately long
+
+	shortKey := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
+	longKey := beeline.PairKey{Area: 2, Origin: 1, Dest: 2, Profile: "car", Res: 8}
+
+	// Area 1: short 30s TTL, long 5m lease. Area 2: long 10m TTL.
+	require.NoError(t, idx.SetAreaFreshness(ctx, 1, 30*time.Second, 5*time.Minute))
+	require.NoError(t, idx.SetAreaFreshness(ctx, 2, 10*time.Minute, 15*time.Second))
+	require.NoError(t, idx.Seed(ctx, []beeline.PairKey{shortKey, longKey}))
+
+	// Compute both now so neither is never-computed, then release the leases.
+	claimed, err := idx.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	require.Len(t, claimed, 2)
+	require.NoError(t, idx.MarkComputed(ctx, claimed, clk.now()))
+
+	// Past area 1's 30s TTL but well within area 2's 10m TTL: only area 1's pair is stale.
+	clk.advance(45 * time.Second)
+	due, err := idx.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, []beeline.PairKey{shortKey}, due, "only the short-TTL area's pair is due")
+
+	// DebtForArea judges staleness against each area's own TTL.
+	d1, err := idx.DebtForArea(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, d1.Debt, "area 1 pair is older than its 30s TTL")
+	d2, err := idx.DebtForArea(ctx, 2)
+	require.NoError(t, err)
+	assert.Zero(t, d2.Debt, "area 2 pair is well within its 10m TTL")
+
+	// The just-claimed area-1 pair holds its area's 5m lease, not the 15s fallback passed
+	// to Claim: a minute later it is stale yet still invisible to a re-claim.
+	clk.advance(time.Minute)
+	again, err := idx.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	assert.Empty(t, again, "the per-area 5m lease keeps the claimed pair invisible")
+}
+
 func TestIndexClaimLifecycle(t *testing.T) {
 	t.Parallel()
 

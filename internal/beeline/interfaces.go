@@ -15,6 +15,15 @@ type RoutingEngine interface {
 	Capabilities() Capabilities
 }
 
+// EngineResolver selects the RoutingEngine an area is served by, so different areas
+// can route through different providers (an in-process Haversine stand-in for one, a
+// real OSRM instance for another). Both the refresh pool and the read path consult it
+// per area instead of holding a single shared engine. AreaID 0 — an out-of-area query
+// that belongs to no partition — resolves to the default engine.
+type EngineResolver interface {
+	EngineFor(area AreaID) RoutingEngine
+}
+
 // Store is the hot read path: a minimal batch key/value surface so "bring your own
 // datastore" is actually true (§5.2). No range queries, no ordering — any KV that
 // can batch-get qualifies.

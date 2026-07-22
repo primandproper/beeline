@@ -52,6 +52,7 @@ func Register(router routing.Router, deps *Deps) {
 	router.Get("/_ops_/live", liveHandler(logger))
 	router.Get("/_ops_/ready", readyHandler(deps.Health, logger))
 
+	router.Get("/_config_/providers", providersListHandler(deps, logger))
 	router.Get("/_config_/areas", areasListHandler(deps, logger))
 	router.Post("/_config_/areas", areaCreateHandler(deps, logger))
 	router.Get("/_config_/areas/{areaID}", areaGetHandler(deps, logger, areaID))
@@ -216,7 +217,11 @@ type areaResponse struct {
 	UpdatedAt        string          `json:"updatedAt"`
 	Name             string          `json:"name"`
 	WarmStrategy     string          `json:"warmStrategy"`
+	RoutingProvider  string          `json:"routingProvider"`
 	DemandIdleTTL    string          `json:"demandIdleTTL"`
+	TargetTTL        string          `json:"targetTTL"`
+	LeaseDuration    string          `json:"leaseDuration"`
+	SweepInterval    string          `json:"sweepInterval"`
 	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
 	Cells            []string        `json:"cells,omitempty"`
 	ID               int64           `json:"id"`
@@ -235,7 +240,11 @@ func toAreaResponse(a *beeline.Area, includeGeometry bool) areaResponse {
 		MaxRadiusMeters:  a.MaxRadiusMeters,
 		CoreRadiusMeters: a.CoreRadiusMeters,
 		WarmStrategy:     string(a.WarmStrategy),
+		RoutingProvider:  a.RoutingProvider,
 		DemandIdleTTL:    a.DemandIdleTTL.String(),
+		TargetTTL:        a.TargetTTL.String(),
+		LeaseDuration:    a.LeaseDuration.String(),
+		SweepInterval:    a.SweepInterval.String(),
 		CellCount:        len(a.Cells),
 		Enabled:          a.Enabled,
 		CreatedAt:        a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
@@ -250,6 +259,14 @@ func toAreaResponse(a *beeline.Area, includeGeometry bool) areaResponse {
 	}
 
 	return resp
+}
+
+// providersListHandler returns the configured routing-provider names (default first)
+// so the operator console can populate its provider picker from live config.
+func providersListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, logger, http.StatusOK, deps.Coordinator.ProviderNames())
+	}
 }
 
 func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
@@ -275,7 +292,11 @@ func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 type createAreaRequest struct {
 	Name             string          `json:"name"`
 	WarmStrategy     string          `json:"warmStrategy"`
+	RoutingProvider  string          `json:"routingProvider"`
 	DemandIdleTTL    string          `json:"demandIdleTTL"`
+	TargetTTL        string          `json:"targetTTL"`
+	LeaseDuration    string          `json:"leaseDuration"`
+	SweepInterval    string          `json:"sweepInterval"`
 	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
 	Cells            []string        `json:"cells,omitempty"`
 	Resolution       int             `json:"resolution"`
@@ -303,13 +324,23 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			return
 		}
 
+		fresh, err := parseFreshness(req.TargetTTL, req.LeaseDuration, req.SweepInterval)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, err.Error())
+			return
+		}
+
 		area, err := deps.Coordinator.Create(r.Context(), &control.CreateAreaInput{
 			Name:             req.Name,
 			Resolution:       req.Resolution,
 			MaxRadiusMeters:  req.MaxRadiusMeters,
 			CoreRadiusMeters: req.CoreRadiusMeters,
 			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
+			RoutingProvider:  req.RoutingProvider,
 			DemandIdleTTL:    ttl,
+			TargetTTL:        fresh.targetTTL,
+			LeaseDuration:    fresh.lease,
+			SweepInterval:    fresh.sweep,
 			GeoJSON:          req.GeoJSON,
 			Cells:            cells,
 		})
@@ -344,7 +375,11 @@ func areaGetHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request
 type updateAreaRequest struct {
 	Name             string  `json:"name"`
 	WarmStrategy     string  `json:"warmStrategy"`
+	RoutingProvider  string  `json:"routingProvider"`
 	DemandIdleTTL    string  `json:"demandIdleTTL"`
+	TargetTTL        string  `json:"targetTTL"`
+	LeaseDuration    string  `json:"leaseDuration"`
+	SweepInterval    string  `json:"sweepInterval"`
 	Resolution       int     `json:"resolution"`
 	MaxRadiusMeters  float64 `json:"maxRadiusMeters"`
 	CoreRadiusMeters float64 `json:"coreRadiusMeters"`
@@ -369,13 +404,23 @@ func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Requ
 			return
 		}
 
-		area, err := deps.Coordinator.Update(r.Context(), id, control.UpdateAreaInput{
+		fresh, err := parseFreshness(req.TargetTTL, req.LeaseDuration, req.SweepInterval)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		area, err := deps.Coordinator.Update(r.Context(), id, &control.UpdateAreaInput{
 			Name:             req.Name,
 			Resolution:       req.Resolution,
 			MaxRadiusMeters:  req.MaxRadiusMeters,
 			CoreRadiusMeters: req.CoreRadiusMeters,
 			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
+			RoutingProvider:  req.RoutingProvider,
 			DemandIdleTTL:    ttl,
+			TargetTTL:        fresh.targetTTL,
+			LeaseDuration:    fresh.lease,
+			SweepInterval:    fresh.sweep,
 		})
 		if err != nil {
 			writeAreaError(w, logger, err)
@@ -609,6 +654,34 @@ func parseDuration(raw string) (time.Duration, error) {
 	}
 
 	return d, nil
+}
+
+// freshnessKnobs holds the three per-area freshness durations parsed from a request.
+type freshnessKnobs struct {
+	targetTTL time.Duration
+	lease     time.Duration
+	sweep     time.Duration
+}
+
+// parseFreshness parses the optional per-area freshness durations (target TTL, claim
+// lease, sweep interval). Each is a Go duration string; an empty value means 0, which the
+// control plane reads as "use the house default". A parse error is tagged with the field
+// so a 400 names the offending knob. Positivity is enforced downstream by the coordinator.
+func parseFreshness(targetTTL, lease, sweep string) (freshnessKnobs, error) {
+	tt, err := parseDuration(targetTTL)
+	if err != nil {
+		return freshnessKnobs{}, errors.New("invalid targetTTL: " + err.Error())
+	}
+	ls, err := parseDuration(lease)
+	if err != nil {
+		return freshnessKnobs{}, errors.New("invalid leaseDuration: " + err.Error())
+	}
+	sw, err := parseDuration(sweep)
+	if err != nil {
+		return freshnessKnobs{}, errors.New("invalid sweepInterval: " + err.Error())
+	}
+
+	return freshnessKnobs{targetTTL: tt, lease: ls, sweep: sw}, nil
 }
 
 // parseAreaID parses a positive area id from a query-string value.

@@ -36,6 +36,21 @@ type AreasRepository interface {
 	SetEnabled(ctx context.Context, id beeline.AreaID, enabled bool) error
 }
 
+// ProvidersRepository persists operator-defined routing-provider specs — the
+// control-plane half of the registry (built-ins are synthesized, never stored).
+// The SQLite store satisfies it.
+type ProvidersRepository interface {
+	ListProviders(ctx context.Context) ([]beeline.ProviderSpec, error)
+	UpsertProvider(ctx context.Context, spec *beeline.ProviderSpec) error
+	DeleteProvider(ctx context.Context, name string) error
+}
+
+// EngineBuilder constructs a routing engine from one provider spec. The CLI wires
+// it to the engine registry (closing over the profile speed map), so the control
+// plane can rebuild engines on provider mutations without depending on concrete
+// engine packages.
+type EngineBuilder func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error)
+
 // AreaIndex is the freshness-index seam: seed an area's pairs, remove them, sweep its
 // cold demand pairs, and report per-area freshness. The in-memory index satisfies it.
 type AreaIndex interface {
@@ -117,16 +132,27 @@ type enabledArea struct {
 
 // Coordinator serializes area lifecycle operations over the repository, index, and
 // store, and answers point-in-area routing for the read path. It owns the routing
-// provider registry: each enabled area resolves its named provider to a concrete
-// engine at seed time, and EngineFor hands that engine to the refresh pool and read
-// path so different areas route through different providers.
+// provider registry: built-in specs are synthesized at construction, operator-defined
+// specs live in the providers repository (mutated through Put/DeleteProvider), and
+// every spec is resolved to a concrete engine through the injected builder. Each
+// enabled area resolves its named provider to an engine at seed time, and EngineFor
+// hands that engine to the refresh pool and read path so different areas route
+// through different providers. The full registry — specs plus the profile speed map —
+// is also published as a content-hashed catalog (Catalog/ProvidersHash) that
+// followers sync their own engines from.
 type Coordinator struct {
 	repo            AreasRepository
+	providersRepo   ProvidersRepository
 	index           AreaIndex
 	store           AreaStore
+	buildEngine     EngineBuilder
 	providers       map[string]beeline.RoutingEngine
+	builtinSpecs    map[string]beeline.ProviderSpec
+	dbSpecs         map[string]beeline.ProviderSpec
+	speeds          map[string]float64
 	enabled         map[beeline.AreaID]*enabledArea
 	lastSwept       map[beeline.AreaID]time.Time
+	catalog         beeline.ProviderCatalog
 	defaultProvider string
 	profiles        []beeline.Profile
 	defaults        FreshnessDefaults
@@ -143,31 +169,102 @@ type FreshnessDefaults struct {
 	SweepInterval time.Duration
 }
 
-// New builds a Coordinator over the given seams and provider registry. providers maps
-// a provider name to its engine and must contain defaultProvider (the engine used by
-// areas that name no provider and by out-of-area reads). defaults seeds a new area's
-// per-area freshness knobs when the create/update input leaves them unset. No areas are
-// seeded yet — call ResumeEnabled at boot to seed the ones already enabled.
-func New(
-	repo AreasRepository,
-	index AreaIndex,
-	store AreaStore,
-	profiles []beeline.Profile,
-	providers map[string]beeline.RoutingEngine,
-	defaultProvider string,
-	defaults FreshnessDefaults,
-) *Coordinator {
-	return &Coordinator{
-		repo:            repo,
-		index:           index,
-		store:           store,
-		providers:       providers,
+// Config wires a Coordinator's seams and registry inputs.
+type Config struct {
+	Areas           AreasRepository
+	Providers       ProvidersRepository
+	Index           AreaIndex
+	Store           AreaStore
+	BuildEngine     EngineBuilder
+	Speeds          map[string]float64
+	DefaultProvider string
+	Builtins        []beeline.ProviderSpec
+	Defaults        FreshnessDefaults
+}
+
+// New builds a Coordinator and constructs the built-in provider engines. The
+// operator-defined half of the registry is loaded by InitProviders; areas are seeded
+// by ResumeEnabled. Call both at boot, in that order.
+func New(cfg *Config) (*Coordinator, error) {
+	profiles := make([]beeline.Profile, 0, len(cfg.Speeds))
+	for name := range cfg.Speeds {
+		profiles = append(profiles, beeline.Profile(name))
+	}
+	slices.Sort(profiles)
+
+	c := &Coordinator{
+		repo:            cfg.Areas,
+		providersRepo:   cfg.Providers,
+		index:           cfg.Index,
+		store:           cfg.Store,
+		buildEngine:     cfg.BuildEngine,
+		speeds:          cfg.Speeds,
 		profiles:        profiles,
-		defaultProvider: defaultProvider,
-		defaults:        defaults,
+		defaultProvider: cfg.DefaultProvider,
+		defaults:        cfg.Defaults,
+		providers:       make(map[string]beeline.RoutingEngine, len(cfg.Builtins)),
+		builtinSpecs:    make(map[string]beeline.ProviderSpec, len(cfg.Builtins)),
+		dbSpecs:         make(map[string]beeline.ProviderSpec),
 		enabled:         make(map[beeline.AreaID]*enabledArea),
 		lastSwept:       make(map[beeline.AreaID]time.Time),
 	}
+
+	for i := range cfg.Builtins {
+		spec := cfg.Builtins[i]
+		engine, err := cfg.BuildEngine(&spec)
+		if err != nil {
+			return nil, fmt.Errorf("control: building built-in provider %q: %w", spec.Name, err)
+		}
+		c.builtinSpecs[spec.Name] = spec
+		c.providers[spec.Name] = engine
+	}
+	if _, ok := c.providers[cfg.DefaultProvider]; !ok {
+		return nil, fmt.Errorf("control: default provider %q is not among the built-ins", cfg.DefaultProvider)
+	}
+	if err := c.rebuildCatalogLocked(); err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+// InitProviders loads the operator-defined provider registry from the repository and
+// builds its engines. When the table is empty and seed entries are supplied (the
+// legacy matrix.providers file config), they are imported first — a one-time
+// migration, after which the database is authoritative and the file block is inert.
+// Call it at boot before ResumeEnabled so resumed areas resolve their providers.
+func (c *Coordinator) InitProviders(ctx context.Context, seed []beeline.ProviderSpec) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	specs, err := c.providersRepo.ListProviders(ctx)
+	if err != nil {
+		return err
+	}
+
+	if len(specs) == 0 && len(seed) > 0 {
+		for i := range seed {
+			if reserveErr := c.checkNameFreeLocked(seed[i].Name); reserveErr != nil {
+				return fmt.Errorf("control: seeding provider from file config: %w", reserveErr)
+			}
+			if upErr := c.providersRepo.UpsertProvider(ctx, &seed[i]); upErr != nil {
+				return upErr
+			}
+		}
+		specs = seed
+	}
+
+	for i := range specs {
+		spec := specs[i]
+		engine, buildErr := c.buildEngine(&spec)
+		if buildErr != nil {
+			return fmt.Errorf("control: building provider %q: %w", spec.Name, buildErr)
+		}
+		c.dbSpecs[spec.Name] = spec
+		c.providers[spec.Name] = engine
+	}
+
+	return c.rebuildCatalogLocked()
 }
 
 // List returns every configured area.
@@ -464,10 +561,32 @@ func (c *Coordinator) AreaEnabled(id beeline.AreaID) bool {
 	return ok
 }
 
-// ProviderNames returns the configured provider names (the default first, then the
-// rest ascending), so the operator console can populate its provider picker from live
-// config rather than a hard-coded list.
-func (c *Coordinator) ProviderNames() []string {
+// ErrProviderInUse marks a provider deletion rejected because an area still names
+// it; ErrProviderReserved marks a mutation of a built-in name. Both map to 400 at
+// the HTTP layer.
+var (
+	ErrProviderInUse    = errors.New("control: provider is referenced by an area")
+	ErrProviderReserved = errors.New("control: provider name is reserved for a built-in engine")
+)
+
+// ErrProviderNotFound marks a delete of a provider that does not exist. The message
+// ends in "not found" so the HTTP layer's not-found mapping applies.
+var ErrProviderNotFound = errors.New("control: provider not found")
+
+// ProviderInfo is one registry entry for the control-plane surface: the full spec
+// plus whether it is a synthesized built-in (immutable through the API).
+type ProviderInfo struct {
+	Spec    beeline.ProviderSpec
+	Builtin bool
+}
+
+// ListProviderInfos returns every registered provider — the default first, then the
+// rest ascending by name — so the operator console can render the registry and its
+// picker from live state.
+func (c *Coordinator) ListProviderInfos() []ProviderInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	names := make([]string, 0, len(c.providers))
 	for name := range c.providers {
 		if name != c.defaultProvider {
@@ -475,8 +594,165 @@ func (c *Coordinator) ProviderNames() []string {
 		}
 	}
 	slices.Sort(names)
+	names = append([]string{c.defaultProvider}, names...)
 
-	return append([]string{c.defaultProvider}, names...)
+	infos := make([]ProviderInfo, 0, len(names))
+	for _, name := range names {
+		if spec, ok := c.builtinSpecs[name]; ok {
+			infos = append(infos, ProviderInfo{Spec: spec, Builtin: true})
+			continue
+		}
+		infos = append(infos, ProviderInfo{Spec: c.dbSpecs[name]})
+	}
+
+	return infos
+}
+
+// PutProvider creates or replaces one operator-defined provider: validate, build the
+// engine (so a broken spec is rejected before anything persists), persist, register,
+// and re-point any enabled area already routing through that name at the new engine —
+// updating a provider (say, an OSRM base URL) takes effect without re-enabling areas.
+// The catalog hash changes with it, so followers converge on their next claim.
+func (c *Coordinator) PutProvider(ctx context.Context, spec *beeline.ProviderSpec) (ProviderInfo, error) {
+	if err := spec.Validate(); err != nil {
+		return ProviderInfo{}, fmt.Errorf("control: %w", err)
+	}
+	if spec.Type == beeline.ProviderTypeLatentHaversine {
+		return ProviderInfo{}, fmt.Errorf("control: provider type %q is synthesized from engine-latency config and cannot be created", spec.Type)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if err := c.checkNameFreeLocked(spec.Name); err != nil {
+		return ProviderInfo{}, err
+	}
+
+	engine, err := c.buildEngine(spec)
+	if err != nil {
+		return ProviderInfo{}, fmt.Errorf("control: building provider %q: %w", spec.Name, err)
+	}
+	if err = c.providersRepo.UpsertProvider(ctx, spec); err != nil {
+		return ProviderInfo{}, err
+	}
+
+	c.dbSpecs[spec.Name] = *spec
+	c.providers[spec.Name] = engine
+	for _, ea := range c.enabled {
+		if ea.provider == spec.Name {
+			ea.engine = engine
+		}
+	}
+
+	if err = c.rebuildCatalogLocked(); err != nil {
+		return ProviderInfo{}, err
+	}
+
+	return ProviderInfo{Spec: *spec}, nil
+}
+
+// DeleteProvider removes one operator-defined provider. Built-ins are reserved, and
+// a provider still named by any area — enabled or not, since a disabled area may be
+// re-enabled later — cannot be removed until those areas are repointed.
+func (c *Coordinator) DeleteProvider(ctx context.Context, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, ok := c.builtinSpecs[name]; ok {
+		return fmt.Errorf("%w: %q", ErrProviderReserved, name)
+	}
+	if _, ok := c.dbSpecs[name]; !ok {
+		return fmt.Errorf("%w: %q", ErrProviderNotFound, name)
+	}
+
+	areas, err := c.repo.List(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range areas {
+		if areas[i].RoutingProvider == name {
+			return fmt.Errorf("%w: area %d (%s) routes through %q", ErrProviderInUse, areas[i].ID, areas[i].Name, name)
+		}
+	}
+
+	if err = c.providersRepo.DeleteProvider(ctx, name); err != nil {
+		return err
+	}
+	delete(c.dbSpecs, name)
+	delete(c.providers, name)
+
+	return c.rebuildCatalogLocked()
+}
+
+// Catalog returns the current provider catalog — every spec plus the profile speed
+// map, stamped with its content hash. It is the /_work_/providers payload.
+func (c *Coordinator) Catalog() beeline.ProviderCatalog {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := c.catalog
+	out.Providers = slices.Clone(c.catalog.Providers)
+
+	return out
+}
+
+// ProvidersHash returns the catalog's content hash — the change signal stamped into
+// every /_work_/claim response.
+func (c *Coordinator) ProvidersHash() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.catalog.Hash
+}
+
+// checkNameFreeLocked rejects operator use of a built-in provider name. Callers
+// hold c.mu.
+func (c *Coordinator) checkNameFreeLocked(name string) error {
+	if _, ok := c.builtinSpecs[name]; ok {
+		return fmt.Errorf("%w: %q", ErrProviderReserved, name)
+	}
+
+	return nil
+}
+
+// rebuildCatalogLocked recomputes the published catalog and its content hash from
+// the current registry: built-ins first (default engine leading), then the
+// operator-defined specs ascending by name. Callers hold c.mu (or own the
+// still-unshared Coordinator during New).
+func (c *Coordinator) rebuildCatalogLocked() error {
+	specs := make([]beeline.ProviderSpec, 0, len(c.builtinSpecs)+len(c.dbSpecs))
+	if spec, ok := c.builtinSpecs[c.defaultProvider]; ok {
+		specs = append(specs, spec)
+	}
+	builtinNames := make([]string, 0, len(c.builtinSpecs))
+	for name := range c.builtinSpecs {
+		if name != c.defaultProvider {
+			builtinNames = append(builtinNames, name)
+		}
+	}
+	slices.Sort(builtinNames)
+	for _, name := range builtinNames {
+		specs = append(specs, c.builtinSpecs[name])
+	}
+
+	dbNames := make([]string, 0, len(c.dbSpecs))
+	for name := range c.dbSpecs {
+		dbNames = append(dbNames, name)
+	}
+	slices.Sort(dbNames)
+	for _, name := range dbNames {
+		specs = append(specs, c.dbSpecs[name])
+	}
+
+	catalog := beeline.ProviderCatalog{Speeds: c.speeds, Providers: specs}
+	hash, err := catalog.ComputeHash()
+	if err != nil {
+		return fmt.Errorf("control: %w", err)
+	}
+	catalog.Hash = hash
+	c.catalog = catalog
+
+	return nil
 }
 
 // normalizeProvider maps the empty (unset) provider to the default, preserving today's
@@ -490,9 +766,13 @@ func (c *Coordinator) normalizeProvider(name string) string {
 	return name
 }
 
-// validateProvider rejects a provider name that is not in the configured registry, so
-// an area cannot reference an engine that does not exist.
+// validateProvider rejects a provider name that is not in the registry, so an area
+// cannot reference an engine that does not exist. It takes the read lock: the
+// registry is mutable and callers (Create/Update) run before the area lock is held.
 func (c *Coordinator) validateProvider(name string) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if _, ok := c.providers[name]; !ok {
 		return fmt.Errorf("control: unknown routing provider %q", name)
 	}

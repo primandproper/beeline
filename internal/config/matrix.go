@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/primandproper/beeline/internal/beeline"
+
 	"github.com/primandproper/platform-go/v4/httpclient"
 	serverhttp "github.com/primandproper/platform-go/v4/server/http"
 )
@@ -188,38 +190,47 @@ func (t *TelemetryConfig) validate() error {
 	return nil
 }
 
-// Provider registry constants. The built-in Haversine engine is always registered
-// under DefaultProviderName, so an area with no provider set (the empty string) keeps
-// routing through the in-process engine. Configured providers add named entries an
-// area can select instead.
+// Provider registry constants, aliased from the domain package (the single source
+// of truth) so existing config-level references keep compiling.
 const (
-	// DefaultProviderName is the name of the always-present built-in engine. It is
-	// always the raw, in-process Haversine stand-in — enabling EngineLatency never
-	// changes what this name resolves to.
-	DefaultProviderName = "haversine"
+	// DefaultProviderName is the name of the always-present built-in engine.
+	DefaultProviderName = beeline.DefaultProviderName
 	// LatentHaversineProviderName is the built-in Haversine engine wrapped with a
-	// simulated network delay. It is registered as a separate, selectable provider
-	// only when EngineLatency is enabled, so an area opts into the network-bound
-	// behavior by selecting it and reverts by pointing back at DefaultProviderName.
-	LatentHaversineProviderName = "latent-haversine"
+	// simulated network delay, registered only when EngineLatency is enabled.
+	LatentHaversineProviderName = beeline.LatentHaversineProviderName
 	// ProviderTypeHaversine builds an in-process great-circle engine from Profiles.
-	ProviderTypeHaversine = "haversine"
+	ProviderTypeHaversine = beeline.ProviderTypeHaversine
 	// ProviderTypeOSRM builds an HTTP client against a live OSRM /table endpoint.
-	ProviderTypeOSRM = "osrm"
+	ProviderTypeOSRM = beeline.ProviderTypeOSRM
 )
 
-// ProviderConfig declares one named routing provider in the registry (§ per-area
-// providers). Type selects the engine; the remaining fields configure it. haversine
-// providers reuse the global Profiles/speeds and need no other field. osrm providers
-// require a BaseURL and may map beeline profiles to the OSRM profile path segments the
-// server was built with (e.g. car→driving), bound the matrix size to the server's
-// max-table-size, and set a per-request Timeout.
+// ProviderConfig declares one named routing provider in the file config. Since the
+// provider registry moved into the SQLite control plane (/_config_/providers), these
+// entries are seed data only: imported into the database the first time a leader
+// boots against an empty providers table, after which the database is authoritative
+// and this block is ignored. Type selects the engine; haversine providers reuse the
+// global Profiles/speeds and need no other field; osrm providers require a BaseURL
+// and may map beeline profiles to OSRM profile path segments (e.g. car→driving),
+// bound the matrix size, and set a per-request Timeout.
 type ProviderConfig struct {
 	Profiles     map[string]string `json:"profiles,omitempty"`
 	Type         string            `json:"type"`
 	BaseURL      string            `json:"baseURL,omitempty"`
 	Timeout      time.Duration     `json:"timeout,omitempty"`
 	MaxTableSize int               `json:"maxTableSize,omitempty"`
+}
+
+// Spec converts a named file-config provider entry to the domain spec the control
+// plane persists and serves — the shape used to seed an empty providers table.
+func (p *ProviderConfig) Spec(name string) beeline.ProviderSpec {
+	return beeline.ProviderSpec{
+		Name:         name,
+		Type:         p.Type,
+		BaseURL:      p.BaseURL,
+		Profiles:     p.Profiles,
+		TimeoutMs:    p.Timeout.Milliseconds(),
+		MaxTableSize: p.MaxTableSize,
+	}
 }
 
 // validate confirms a provider entry is internally consistent for its type: a known

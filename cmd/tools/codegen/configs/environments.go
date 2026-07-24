@@ -50,10 +50,14 @@ func buildLocalDevConfig() *config.Config {
 			DatabasePath:   "beeline.db",
 			Profiles:       defaultProfiles(),
 			DefaultProfile: "car",
-			// An example named provider: a local OSRM server. Nothing routes through it
-			// until an area selects it (routingProvider: "osrm-local"); the built-in
-			// haversine default still serves every area that names no provider. Point it
-			// at a running OSRM to route real road networks for that area.
+			// An example named provider: a local OSRM server. This block is seed data
+			// only — it is imported into the SQLite provider registry the first time a
+			// leader boots against an empty providers table, after which the database is
+			// authoritative and providers change through /_config_/providers (followers
+			// sync the registry from the leader, so nothing here reaches them). Nothing
+			// routes through it until an area selects it (routingProvider: "osrm-local");
+			// the built-in haversine default still serves every area that names no
+			// provider.
 			Providers: map[string]config.ProviderConfig{
 				"osrm-local": {
 					Type:         config.ProviderTypeOSRM,

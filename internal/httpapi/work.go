@@ -56,10 +56,14 @@ type claimAreaMeta struct {
 // claimResponse hands out leased pairs. Areas covers each distinct area id in
 // Pairs (keys are the ids in decimal). LeaseSeconds echoes the granted
 // (defaulted/capped) lease so the follower knows its visibility budget.
+// ProvidersHash is the provider catalog's current content hash: a follower holding
+// a different hash refetches /_work_/providers and rebuilds its engines before
+// computing, so provider config changes propagate within one claim cycle.
 type claimResponse struct {
-	Areas        map[string]claimAreaMeta `json:"areas,omitempty"`
-	Pairs        []workPair               `json:"pairs"`
-	LeaseSeconds int                      `json:"leaseSeconds"`
+	Areas         map[string]claimAreaMeta `json:"areas,omitempty"`
+	ProvidersHash string                   `json:"providersHash,omitempty"`
+	Pairs         []workPair               `json:"pairs"`
+	LeaseSeconds  int                      `json:"leaseSeconds"`
 }
 
 // claimHandler leases up to batchSize due pairs to the calling follower via the
@@ -108,6 +112,9 @@ func claimHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			Pairs:        make([]workPair, 0, len(keys)),
 			LeaseSeconds: int(lease / time.Second),
 		}
+		if deps.Coordinator != nil {
+			resp.ProvidersHash = deps.Coordinator.ProvidersHash()
+		}
 		for i := range keys {
 			resp.Pairs = append(resp.Pairs, workPair{
 				Profile: string(keys[i].Profile),
@@ -129,6 +136,17 @@ func claimHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		}
 
 		writeJSON(w, logger, http.StatusOK, resp)
+	}
+}
+
+// workProvidersHandler serves the complete provider catalog — every spec plus the
+// profile speed map, stamped with its content hash. Followers fetch it at startup
+// and whenever a claim response carries an unfamiliar hash, then build their
+// engines from it: provider configuration lives only on the leader, and followers
+// need to know nothing but a leader URL.
+func workProvidersHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, logger, http.StatusOK, deps.Coordinator.Catalog())
 	}
 }
 

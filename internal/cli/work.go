@@ -58,14 +58,21 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 		return errors.New("a leader URL is required: pass --leader, set " + LeaderURLEnvVar + ", or configure matrix.follower.leaderURL")
 	}
 
-	// The follower computes with the same provider registry a leader would build
-	// from this config, so a claimed area's provider name resolves to the same
-	// engine here as it does on a leader running the same config file.
+	// The follower's provider registry is synced from the leader: every claim
+	// carries the leader's provider-catalog hash, and an unfamiliar hash makes the
+	// follower fetch /_work_/providers and rebuild its engines (speeds included)
+	// before computing. Locally we only construct the fallback engine used until
+	// the first sync; any matrix.providers block in this config is leader-side
+	// seed data and is deliberately ignored here.
+	if len(mcfg.Providers) > 0 {
+		a.log().Info("matrix.providers is ignored by the work subcommand; provider config syncs from the leader")
+	}
 	speeds := make(map[beeline.Profile]float64, len(mcfg.Profiles))
 	for name, speed := range mcfg.Profiles {
 		speeds[beeline.Profile(name)] = speed
 	}
-	providers, err := registry.Build(mcfg.Providers, speeds, mcfg.EngineLatency)
+	fallbackSpec := beeline.ProviderSpec{Name: config.DefaultProviderName, Type: config.ProviderTypeHaversine}
+	fallback, err := registry.BuildEngine(&fallbackSpec, speeds)
 	if err != nil {
 		return err
 	}
@@ -73,9 +80,11 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 	httpCfg := fcfg.HTTP
 	httpCfg.EnsureDefaults()
 	f, err := follower.New(follower.Config{
-		LeaderURL: leaderURL,
-		Client:    httpCfg.BuildClient(),
-	}, providers, config.DefaultProviderName, a.logger)
+		LeaderURL:    leaderURL,
+		Client:       httpCfg.BuildClient(),
+		Fallback:     fallback,
+		BuildEngines: registry.BuildAll,
+	}, a.logger)
 	if err != nil {
 		return err
 	}

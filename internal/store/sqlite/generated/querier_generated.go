@@ -12,12 +12,15 @@ type Querier interface {
 	CreateArea(ctx context.Context, db DBTX, arg *CreateAreaParams) (int64, error)
 	DeleteArea(ctx context.Context, db DBTX, id int64) error
 	DeleteAreaLayers(ctx context.Context, db DBTX, areaID int64) error
+	DeleteProvider(ctx context.Context, db DBTX, name string) error
 	GetArea(ctx context.Context, db DBTX, id int64) (*Areas, error)
 	InsertAreaLayer(ctx context.Context, db DBTX, arg *InsertAreaLayerParams) error
 	ListAreaLayers(ctx context.Context, db DBTX, areaID int64) ([]*AreaLayers, error)
 	ListAreas(ctx context.Context, db DBTX) ([]*Areas, error)
+	ListProviders(ctx context.Context, db DBTX) ([]*Providers, error)
 	SetAreaEnabled(ctx context.Context, db DBTX, arg *SetAreaEnabledParams) error
 	UpdateArea(ctx context.Context, db DBTX, arg *UpdateAreaParams) error
+	UpsertProvider(ctx context.Context, db DBTX, arg *UpsertProviderParams) error
 }
 
 var _ Querier = (*Queries)(nil)

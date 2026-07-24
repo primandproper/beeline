@@ -47,24 +47,47 @@ func newHarness(t *testing.T) *harness {
 	index := memindex.New(testTTL, nil)
 	store := memstore.New()
 
-	// A registry with the built-in default plus one named OSRM provider, so tests can
+	coord := newCoordinator(t, repo, index, store)
+
+	// Register one named OSRM provider alongside the built-in default, so tests can
 	// exercise per-area provider selection and unknown-provider rejection.
-	providers, err := registry.Build(
-		map[string]config.ProviderConfig{
-			testProvider: {Type: config.ProviderTypeOSRM, BaseURL: "http://osrm-test:5000", MaxTableSize: 10000},
-		},
-		map[beeline.Profile]float64{"car": 10},
-		config.EngineLatencyConfig{},
-	)
+	_, err = coord.PutProvider(context.Background(), &beeline.ProviderSpec{
+		Name: testProvider, Type: beeline.ProviderTypeOSRM, BaseURL: "http://osrm-test:5000", MaxTableSize: 10000,
+	})
 	require.NoError(t, err)
 
-	coord := control.New(repo, index, store, []beeline.Profile{"car"}, providers, config.DefaultProviderName, control.FreshnessDefaults{
-		TargetTTL:     testTTL,
-		LeaseDuration: 15 * time.Second,
-		SweepInterval: time.Second,
-	})
-
 	return &harness{repo: repo, index: index, store: store, coord: coord}
+}
+
+// newCoordinator builds a coordinator over the given seams with the built-in
+// registry and the operator-defined providers loaded from repo — the boot sequence
+// serve.go runs, minus area resume.
+func newCoordinator(t *testing.T, repo *areasqlite.Repository, index *memindex.Index, store *memstore.Store) *control.Coordinator {
+	t.Helper()
+
+	speeds := map[string]float64{"car": 10}
+	engineSpeeds := map[beeline.Profile]float64{"car": 10}
+	coord, err := control.New(&control.Config{
+		Areas:     repo,
+		Providers: repo,
+		Index:     index,
+		Store:     store,
+		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
+			return registry.BuildEngine(spec, engineSpeeds)
+		},
+		Speeds:          speeds,
+		Builtins:        registry.BuiltinSpecs(false, 0, 0),
+		DefaultProvider: config.DefaultProviderName,
+		Defaults: control.FreshnessDefaults{
+			TargetTTL:     testTTL,
+			LeaseDuration: 15 * time.Second,
+			SweepInterval: time.Second,
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, coord.InitProviders(context.Background(), nil))
+
+	return coord
 }
 
 // diskCells returns the res-8 GridDisk of radius r around San Francisco.
@@ -588,16 +611,10 @@ func TestResumeEnabledSeedsOnlyEnabled(t *testing.T) {
 	require.NoError(t, err)
 
 	// Simulate a restart: a brand-new coordinator with a fresh index/store over the
-	// same persisted areas.
+	// same persisted areas (and the same persisted providers).
 	freshIndex := memindex.New(testTTL, nil)
 	freshStore := memstore.New()
-	freshProviders, err := registry.Build(nil, map[beeline.Profile]float64{"car": 10}, config.EngineLatencyConfig{})
-	require.NoError(t, err)
-	fresh := control.New(h.repo, freshIndex, freshStore, []beeline.Profile{"car"}, freshProviders, config.DefaultProviderName, control.FreshnessDefaults{
-		TargetTTL:     testTTL,
-		LeaseDuration: 15 * time.Second,
-		SweepInterval: time.Second,
-	})
+	fresh := newCoordinator(t, h.repo, freshIndex, freshStore)
 
 	require.NoError(t, fresh.ResumeEnabled(ctx))
 
@@ -712,13 +729,152 @@ func TestUpdateReplacesLayerList(t *testing.T) {
 	assert.Len(t, routed.Layers, 2, "the re-converged snapshot carries both layers")
 }
 
-func TestProviderNamesListsDefaultFirst(t *testing.T) {
+func TestListProviderInfosListsDefaultFirst(t *testing.T) {
 	t.Parallel()
 
-	names := newHarness(t).coord.ProviderNames()
-	require.NotEmpty(t, names)
-	assert.Equal(t, config.DefaultProviderName, names[0], "the default is listed first")
+	infos := newHarness(t).coord.ListProviderInfos()
+	require.NotEmpty(t, infos)
+	assert.Equal(t, config.DefaultProviderName, infos[0].Spec.Name, "the default is listed first")
+	assert.True(t, infos[0].Builtin)
+
+	names := make([]string, 0, len(infos))
+	for _, info := range infos {
+		names = append(names, info.Spec.Name)
+	}
 	assert.Contains(t, names, testProvider)
+}
+
+func TestProviderLifecycle(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	initialHash := h.coord.ProvidersHash()
+	require.NotEmpty(t, initialHash)
+
+	// Put registers the provider and changes the catalog hash.
+	info, err := h.coord.PutProvider(ctx, &beeline.ProviderSpec{
+		Name: "osrm-east", Type: beeline.ProviderTypeOSRM, BaseURL: "http://osrm-east:5000",
+	})
+	require.NoError(t, err)
+	assert.False(t, info.Builtin)
+	assert.NotEqual(t, initialHash, h.coord.ProvidersHash())
+
+	catalog := h.coord.Catalog()
+	assert.Equal(t, catalog.Hash, h.coord.ProvidersHash())
+	names := make([]string, 0, len(catalog.Providers))
+	for i := range catalog.Providers {
+		names = append(names, catalog.Providers[i].Name)
+	}
+	assert.Contains(t, names, "osrm-east")
+	assert.Contains(t, names, config.DefaultProviderName, "built-ins travel in the catalog")
+	assert.Equal(t, map[string]float64{"car": 10}, catalog.Speeds)
+
+	// Updating a provider re-points enabled areas without re-enabling them.
+	area, err := h.coord.Create(ctx, &control.CreateAreaInput{
+		Name: "east", GeoJSON: diskGeoJSON(t, 1), Layers: layers1(1500, 0),
+		RoutingProvider: "osrm-east",
+	})
+	require.NoError(t, err)
+	_, err = h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+	require.Equal(t, 0, h.coord.EngineFor(area.ID).Capabilities().MaxTableSize)
+
+	_, err = h.coord.PutProvider(ctx, &beeline.ProviderSpec{
+		Name: "osrm-east", Type: beeline.ProviderTypeOSRM, BaseURL: "http://osrm-east-v2:5000", MaxTableSize: 250,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 250, h.coord.EngineFor(area.ID).Capabilities().MaxTableSize,
+		"the enabled area routes through the replaced engine without re-enabling")
+
+	// Delete is rejected while any area still references the provider — enabled or
+	// not — and succeeds once the area is gone.
+	err = h.coord.DeleteProvider(ctx, "osrm-east")
+	require.ErrorIs(t, err, control.ErrProviderInUse)
+
+	require.NoError(t, h.coord.Delete(ctx, area.ID))
+	require.NoError(t, h.coord.DeleteProvider(ctx, "osrm-east"))
+
+	// Built-in names are reserved against mutation.
+	_, err = h.coord.PutProvider(ctx, &beeline.ProviderSpec{
+		Name: config.DefaultProviderName, Type: beeline.ProviderTypeHaversine,
+	})
+	require.ErrorIs(t, err, control.ErrProviderReserved)
+	err = h.coord.DeleteProvider(ctx, config.DefaultProviderName)
+	require.ErrorIs(t, err, control.ErrProviderReserved)
+
+	// Deleting an unknown provider is not found.
+	err = h.coord.DeleteProvider(ctx, "ghost")
+	require.ErrorIs(t, err, control.ErrProviderNotFound)
+}
+
+func TestInitProvidersSeedsFromFileConfigOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	db, err := areasqlite.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	repo := areasqlite.NewRepository(db, nil)
+
+	seed := []beeline.ProviderSpec{{
+		Name: "osrm-legacy", Type: beeline.ProviderTypeOSRM, BaseURL: "http://legacy:5000",
+	}}
+
+	// First boot against an empty table: the file-config entries are imported.
+	coord := newCoordinatorSeeded(t, repo, seed)
+	specs, err := repo.ListProviders(ctx)
+	require.NoError(t, err)
+	require.Len(t, specs, 1)
+	assert.Equal(t, "osrm-legacy", specs[0].Name)
+
+	// The database is now authoritative: a mutation survives a "restart" even when
+	// the stale file config still names the old entry.
+	require.NoError(t, coord.DeleteProvider(ctx, "osrm-legacy"))
+	_, err = coord.PutProvider(ctx, &beeline.ProviderSpec{
+		Name: "osrm-new", Type: beeline.ProviderTypeOSRM, BaseURL: "http://new:5000",
+	})
+	require.NoError(t, err)
+
+	rebooted := newCoordinatorSeeded(t, repo, seed)
+	names := make([]string, 0)
+	for _, info := range rebooted.ListProviderInfos() {
+		if !info.Builtin {
+			names = append(names, info.Spec.Name)
+		}
+	}
+	assert.Equal(t, []string{"osrm-new"}, names, "seed entries are not re-imported into a non-empty table")
+}
+
+// newCoordinatorSeeded is newCoordinator with file-config seed specs passed to
+// InitProviders.
+func newCoordinatorSeeded(t *testing.T, repo *areasqlite.Repository, seed []beeline.ProviderSpec) *control.Coordinator {
+	t.Helper()
+
+	engineSpeeds := map[beeline.Profile]float64{"car": 10}
+	coord, err := control.New(&control.Config{
+		Areas:     repo,
+		Providers: repo,
+		Index:     memindex.New(testTTL, nil),
+		Store:     memstore.New(),
+		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
+			return registry.BuildEngine(spec, engineSpeeds)
+		},
+		Speeds:          map[string]float64{"car": 10},
+		Builtins:        registry.BuiltinSpecs(false, 0, 0),
+		DefaultProvider: config.DefaultProviderName,
+		Defaults: control.FreshnessDefaults{
+			TargetTTL:     testTTL,
+			LeaseDuration: 15 * time.Second,
+			SweepInterval: time.Second,
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, coord.InitProviders(context.Background(), seed))
+
+	return coord
 }
 
 func TestWarmPairsValidation(t *testing.T) {

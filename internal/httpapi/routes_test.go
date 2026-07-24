@@ -272,14 +272,26 @@ func newWarmHarness(t *testing.T) *warmHarness {
 	index := memindex.New(time.Minute, nil)
 	store := memstore.New()
 
-	providers, err := registry.Build(nil, map[beeline.Profile]float64{"car": 10}, config.EngineLatencyConfig{})
-	require.NoError(t, err)
-
-	coord := control.New(repo, index, store, []beeline.Profile{"car"}, providers, config.DefaultProviderName, control.FreshnessDefaults{
-		TargetTTL:     time.Minute,
-		LeaseDuration: 15 * time.Second,
-		SweepInterval: time.Second,
+	engineSpeeds := map[beeline.Profile]float64{"car": 10}
+	coord, err := control.New(&control.Config{
+		Areas:     repo,
+		Providers: repo,
+		Index:     index,
+		Store:     store,
+		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
+			return registry.BuildEngine(spec, engineSpeeds)
+		},
+		Speeds:          map[string]float64{"car": 10},
+		Builtins:        registry.BuiltinSpecs(false, 0, 0),
+		DefaultProvider: config.DefaultProviderName,
+		Defaults: control.FreshnessDefaults{
+			TargetTTL:     time.Minute,
+			LeaseDuration: 15 * time.Second,
+			SweepInterval: time.Second,
+		},
 	})
+	require.NoError(t, err)
+	require.NoError(t, coord.InitProviders(ctx, nil))
 
 	// A ~5 km square over SF: its res-8 polyfill comfortably contains the center
 	// cell and its immediate neighbors.

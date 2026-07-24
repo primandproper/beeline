@@ -15,11 +15,6 @@
 		"tracing": {}
 	},
 	"matrix": {
-		"profiles": {
-			"bike": 4.2,
-			"car": 13.9,
-			"walk": 1.4
-		},
 		"providers": {
 			"osrm-local": {
 				"profiles": {
@@ -32,6 +27,11 @@
 				"timeout": 5000000000,
 				"maxTableSize": 10000
 			}
+		},
+		"profiles": {
+			"bike": 4.2,
+			"car": 13.9,
+			"walk": 1.4
 		},
 		"defaultProfile": "car",
 		"databasePath": "beeline.db",
@@ -50,11 +50,6 @@
 			"aggregateBucket": 60000000000,
 			"aggregateMaxKeys": 100000
 		},
-		"engineLatency": {
-			"min": 25000000,
-			"max": 120000000,
-			"enabled": true
-		},
 		"follower": {
 			"leaderURL": "http://localhost:8080",
 			"http": {
@@ -66,6 +61,11 @@
 			"idleBackoff": 1000000000,
 			"port": 8081,
 			"workers": 4
+		},
+		"engineLatency": {
+			"min": 25000000,
+			"max": 120000000,
+			"enabled": true
 		},
 		"targetTTL": 30000000000,
 		"leaseDuration": 15000000000,

@@ -741,14 +741,19 @@
     sel.value = opt;
   }
 
-  // loadProviders fills the create/edit provider pickers from live server config, so
-  // the options track whatever named providers the operator configured.
+  // loadProviders fills the create/edit provider pickers from the live provider
+  // registry (built-ins plus the database-backed operator entries), so the options
+  // track whatever providers exist right now. Each entry is a full spec object;
+  // the option value is the name, with the engine type as a hint for non-builtins.
   function loadProviders() {
-    return fetch("/_config_/providers").then(jsonOrErr).then(function (names) {
+    return fetch("/_config_/providers").then(jsonOrErr).then(function (providers) {
       [els.newProvider, els.editProvider].forEach(function (sel) {
         if (!sel) return;
         sel.innerHTML = "";
-        (names || []).forEach(function (n) { sel.appendChild(new Option(n, n)); });
+        (providers || []).forEach(function (p) {
+          var label = p.builtin ? p.name : p.name + " (" + p.type + ")";
+          sel.appendChild(new Option(label, p.name));
+        });
       });
     }).catch(function () { /* non-fatal: the default is applied server-side */ });
   }

@@ -15,7 +15,11 @@ The application is a **Cobra CLI**. Three subcommands:
 - `work` — the follower half of the leader/follower split (design §8): the same binary pointed at a
   running `serve` instance (`--leader <url>`, `BEELINE_MATRIX_FOLLOWER_LEADER_URL`, or
   `matrix.follower.leaderURL`). It claims pending pairs from the leader over `POST /_work_/claim`,
-  computes them with its local routing engines (built from the same `matrix.providers` config), and
+  computes them with routing engines built from the **leader's provider catalog** (every claim
+  response carries the catalog's content hash; an unfamiliar hash makes the follower fetch
+  `GET /_work_/providers` and rebuild its engines — speeds included — before computing, so a
+  follower needs no provider config of its own, and a failed sync fails the claim rather than
+  compute with stale engines), and
   submits the scalars back over `POST /_work_/submit`; the leader's leased freshness index is the
   only coordination, so followers are stateless — one that dies just lets its leases expire. A
   follower serves only health probes (`/_ops_/live`, and `/_ops_/ready` = leader reachable) on
@@ -68,8 +72,12 @@ HTTP endpoints (default `:8080`):
   `mode:"bump"` (default) as decayable demand at top refresh priority, `mode:"seed"` pinned
   against the demand sweep).
 - Work distribution — `POST /_work_/claim` (lease up to `batchSize` due pairs — hex H3 cells +
-  area/profile/res — with per-area `routingProvider` metadata; zero `batchSize`/`leaseSeconds` fall
-  back to `refreshBatch`/`leaseDuration`, both capped) and `POST /_work_/submit` (write a follower's
+  area/profile/res — with per-area `routingProvider` metadata and the provider catalog's
+  `providersHash`; zero `batchSize`/`leaseSeconds` fall
+  back to `refreshBatch`/`leaseDuration`, both capped), `GET /_work_/providers` (the full provider
+  **catalog**: every spec — built-ins included — plus the profile speed map, stamped with its content
+  hash; followers fetch it at startup and on any hash change), and `POST /_work_/submit` (write a
+  follower's
   computed estimates: `store.Put` + `MarkComputed`, stamped with the **leader's** clock; results for
   since-disabled areas are dropped). Idempotent by construction — duplicate submits and expired-lease
   submits are waste, never corruption.
@@ -77,8 +85,13 @@ HTTP endpoints (default `:8080`):
   SQLite store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
   `layers` list of precision levels);
   `GET`/`PATCH`/`DELETE /_config_/areas/{areaID}`; `POST …/{areaID}/enable` + `…/disable`;
-  `PUT …/{areaID}/geojson` (replace geometry). Unauthenticated, like the other endpoints; a
-  real deploy would gate these.
+  `PUT …/{areaID}/geojson` (replace geometry). Plus the **provider registry** under
+  `/_config_/providers`: `GET` (list every provider — built-ins flagged) and
+  `PUT`/`DELETE /_config_/providers/{providerName}` (upsert/remove an operator-defined provider —
+  haversine or osrm spec, SQLite-backed). Updating a provider re-points enabled areas' engines live
+  and changes the catalog hash so followers converge on their next claim; deleting is refused (409)
+  while any area references the name, and built-ins are immutable. Unauthenticated, like the other
+  endpoints; a real deploy would gate these.
 - Health — `/_ops_/live` + `/_ops_/ready`.
 - UI — `GET /` (the embedded console) and `/assets/*` (its bundled JS/CSS + vendored Leaflet/h3-js).
 
@@ -111,14 +124,19 @@ HTTP endpoints (default `:8080`):
   (`rawEnabled`) and aggregated (`aggregateEnabled`) channels, a JSONL sink path + rotation bounds,
   and buffer/flush/bucket knobs. Service areas
   — including their per-area warm strategy, precision layers (with per-layer bounds), and demand-idle
-  TTL — are not configured here; they live in the database (`internal/store/sqlite`).
+  TTL — are not configured here; they live in the database (`internal/store/sqlite`). So do routing
+  **providers**: the `matrix.providers` block is seed data only, imported into the database the
+  first time a leader boots against an empty `providers` table, after which the database is
+  authoritative (`/_config_/providers`) and the block is inert — followers ignore it entirely and
+  sync provider config from the leader.
 
 ### Matrix service packages (design §5 seams)
 
 - `internal/beeline/` — domain model and the three pluggable interfaces: `RoutingEngine`, `Store`,
   `FreshnessIndex` (§5). Core types (`Area`, `Layer`, `AreaID`, `PairKey` — keyed by `Area` —
-  `Estimate`, `Stored`, `DebtStats`, `RoutedArea`/`RoutedLayer`, …) and cell helpers (`Center`,
-  `CellAt`). `H3Cell` aliases `h3.Cell`.
+  `Estimate`, `Stored`, `DebtStats`, `RoutedArea`/`RoutedLayer`, `ProviderSpec`/`ProviderCatalog` —
+  the persisted + wire shape of one routing provider and the content-hashed registry followers
+  sync, …) and cell helpers (`Center`, `CellAt`). `H3Cell` aliases `h3.Cell`.
 - `internal/geo/` — pure `Haversine(a, b)` great-circle distance.
 - `internal/telemetry/` — query-event capture for offline demand-model training. The read path tees
   every in-area fetch (cache hit/stale, same-cell, demand — H3 cells only, never coordinates) to a
@@ -128,7 +146,10 @@ HTTP endpoints (default `:8080`):
   is enabled; drained explicitly in `serve.go` after HTTP shutdown. The predictions flow back in via
   `POST /_ops_/warm`.
 - `internal/engine/haversine/` — `RoutingEngine` implemented as Haversine ÷ per-profile speed. Swap
-  a real engine in behind the interface without touching callers.
+  a real engine in behind the interface without touching callers. Siblings: `osrm/` (an HTTP client
+  against a live OSRM `/table` endpoint), `latency/` (a delay-injecting wrapper simulating a
+  network-bound engine), and `registry/` (`BuildEngine`/`BuildAll` — construct engines from
+  `beeline.ProviderSpec`s — plus `BuiltinSpecs`, the synthesized haversine/latent-haversine specs).
 - `internal/tessellate/` — turns an area's geometry into its pair set: `CellsFromGeoJSON` polyfills the
   uploaded polygon via `h3.PolygonToCells` (§7), called once per layer resolution; `SamplePoint` returns
   a representative in-polygon coordinate (cheap create-time validation + radius-floor sample cells);
@@ -140,8 +161,9 @@ HTTP endpoints (default `:8080`):
   `Repository` over sqlc-generated queries (`generated/`, regenerate with `make sqlc`) and embedded
   goose migrations (`migrations/`). Stores area definitions (name, `warm_strategy`,
   `demand_idle_ttl_seconds`, GeoJSON, enabled flag, plus the `area_layers` child table — one row per
-  precision layer) — not the computed matrix and not cells (cells are derived by polyfill at seed
-  time).
+  precision layer) and the operator-defined **provider registry** (`providers` table — one
+  `beeline.ProviderSpec` per row; built-ins are synthesized, never stored) — not the computed matrix
+  and not cells (cells are derived by polyfill at seed time).
 - `internal/freshness/memory/` — in-memory `FreshnessIndex`: leased queue (`Claim`/`MarkComputed`,
   §8), demand `Bump`, the query-access signal `Access` (tracks a pair + stamps last-access without
   raising refresh priority), per-area demand decay `SweepArea` (evicts unpinned, unqueried pairs; `Seed`
@@ -154,8 +176,11 @@ HTTP endpoints (default `:8080`):
   one pool implementation serves both roles.
 - `internal/follower/` — the `work` subcommand's client: implements `refresh.WorkSource` and
   `beeline.EngineResolver` against a leader's `/_work_/` endpoints, resolving each claimed area's
-  `routingProvider` name against the local registry (unknown names fall back to the default engine
-  with a once-per-name log). Also the follower's health endpoints (`RegisterHealth`).
+  `routingProvider` name against a registry **synced from the leader's provider catalog** (claim
+  responses carry the catalog hash; a mismatch fetches `/_work_/providers` and rebuilds the engines
+  before computing, and a failed sync fails the claim so leases expire back into the queue; unknown
+  names fall back to the default engine with a once-per-name log only against pre-catalog leaders).
+  Also the follower's health endpoints (`RegisterHealth`).
 - `internal/query/` — the read path (§9): resolves the origin to its enabled area via the `AreaRouter`
   seam, then keys the lookup against that area's partition at the **finest layer**
   (`RoutedArea.ReadLayer()`; distance-based fallthrough to coarser layers is deliberately not
@@ -165,7 +190,12 @@ HTTP endpoints (default `:8080`):
 - `internal/control/` — the multi-area control plane. A `Coordinator` (backed by the SQLite
   `AreasRepository`) owns the enabled-area set and, on `Enable`/`Disable`/`Update`/`SetGeoJSON`/…,
   drives per-area seed/unseed over the `AreaIndex`/`AreaStore` seams while the refresh pool keeps
-  running. `Enable` polyfills every layer from the area's GeoJSON and seeds by warm strategy (eager
+  running. It also owns the **provider registry**: built-in specs at construction plus the
+  `ProvidersRepository`-persisted operator entries (`InitProviders` loads them at boot, seeding an
+  empty table once from legacy `matrix.providers` file config), mutated via
+  `PutProvider`/`DeleteProvider` (engines rebuilt through the injected `EngineBuilder`, enabled
+  areas re-pointed live, deletes refused while referenced) and published as a content-hashed
+  `beeline.ProviderCatalog` (`Catalog`/`ProvidersHash`) that followers sync from. `Enable` polyfills every layer from the area's GeoJSON and seeds by warm strategy (eager
   pins each layer's whole bound, lazy nothing, hybrid each layer's core);
   `SweepExpired` (driven by a janitor goroutine in `serve.go`) evicts cold demand pairs per area. It
   also implements `query.AreaRouter` (`Locate` — containment is the finest layer's cell set; the

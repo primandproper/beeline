@@ -56,7 +56,9 @@ type Deps struct {
 // Register attaches all routes to the router.
 func Register(router routing.Router, deps *Deps) {
 	logger := logging.EnsureLogger(deps.Logger)
-	areaID := chirouter.NewRouteParamManager().BuildRouteParamIDFetcher(logger, "areaID", "area")
+	params := chirouter.NewRouteParamManager()
+	areaID := params.BuildRouteParamIDFetcher(logger, "areaID", "area")
+	providerName := params.BuildRouteParamStringIDFetcher("providerName")
 
 	router.Get("/estimate", estimateHandler(deps, logger))
 	router.Post("/table", tableHandler(deps, logger))
@@ -70,8 +72,11 @@ func Register(router routing.Router, deps *Deps) {
 
 	router.Post("/_work_/claim", claimHandler(deps, logger))
 	router.Post("/_work_/submit", submitHandler(deps, logger))
+	router.Get("/_work_/providers", workProvidersHandler(deps, logger))
 
 	router.Get("/_config_/providers", providersListHandler(deps, logger))
+	router.Put("/_config_/providers/{providerName}", providerPutHandler(deps, logger, providerName))
+	router.Delete("/_config_/providers/{providerName}", providerDeleteHandler(deps, logger, providerName))
 	router.Get("/_config_/areas", areasListHandler(deps, logger))
 	router.Post("/_config_/areas", areaCreateHandler(deps, logger))
 	router.Get("/_config_/areas/{areaID}", areaGetHandler(deps, logger, areaID))
@@ -714,11 +719,89 @@ func toAreaResponse(logger logging.Logger, a *beeline.Area, includeGeometry bool
 	return resp
 }
 
-// providersListHandler returns the configured routing-provider names (default first)
-// so the operator console can populate its provider picker from live config.
+// providerResponse is one registry entry on the wire: the full spec plus whether it
+// is a synthesized built-in (immutable through this API).
+type providerResponse struct {
+	beeline.ProviderSpec
+	Builtin bool `json:"builtin"`
+}
+
+// providersListHandler returns every registered routing provider (default first) so
+// the operator console can render the registry and populate its picker from live
+// state. Entries marked builtin cannot be modified or deleted.
 func providersListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, logger, http.StatusOK, deps.Coordinator.ProviderNames())
+		infos := deps.Coordinator.ListProviderInfos()
+		out := make([]providerResponse, 0, len(infos))
+		for i := range infos {
+			out = append(out, providerResponse{ProviderSpec: infos[i].Spec, Builtin: infos[i].Builtin})
+		}
+
+		writeJSON(w, logger, http.StatusOK, out)
+	}
+}
+
+// providerPutHandler creates or replaces one operator-defined provider by name. The
+// path names the provider; a body name is overridden, so the URL is authoritative.
+// This is the single place a cluster's routing config changes: followers pick the
+// new registry up on their next claim via the catalog hash.
+func providerPutHandler(deps *Deps, logger logging.Logger, providerName func(*http.Request) string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimSpace(providerName(r))
+		if name == "" {
+			writeError(w, logger, http.StatusBadRequest, "invalid or missing provider name")
+			return
+		}
+
+		var spec beeline.ProviderSpec
+		if err := decodeJSON(r, &spec); err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid provider body: "+err.Error())
+			return
+		}
+		spec.Name = name
+
+		info, err := deps.Coordinator.PutProvider(r.Context(), &spec)
+		if err != nil {
+			writeProviderError(w, logger, err)
+			return
+		}
+
+		logger.Info("routing provider upserted")
+		writeJSON(w, logger, http.StatusOK, providerResponse{ProviderSpec: info.Spec, Builtin: info.Builtin})
+	}
+}
+
+// providerDeleteHandler removes one operator-defined provider. Deletion is refused
+// while any area still routes through the name (409) and for built-ins (400).
+func providerDeleteHandler(deps *Deps, logger logging.Logger, providerName func(*http.Request) string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimSpace(providerName(r))
+		if name == "" {
+			writeError(w, logger, http.StatusBadRequest, "invalid or missing provider name")
+			return
+		}
+
+		if err := deps.Coordinator.DeleteProvider(r.Context(), name); err != nil {
+			writeProviderError(w, logger, err)
+			return
+		}
+
+		logger.Info("routing provider deleted")
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// writeProviderError maps a provider mutation error to an HTTP status: unknown name
+// → 404, still referenced by an area → 409, everything else (reserved built-in,
+// validation) → 400.
+func writeProviderError(w http.ResponseWriter, logger logging.Logger, err error) {
+	switch {
+	case errors.Is(err, control.ErrProviderNotFound):
+		writeError(w, logger, http.StatusNotFound, err.Error())
+	case errors.Is(err, control.ErrProviderInUse):
+		writeError(w, logger, http.StatusConflict, err.Error())
+	default:
+		writeError(w, logger, http.StatusBadRequest, err.Error())
 	}
 }
 

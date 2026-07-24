@@ -26,3 +26,14 @@ type Areas struct {
 	LeaseDurationSeconds int64
 	SweepIntervalSeconds int64
 }
+
+type Providers struct {
+	Name         string
+	Type         string
+	BaseUrl      string
+	ProfilesJson string
+	MaxTableSize int64
+	TimeoutMs    int64
+	CreatedAt    string
+	UpdatedAt    string
+}

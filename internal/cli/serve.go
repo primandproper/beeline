@@ -58,16 +58,13 @@ func (a *application) serve(ctx context.Context) error {
 		profiles = append(profiles, p)
 	}
 
-	// Routing providers: the named engine registry the control plane resolves per area.
-	// The built-in Haversine stand-in is always registered raw under the default name;
-	// when EngineLatency is enabled, a separate "latent-haversine" provider is added that
-	// pays a random [Min, Max] delay per Table call, modeling a network-bound engine an
-	// area can opt into. Any configured providers — additional Haversine engines or real
-	// OSRM endpoints — add further named entries an area can select.
-	providers, err := registry.Build(mcfg.Providers, speeds, mcfg.EngineLatency)
-	if err != nil {
-		return err
-	}
+	// Built-in routing providers: the raw Haversine stand-in is always synthesized
+	// under the default name; when EngineLatency is enabled, a separate
+	// "latent-haversine" provider is added that pays a random [Min, Max] delay per
+	// Table call, modeling a network-bound engine an area can opt into. Everything
+	// else in the registry is operator-defined and lives in the database
+	// (/_config_/providers), loaded by InitProviders below.
+	builtins := registry.BuiltinSpecs(mcfg.EngineLatency.Enabled, mcfg.EngineLatency.Min, mcfg.EngineLatency.Max)
 	if lat := mcfg.EngineLatency; lat.Enabled {
 		a.log().WithValues(map[string]any{
 			"provider": config.LatentHaversineProviderName,
@@ -79,9 +76,9 @@ func (a *application) serve(ctx context.Context) error {
 	store := memstore.New()
 	index := memindex.New(mcfg.TargetTTL, nil)
 
-	// Area store: SQLite-backed area definitions. Opening it runs migrations; a fresh
-	// database has no areas, so nothing is seeded and the refresh pool idles until an
-	// area is created and enabled via the control plane.
+	// Area store: SQLite-backed area and provider definitions. Opening it runs
+	// migrations; a fresh database has no areas, so nothing is seeded and the refresh
+	// pool idles until an area is created and enabled via the control plane.
 	db, err := areasqlite.Open(mcfg.DatabasePath)
 	if err != nil {
 		return err
@@ -94,14 +91,43 @@ func (a *application) serve(ctx context.Context) error {
 	repo := areasqlite.NewRepository(db, nil)
 
 	// Control plane: owns the enabled-area set and drives per-area seed/unseed on the
-	// shared index/store. It also routes read-path queries to the containing area. The
-	// global freshness knobs seed a new area's per-area contract when the operator leaves
-	// them unset; each area then stores and honors its own values.
-	coordinator := control.New(repo, index, store, profiles, providers, config.DefaultProviderName, control.FreshnessDefaults{
-		TargetTTL:     mcfg.TargetTTL,
-		LeaseDuration: mcfg.LeaseDuration,
-		SweepInterval: mcfg.SweepInterval,
+	// shared index/store. It also routes read-path queries to the containing area and
+	// owns the provider registry (built-ins + the database-backed operator entries,
+	// published to followers as a content-hashed catalog). The global freshness knobs
+	// seed a new area's per-area contract when the operator leaves them unset; each
+	// area then stores and honors its own values.
+	coordinator, err := control.New(&control.Config{
+		Areas:     repo,
+		Providers: repo,
+		Index:     index,
+		Store:     store,
+		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
+			return registry.BuildEngine(spec, speeds)
+		},
+		Speeds:          mcfg.Profiles,
+		Builtins:        builtins,
+		DefaultProvider: config.DefaultProviderName,
+		Defaults: control.FreshnessDefaults{
+			TargetTTL:     mcfg.TargetTTL,
+			LeaseDuration: mcfg.LeaseDuration,
+			SweepInterval: mcfg.SweepInterval,
+		},
 	})
+	if err != nil {
+		return err
+	}
+
+	// Load the operator-defined providers from the database. A legacy
+	// matrix.providers block seeds an empty table once; after that the database is
+	// authoritative and provider changes happen through /_config_/providers.
+	seedSpecs := make([]beeline.ProviderSpec, 0, len(mcfg.Providers))
+	for name := range mcfg.Providers {
+		pc := mcfg.Providers[name]
+		seedSpecs = append(seedSpecs, pc.Spec(name))
+	}
+	if err = coordinator.InitProviders(ctx, seedSpecs); err != nil {
+		return err
+	}
 
 	// Query telemetry: when a capture channel is enabled, the read path tees every
 	// in-area fetch to a recorder over a bounded, never-blocking buffer, and a flusher

@@ -324,6 +324,7 @@ the prototype they are unauthenticated; a real deploy would gate them.
      "dest": "882a100d2dfffff", "area": 3, "res": 8}
   ],
   "areas": {"3": {"routingProvider": "latency-sim"}},
+  "providersHash": "9f2c…",
   "leaseSeconds": 30
 }
 ```
@@ -338,11 +339,20 @@ the prototype they are unauthenticated; a real deploy would gate them.
   precision layer the estimate must be written back under. Submit echoes all
   five fields verbatim.
 - `areas` carries metadata for each distinct area in the batch — today just the
-  routing-provider name, which the follower resolves against its own provider
-  registry (built from the same `matrix.providers` config a leader uses). An
-  unknown name falls back to the follower's default engine with a once-per-name
-  warning: the work still completes, but that area is being computed with
-  different routing than the leader intended.
+  routing-provider name, which the follower resolves against a provider registry
+  **synced from the leader itself**. `providersHash` is the content hash of the
+  leader's provider catalog (`GET /_work_/providers`: every provider spec —
+  built-ins included — plus the profile speed map). A follower holding a
+  different hash fetches the catalog and rebuilds its engines *before* computing
+  the claim; a failed sync fails the claim so pairs are never computed with
+  engines the leader no longer intends (the leases just expire back into the
+  queue). Provider configuration therefore lives in exactly one place — the
+  leader's `/_config_/providers` registry (SQLite-backed; a legacy
+  `matrix.providers` config block seeds an empty table once) — and repointing
+  the whole cluster at a different OSRM instance is one control-plane call that
+  propagates to every follower within one claim cycle. A follower needs nothing
+  but a leader URL. The unknown-name fallback (default engine, once-per-name
+  warning) survives only as a guard against pre-catalog leaders.
 - Claims go through the same `Index.Claim` the leader's local workers use, so
   local workers and followers drain one queue in identical priority order.
 

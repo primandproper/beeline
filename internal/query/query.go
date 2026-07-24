@@ -10,6 +10,7 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/geo"
+	"github.com/primandproper/beeline/internal/telemetry"
 
 	"github.com/primandproper/platform-go/v4/observability/logging"
 )
@@ -19,6 +20,16 @@ import (
 // which area partition (and resolution) a lookup keys against.
 type AreaRouter interface {
 	Locate(p beeline.LatLng) (beeline.RoutedArea, bool)
+}
+
+// FetchRecorder receives one event per in-area estimate the read path serves — the
+// demand signal an organization can export to train a model on which pairs get
+// queried when. Implementations must never block: the read path calls it inline.
+// Out-of-area queries are not recorded (they have no area, no resolution, and cells
+// are the only location the telemetry may carry); refresh recomputes never pass
+// through here at all, so the record matches the queries-only access signal.
+type FetchRecorder interface {
+	RecordFetch(ev *telemetry.FetchEvent)
 }
 
 // Source describes how an estimate was produced, for observability on the read path.
@@ -59,8 +70,9 @@ const (
 	classOutOfArea
 )
 
-// pairPlan is the classification of one pair. key is meaningful only for
-// classCacheLookup.
+// pairPlan is the classification of one pair. key is meaningful for
+// classCacheLookup and classSameCell (where Origin == Dest == the shared cell, so
+// telemetry can identify the fetch); it is zero for classOutOfArea.
 type pairPlan struct {
 	key   beeline.PairKey
 	class cellClass
@@ -76,20 +88,38 @@ type Handler struct {
 	index    beeline.FreshnessIndex
 	resolver beeline.EngineResolver
 	router   AreaRouter
+	recorder FetchRecorder
 	logger   logging.Logger
 }
 
-// NewHandler builds a read-path handler. A nil logger is replaced with a noop. Staleness
-// is judged per query against the containing area's own target TTL (from the router), so
-// the read path carries no global TTL.
-func NewHandler(store beeline.Store, index beeline.FreshnessIndex, resolver beeline.EngineResolver, router AreaRouter, logger logging.Logger) *Handler {
+// NewHandler builds a read-path handler. A nil logger is replaced with a noop; a nil
+// recorder disables telemetry entirely. Staleness is judged per query against the
+// containing area's own target TTL (from the router), so the read path carries no
+// global TTL.
+func NewHandler(store beeline.Store, index beeline.FreshnessIndex, resolver beeline.EngineResolver, router AreaRouter, logger logging.Logger, recorder FetchRecorder) *Handler {
 	return &Handler{
 		store:    store,
 		index:    index,
 		resolver: resolver,
 		router:   router,
+		recorder: recorder,
 		logger:   logging.EnsureLogger(logger),
 	}
+}
+
+// record tees one served estimate to the telemetry recorder, if one is wired. The
+// recorder contract is non-blocking, so this adds nothing observable to a query.
+func (h *Handler) record(key beeline.PairKey, source Source, stale bool) {
+	if h.recorder == nil {
+		return
+	}
+
+	h.recorder.RecordFetch(&telemetry.FetchEvent{
+		At:     time.Now(),
+		Key:    key,
+		Source: string(source),
+		Stale:  stale,
+	})
 }
 
 // Estimate answers a single origin→destination query for a profile. It routes by the
@@ -112,7 +142,12 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 	case classSameCell:
 		// Center-to-center distance is ~0, wrong for a real trip. Compute directly on
 		// the true coordinates instead of trusting the cache (§9).
-		return h.compute(ctx, routed.ID, origin, dest, profile, SourceSameCell)
+		res, computeErr := h.compute(ctx, routed.ID, origin, dest, profile, SourceSameCell)
+		if computeErr == nil {
+			h.record(plan.key, SourceSameCell, false)
+		}
+
+		return res, computeErr
 	}
 
 	got, err := h.store.BatchGet(ctx, []beeline.PairKey{plan.key})
@@ -122,6 +157,7 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 
 	if len(got) > 0 && got[0] != nil {
 		res, stale := cacheHit(got[0], routed.TargetTTL)
+		h.record(plan.key, SourceCache, stale)
 		if stale {
 			// Return the stale value immediately; bump its refresh priority so the
 			// budget flows to pairs people actually query (§3). A bump failure is
@@ -145,6 +181,10 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 	if err != nil {
 		return Result{}, err
 	}
+
+	// Beyond-bound demand is still recorded: it is real demand, and the exporter can
+	// judge distance offline from the cells — only caching is bounded.
+	h.record(plan.key, SourceDemand, false)
 
 	if !withinBound(routed.ReadLayer().MaxRadiusMeters, origin, dest) {
 		return res, nil
@@ -181,14 +221,13 @@ func (h *Handler) classify(routed beeline.RoutedArea, located bool, origin, dest
 		return pairPlan{}, err
 	}
 
+	key := beeline.PairKey{Area: routed.ID, Origin: originCell, Dest: destCell, Profile: profile, Res: layer.Resolution}
+
 	if originCell == destCell {
-		return pairPlan{class: classSameCell}, nil
+		return pairPlan{class: classSameCell, key: key}, nil
 	}
 
-	return pairPlan{
-		class: classCacheLookup,
-		key:   beeline.PairKey{Area: routed.ID, Origin: originCell, Dest: destCell, Profile: profile, Res: layer.Resolution},
-	}, nil
+	return pairPlan{class: classCacheLookup, key: key}, nil
 }
 
 // cacheHit packages a stored value into a cache Result and reports whether it is
@@ -291,8 +330,9 @@ func (h *Handler) Table(ctx context.Context, q *TableQuery) (TableResult, error)
 		routed[i], located[i] = h.router.Locate(q.Sources[i])
 	}
 
-	// todo is a cell awaiting a live compute in the fill pass. key is set only for a
-	// cache miss (classCacheLookup), the sole class eligible to be cached afterwards.
+	// todo is a cell awaiting a live compute in the fill pass. key is set for a cache
+	// miss (classCacheLookup) — the sole class eligible to be cached afterwards — and
+	// for a same-cell correction, whose key identifies the fetch to telemetry.
 	type todo struct {
 		key   beeline.PairKey
 		j     int
@@ -332,7 +372,7 @@ func (h *Handler) Table(ctx context.Context, q *TableQuery) (TableResult, error)
 				pending[i] = append(pending[i], todo{j: j, class: classOutOfArea})
 			case classSameCell:
 				result.SameCell++
-				pending[i] = append(pending[i], todo{j: j, class: classSameCell})
+				pending[i] = append(pending[i], todo{j: j, class: classSameCell, key: plan.key})
 			case classCacheLookup:
 				keys = append(keys, plan.key)
 				lookups = append(lookups, lookup{i: i, j: j, key: plan.key})
@@ -355,6 +395,7 @@ func (h *Handler) Table(ctx context.Context, q *TableQuery) (TableResult, error)
 				res, stale := cacheHit(got[idx], routed[lk.i].TargetTTL)
 				result.Hits++
 				result.Cells[lk.i][lk.j] = cellFrom(res)
+				h.record(lk.key, SourceCache, stale)
 				if stale {
 					staleKeys = append(staleKeys, lk.key)
 				} else {
@@ -428,6 +469,12 @@ func (h *Handler) Table(ctx context.Context, q *TableQuery) (TableResult, error)
 				source = SourceSameCell
 			}
 			result.Cells[i][t.j] = CellResult{Estimate: est, ComputedAt: now, Source: source, Present: true}
+
+			// Same-cell and miss cells are in-area fetches; out-of-area cells carry
+			// no key and are not recorded, matching Estimate.
+			if t.class != classOutOfArea {
+				h.record(t.key, source, false)
+			}
 
 			// Only a genuine miss within the area bound is cached; same-cell and
 			// out-of-area cells are answered but never stored, matching Estimate.

@@ -22,13 +22,13 @@
 		},
 		"providers": {
 			"osrm-local": {
-				"type": "osrm",
-				"baseURL": "http://localhost:5000",
 				"profiles": {
 					"bike": "cycling",
 					"car": "driving",
 					"walk": "foot"
 				},
+				"type": "osrm",
+				"baseURL": "http://localhost:5000",
 				"timeout": 5000000000,
 				"maxTableSize": 10000
 			}
@@ -39,6 +39,16 @@
 			"startupDeadline": 5000000000,
 			"port": 8080,
 			"debug": false
+		},
+		"telemetry": {
+			"path": "artifacts/telemetry.jsonl",
+			"sink": "jsonl",
+			"maxFileBytes": 8388608,
+			"maxFiles": 3,
+			"bufferSize": 8192,
+			"flushInterval": 2000000000,
+			"aggregateBucket": 60000000000,
+			"aggregateMaxKeys": 100000
 		},
 		"engineLatency": {
 			"min": 25000000,

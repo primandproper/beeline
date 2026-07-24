@@ -6,15 +6,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+	"github.com/primandproper/beeline/internal/config"
+	"github.com/primandproper/beeline/internal/control"
 	haversineengine "github.com/primandproper/beeline/internal/engine/haversine"
+	"github.com/primandproper/beeline/internal/engine/registry"
 	memindex "github.com/primandproper/beeline/internal/freshness/memory"
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/query"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
+	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
 
 	"github.com/primandproper/platform-go/v4/observability/logging"
 	metricsnoop "github.com/primandproper/platform-go/v4/observability/metrics/noop"
@@ -23,6 +28,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/uber/h3-go/v4"
 )
 
 // oneArea routes every coordinate into a single unbounded area at resolution 9.
@@ -59,7 +65,7 @@ func newTestRouter(t *testing.T) (http.Handler, *memstore.Store) {
 	store := memstore.New()
 	index := memindex.New(time.Minute, nil)
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
-	handler := query.NewHandler(store, index, oneEngine{engine: engine}, oneArea{}, nil)
+	handler := query.NewHandler(store, index, oneEngine{engine: engine}, oneArea{}, nil, nil)
 
 	router := chirouter.NewRouter(
 		logging.EnsureLogger(nil),
@@ -238,6 +244,162 @@ func TestPairsEndpointRejectsBadInput(t *testing.T) {
 			h, _ := newTestRouter(t)
 			rec := postPairs(t, h, body)
 			assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for %s", name)
+		})
+	}
+}
+
+// warmHarness is a router with a real coordinator behind it (the warm endpoint
+// validates pairs against the enabled-area set, which the lighter newTestRouter
+// fakes away), plus the shared index so tests can observe the warmed queue.
+type warmHarness struct {
+	handler http.Handler
+	index   *memindex.Index
+	areaID  beeline.AreaID
+	origin  beeline.H3Cell
+	dest    beeline.H3Cell
+}
+
+func newWarmHarness(t *testing.T) *warmHarness {
+	t.Helper()
+
+	ctx := context.Background()
+
+	db, err := areasqlite.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	repo := areasqlite.NewRepository(db, nil)
+	index := memindex.New(time.Minute, nil)
+	store := memstore.New()
+
+	providers, err := registry.Build(nil, map[beeline.Profile]float64{"car": 10}, config.EngineLatencyConfig{})
+	require.NoError(t, err)
+
+	coord := control.New(repo, index, store, []beeline.Profile{"car"}, providers, config.DefaultProviderName, control.FreshnessDefaults{
+		TargetTTL:     time.Minute,
+		LeaseDuration: 15 * time.Second,
+		SweepInterval: time.Second,
+	})
+
+	// A ~5 km square over SF: its res-8 polyfill comfortably contains the center
+	// cell and its immediate neighbors.
+	geo := `{"type":"Polygon","coordinates":[[[-122.45,37.75],[-122.39,37.75],[-122.39,37.80],[-122.45,37.80],[-122.45,37.75]]]}`
+	area, err := coord.Create(ctx, &control.CreateAreaInput{
+		Name:         "warm",
+		WarmStrategy: beeline.WarmLazy,
+		GeoJSON:      []byte(geo),
+		Layers:       []beeline.Layer{{Resolution: 8, MaxRadiusMeters: 5000}},
+	})
+	require.NoError(t, err)
+	_, err = coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	center, err := beeline.CellAt(beeline.LatLng{Lat: 37.775, Lng: -122.42}, 8)
+	require.NoError(t, err)
+	disk, err := h3.GridDisk(center, 1)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(disk), 2)
+
+	handler := query.NewHandler(store, index, coord, coord, nil, nil)
+	router := chirouter.NewRouter(
+		logging.EnsureLogger(nil),
+		tracingnoop.NewTracerProvider(),
+		metricsnoop.NewMetricsProvider(),
+		&chirouter.Config{ServiceName: "test"},
+	)
+	httpapi.Register(router, &httpapi.Deps{Handler: handler, Store: store, Index: index, Coordinator: coord, DefaultProfile: "car"})
+
+	return &warmHarness{handler: router.Handler(), index: index, areaID: area.ID, origin: center, dest: disk[1]}
+}
+
+func postWarm(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/_ops_/warm", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	return rec
+}
+
+func TestWarmEndpointBumpsPredictedPairs(t *testing.T) {
+	t.Parallel()
+
+	h := newWarmHarness(t)
+
+	body := `{"area": ` + strconv.FormatInt(int64(h.areaID), 10) +
+		`, "pairs": [{"origin": "` + h.origin.String() + `", "dest": "` + h.dest.String() + `"}]}`
+	rec := postWarm(t, h.handler, body)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp struct {
+		Mode     string `json:"mode"`
+		Accepted int    `json:"accepted"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, 1, resp.Accepted)
+	assert.Equal(t, "bump", resp.Mode, "bump is the default mode")
+
+	// The warmed pair is the lazy area's only queue entry, claimable immediately.
+	claimed, err := h.index.Claim(context.Background(), 10, 15*time.Second)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, beeline.PairKey{Area: h.areaID, Origin: h.origin, Dest: h.dest, Profile: "car", Res: 8}, claimed[0])
+}
+
+func TestWarmEndpointSeedMode(t *testing.T) {
+	t.Parallel()
+
+	h := newWarmHarness(t)
+
+	body := `{"area": ` + strconv.FormatInt(int64(h.areaID), 10) + `, "mode": "seed",` +
+		` "pairs": [{"origin": "` + h.origin.String() + `", "dest": "` + h.dest.String() + `"}]}`
+	rec := postWarm(t, h.handler, body)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp struct {
+		Mode string `json:"mode"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, "seed", resp.Mode)
+
+	// Seed mode pins: a sweep far in the future removes nothing.
+	removed, err := h.index.SweepArea(context.Background(), h.areaID, time.Now().Add(time.Hour))
+	require.NoError(t, err)
+	assert.Empty(t, removed)
+}
+
+func TestWarmEndpointRejectsBadInput(t *testing.T) {
+	t.Parallel()
+
+	h := newWarmHarness(t)
+	goodPair := `{"origin": "` + h.origin.String() + `", "dest": "` + h.dest.String() + `"}`
+	area := strconv.FormatInt(int64(h.areaID), 10)
+
+	res9, err := beeline.CellAt(beeline.LatLng{Lat: 37.775, Lng: -122.42}, 9)
+	require.NoError(t, err)
+	outside, err := beeline.CellAt(beeline.LatLng{Lat: 0, Lng: 0}, 8)
+	require.NoError(t, err)
+
+	cases := map[string]string{
+		"malformed json":  `{"area":`,
+		"missing area":    `{"pairs": [` + goodPair + `]}`,
+		"empty pairs":     `{"area": ` + area + `, "pairs": []}`,
+		"unknown mode":    `{"area": ` + area + `, "mode": "sear", "pairs": [` + goodPair + `]}`,
+		"invalid origin":  `{"area": ` + area + `, "pairs": [{"origin": "nope", "dest": "` + h.dest.String() + `"}]}`,
+		"mixed-res pair":  `{"area": ` + area + `, "pairs": [{"origin": "` + h.origin.String() + `", "dest": "` + res9.String() + `"}]}`,
+		"unknown area":    `{"area": 999, "pairs": [` + goodPair + `]}`,
+		"outside cell":    `{"area": ` + area + `, "pairs": [{"origin": "` + outside.String() + `", "dest": "` + h.dest.String() + `"}]}`,
+		"unknown profile": `{"area": ` + area + `, "profile": "hovercraft", "pairs": [` + goodPair + `]}`,
+		"same-cell pair":  `{"area": ` + area + `, "pairs": [{"origin": "` + h.origin.String() + `", "dest": "` + h.origin.String() + `"}]}`,
+	}
+
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := postWarm(t, h.handler, body)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for %s, got %s", name, rec.Body.String())
 		})
 	}
 }

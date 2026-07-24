@@ -16,6 +16,25 @@ func TestMatrixConfigValidate(t *testing.T) {
 
 		m := defaultMatrixConfig()
 		require.NoError(t, m.validate(context.Background()))
+		assert.False(t, m.Telemetry.Enabled(), "telemetry capture is opt-in")
+	})
+
+	t.Run("a zero-value telemetry config validates while disabled", func(t *testing.T) {
+		t.Parallel()
+
+		m := defaultMatrixConfig()
+		m.Telemetry = TelemetryConfig{}
+		require.NoError(t, m.validate(context.Background()))
+	})
+
+	t.Run("the defaults validate once a telemetry channel is switched on", func(t *testing.T) {
+		t.Parallel()
+
+		m := defaultMatrixConfig()
+		m.Telemetry.RawEnabled = true
+		require.NoError(t, m.validate(context.Background()), "flipping a channel on must need no other knob")
+		m.Telemetry.AggregateEnabled = true
+		require.NoError(t, m.validate(context.Background()))
 	})
 
 	t.Run("rejects invalid fields", func(t *testing.T) {
@@ -29,6 +48,22 @@ func TestMatrixConfigValidate(t *testing.T) {
 			"zero ttl":            func(m *MatrixConfig) { m.TargetTTL = 0 },
 			"zero workers":        func(m *MatrixConfig) { m.RefreshWorkers = 0 },
 			"missing server port": func(m *MatrixConfig) { m.Server.Port = 0 },
+			"telemetry on without a path": func(m *MatrixConfig) {
+				m.Telemetry.RawEnabled = true
+				m.Telemetry.Path = ""
+			},
+			"telemetry with unknown sink": func(m *MatrixConfig) {
+				m.Telemetry.RawEnabled = true
+				m.Telemetry.Sink = "kafka"
+			},
+			"telemetry with zero buffer": func(m *MatrixConfig) {
+				m.Telemetry.AggregateEnabled = true
+				m.Telemetry.BufferSize = 0
+			},
+			"aggregation without a bucket": func(m *MatrixConfig) {
+				m.Telemetry.AggregateEnabled = true
+				m.Telemetry.AggregateBucket = 0
+			},
 		}
 
 		for name, mutate := range cases {

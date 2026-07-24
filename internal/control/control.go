@@ -40,6 +40,9 @@ type AreasRepository interface {
 // cold demand pairs, and report per-area freshness. The in-memory index satisfies it.
 type AreaIndex interface {
 	Seed(ctx context.Context, keys []beeline.PairKey) error
+	// Bump raises pairs' refresh priority (adding unknown keys as unpinned demand
+	// entries), the decayable half of the model-driven warm feed.
+	Bump(ctx context.Context, keys []beeline.PairKey) error
 	Unseed(ctx context.Context, area beeline.AreaID) error
 	SweepArea(ctx context.Context, area beeline.AreaID, cutoff time.Time) ([]beeline.PairKey, error)
 	CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error)
@@ -533,6 +536,89 @@ func (c *Coordinator) CellStatesForArea(ctx context.Context, id beeline.AreaID) 
 // its layers (accepted — the contract is the area's).
 func (c *Coordinator) DebtForArea(ctx context.Context, id beeline.AreaID) (beeline.DebtStats, error) {
 	return c.index.DebtForArea(ctx, id)
+}
+
+// ErrInvalidWarm marks a warm-feed request the coordinator rejected (unknown or
+// disabled area, or a pair that does not belong to it), so the HTTP layer can map
+// validation failures to 400 without matching error text.
+var ErrInvalidWarm = errors.New("control: invalid warm request")
+
+// WarmPairs feeds externally predicted demand — e.g. a model trained on the
+// telemetry this service exports — into the freshness index for one enabled area,
+// so the refresh pool computes those pairs before they are queried. Every pair must
+// belong to the area: keyed at its finest layer's resolution, both cells inside the
+// polyfilled cell set, a configured profile, and origin ≠ dest (same-cell trips are
+// never cached, so warming one is meaningless); Area is stamped from id. The first
+// invalid pair rejects the whole request with ErrInvalidWarm.
+//
+// pin=false is the recommended mode: Bump adds the pairs as unpinned demand
+// entries at top refresh priority, and if the prediction was wrong they decay
+// through the area's normal demand sweep. pin=true additionally Seeds them —
+// pinned, surviving the sweep until the area is disabled — for pairs a model deems
+// perennial. Note that Seed resets the area's achieved-throughput baseline, so
+// pinning restarts the /_ops_/freshness throughput readout; repeated seed-mode
+// calls also grow the pinned set without bound.
+func (c *Coordinator) WarmPairs(ctx context.Context, id beeline.AreaID, pairs []beeline.PairKey, pin bool) (int, error) {
+	if len(pairs) == 0 {
+		return 0, fmt.Errorf("%w: at least one pair is required", ErrInvalidWarm)
+	}
+
+	c.mu.RLock()
+	ea, ok := c.enabled[id]
+	if !ok || len(ea.layers) == 0 {
+		c.mu.RUnlock()
+
+		return 0, fmt.Errorf("%w: area %d is not enabled", ErrInvalidWarm, id)
+	}
+	finest := ea.layers[0]
+
+	keys := make([]beeline.PairKey, len(pairs))
+	for i := range pairs {
+		p := pairs[i]
+		if err := c.validateWarmPair(&finest, &p); err != nil {
+			c.mu.RUnlock()
+
+			return 0, err
+		}
+		p.Area = id
+		keys[i] = p
+	}
+	c.mu.RUnlock()
+
+	// Outside the lock: Seed/Bump serialize on the index's own lock, and a
+	// concurrent disable at worst warms pairs the Unseed immediately removes.
+	if pin {
+		if err := c.index.Seed(ctx, keys); err != nil {
+			return 0, err
+		}
+	}
+	if err := c.index.Bump(ctx, keys); err != nil {
+		return 0, err
+	}
+
+	return len(keys), nil
+}
+
+// validateWarmPair rejects a predicted pair that does not belong to the area's
+// finest (read) layer or names an unknown profile.
+func (c *Coordinator) validateWarmPair(finest *enabledLayer, p *beeline.PairKey) error {
+	if p.Res != finest.resolution {
+		return fmt.Errorf("%w: pair resolution %d does not match the area's read layer resolution %d", ErrInvalidWarm, p.Res, finest.resolution)
+	}
+	if p.Origin == p.Dest {
+		return fmt.Errorf("%w: origin and destination cell %s are the same (same-cell trips are never cached)", ErrInvalidWarm, p.Origin)
+	}
+	if _, ok := finest.cells[p.Origin]; !ok {
+		return fmt.Errorf("%w: origin cell %s is outside the area", ErrInvalidWarm, p.Origin)
+	}
+	if _, ok := finest.cells[p.Dest]; !ok {
+		return fmt.Errorf("%w: destination cell %s is outside the area", ErrInvalidWarm, p.Dest)
+	}
+	if !slices.Contains(c.profiles, p.Profile) {
+		return fmt.Errorf("%w: unknown profile %q", ErrInvalidWarm, p.Profile)
+	}
+
+	return nil
 }
 
 // persistAndConvergeLocked writes area and, if it is enabled, re-converges its working

@@ -21,24 +21,19 @@ import (
 // in Load (BEELINE_MATRIX_… environment overlay) and LoadFromFile (JSON), per the
 // project's configuration convention.
 type MatrixConfig struct {
-	Profiles       map[string]float64        `env:"PROFILES"              json:"profiles"`
-	Providers      map[string]ProviderConfig `env:"PROVIDERS"             json:"providers,omitempty"`
-	DefaultProfile string                    `env:"DEFAULT_PROFILE"       json:"defaultProfile"`
-	DatabasePath   string                    `env:"DATABASE_PATH"         json:"databasePath"`
-	Server         serverhttp.Config         `envPrefix:"SERVER_"         json:"server"`
-	EngineLatency  EngineLatencyConfig       `envPrefix:"ENGINE_LATENCY_" json:"engineLatency,omitzero"`
-	TargetTTL      time.Duration             `env:"TARGET_TTL"            json:"targetTTL"`
-	LeaseDuration  time.Duration             `env:"LEASE_DURATION"        json:"leaseDuration"`
-	SweepInterval  time.Duration             `env:"SWEEP_INTERVAL"        json:"sweepInterval"`
-	RefreshWorkers int                       `env:"REFRESH_WORKERS"       json:"refreshWorkers"`
-	RefreshBatch   int                       `env:"REFRESH_BATCH"         json:"refreshBatch"`
-
-	// SilenceRouteLogging suppresses the router's per-response access log. The
-	// operator console polls /_ops_/freshness and /_ops_/cells every second or two,
-	// which otherwise floods stdout; health probes are always excluded regardless.
-	// Errors, panics, and startup logs still print. On for localdev/demo, off in
-	// production where access logs are wanted.
-	SilenceRouteLogging bool `env:"SILENCE_ROUTE_LOGGING" json:"silenceRouteLogging,omitempty"`
+	Profiles            map[string]float64        `env:"PROFILES"              json:"profiles"`
+	Providers           map[string]ProviderConfig `env:"PROVIDERS"             json:"providers,omitempty"`
+	DefaultProfile      string                    `env:"DEFAULT_PROFILE"       json:"defaultProfile"`
+	DatabasePath        string                    `env:"DATABASE_PATH"         json:"databasePath"`
+	Server              serverhttp.Config         `envPrefix:"SERVER_"         json:"server"`
+	Telemetry           TelemetryConfig           `envPrefix:"TELEMETRY_"      json:"telemetry,omitzero"`
+	EngineLatency       EngineLatencyConfig       `envPrefix:"ENGINE_LATENCY_" json:"engineLatency,omitzero"`
+	TargetTTL           time.Duration             `env:"TARGET_TTL"            json:"targetTTL"`
+	LeaseDuration       time.Duration             `env:"LEASE_DURATION"        json:"leaseDuration"`
+	SweepInterval       time.Duration             `env:"SWEEP_INTERVAL"        json:"sweepInterval"`
+	RefreshWorkers      int                       `env:"REFRESH_WORKERS"       json:"refreshWorkers"`
+	RefreshBatch        int                       `env:"REFRESH_BATCH"         json:"refreshBatch"`
+	SilenceRouteLogging bool                      `env:"SILENCE_ROUTE_LOGGING" json:"silenceRouteLogging,omitempty"`
 }
 
 // EngineLatencyConfig models the routing engine as network-bound. When Enabled, a
@@ -54,6 +49,84 @@ type EngineLatencyConfig struct {
 	Min     time.Duration `env:"MIN"     json:"min,omitempty"`
 	Max     time.Duration `env:"MAX"     json:"max,omitempty"`
 	Enabled bool          `env:"ENABLED" json:"enabled,omitempty"`
+}
+
+// TelemetrySinkJSONL is the only telemetry sink type implemented today: an
+// append-only newline-delimited JSON file, rotated by size.
+const TelemetrySinkJSONL = "jsonl"
+
+// TelemetryConfig configures query-event capture for offline demand-model training
+// (which estimates get fetched, keyed by H3 cell — never raw coordinates). Two
+// independently switchable channels share one recorder and sink: RawEnabled writes
+// one record per fetch; AggregateEnabled writes per-(pair, time bucket) counts on
+// each flush. Both are off by default — nothing is recorded or written unless an
+// operator opts in. The read path hands events to a bounded buffer and never
+// blocks: a full buffer drops (and counts) events instead of slowing queries.
+type TelemetryConfig struct {
+	// Path is the sink file the JSONL writer appends to.
+	Path string `env:"PATH" json:"path,omitempty"`
+	// Sink selects the writer implementation; only "jsonl" exists today.
+	Sink string `env:"SINK" json:"sink,omitempty"`
+	// MaxFileBytes rotates the sink file when it would grow past this size.
+	MaxFileBytes int64 `env:"MAX_FILE_BYTES" json:"maxFileBytes,omitempty"`
+	// MaxFiles is how many rotated files are retained alongside the live one.
+	MaxFiles int `env:"MAX_FILES" json:"maxFiles,omitempty"`
+	// BufferSize caps the in-flight event buffer between the read path and the
+	// flusher; overflow drops events rather than ever blocking a query.
+	BufferSize int `env:"BUFFER_SIZE" json:"bufferSize,omitempty"`
+	// FlushInterval is the flusher cadence: completed aggregate buckets are emitted
+	// and buffered sink writes are pushed to disk.
+	FlushInterval time.Duration `env:"FLUSH_INTERVAL" json:"flushInterval,omitempty"`
+	// AggregateBucket is the aggregation window (counts per pair per bucket).
+	AggregateBucket time.Duration `env:"AGGREGATE_BUCKET" json:"aggregateBucket,omitempty"`
+	// AggregateMaxKeys bounds the in-memory aggregation map.
+	AggregateMaxKeys int `env:"AGGREGATE_MAX_KEYS" json:"aggregateMaxKeys,omitempty"`
+	// RawEnabled records one event per fetch.
+	RawEnabled bool `env:"RAW_ENABLED" json:"rawEnabled,omitempty"`
+	// AggregateEnabled records per-(pair, bucket) demand counts.
+	AggregateEnabled bool `env:"AGGREGATE_ENABLED" json:"aggregateEnabled,omitempty"`
+}
+
+// Enabled reports whether any capture channel is on — the switch for constructing
+// the recorder and sink at all.
+func (t *TelemetryConfig) Enabled() bool {
+	return t.RawEnabled || t.AggregateEnabled
+}
+
+// validate constrains the knobs only when a channel is enabled, so a disabled
+// zero-value config passes untouched (the EngineLatency convention).
+func (t *TelemetryConfig) validate() error {
+	if !t.Enabled() {
+		return nil
+	}
+	if t.Path == "" {
+		return fmt.Errorf("telemetry path is required when telemetry is enabled")
+	}
+	if t.Sink != TelemetrySinkJSONL {
+		return fmt.Errorf("telemetry sink %q is unknown (want %q)", t.Sink, TelemetrySinkJSONL)
+	}
+	if t.MaxFileBytes <= 0 {
+		return fmt.Errorf("telemetry max file bytes %d must be positive", t.MaxFileBytes)
+	}
+	if t.MaxFiles < 1 {
+		return fmt.Errorf("telemetry max files %d must be >= 1", t.MaxFiles)
+	}
+	if t.BufferSize < 1 {
+		return fmt.Errorf("telemetry buffer size %d must be >= 1", t.BufferSize)
+	}
+	if t.FlushInterval <= 0 {
+		return fmt.Errorf("telemetry flush interval %v must be positive", t.FlushInterval)
+	}
+	if t.AggregateEnabled {
+		if t.AggregateBucket <= 0 {
+			return fmt.Errorf("telemetry aggregate bucket %v must be positive", t.AggregateBucket)
+		}
+		if t.AggregateMaxKeys < 1 {
+			return fmt.Errorf("telemetry aggregate max keys %d must be >= 1", t.AggregateMaxKeys)
+		}
+	}
+
+	return nil
 }
 
 // Provider registry constants. The built-in Haversine engine is always registered
@@ -150,6 +223,18 @@ func defaultMatrixConfig() MatrixConfig {
 		SweepInterval:  30 * time.Second,
 		RefreshWorkers: 4,
 		RefreshBatch:   256,
+		// Telemetry defaults are ready-to-enable: both channels start off, and
+		// flipping RawEnabled/AggregateEnabled needs no other knob.
+		Telemetry: TelemetryConfig{
+			Path:             "beeline-telemetry.jsonl",
+			Sink:             TelemetrySinkJSONL,
+			MaxFileBytes:     64 << 20,
+			MaxFiles:         5,
+			BufferSize:       8192,
+			FlushInterval:    5 * time.Second,
+			AggregateBucket:  5 * time.Minute,
+			AggregateMaxKeys: 100_000,
+		},
 	}
 }
 
@@ -186,6 +271,9 @@ func (m *MatrixConfig) validate(ctx context.Context) error {
 		return fmt.Errorf("refresh batch %d must be >= 1", m.RefreshBatch)
 	}
 	if err := m.EngineLatency.validate(); err != nil {
+		return err
+	}
+	if err := m.Telemetry.validate(); err != nil {
 		return err
 	}
 	for name := range m.Providers {

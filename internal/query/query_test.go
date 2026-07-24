@@ -2,6 +2,7 @@ package query_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	memindex "github.com/primandproper/beeline/internal/freshness/memory"
 	"github.com/primandproper/beeline/internal/query"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
+	"github.com/primandproper/beeline/internal/telemetry"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -54,7 +56,7 @@ func newHandler(t *testing.T, resolution int, ttl time.Duration) (*query.Handler
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
 	router := fakeRouter{id: testArea, resolution: resolution, targetTTL: ttl, present: true}
 
-	return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil), store, index
+	return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, nil), store, index
 }
 
 func TestEstimateSameCellCorrection(t *testing.T) {
@@ -134,7 +136,7 @@ func TestEstimateOutOfAreaComputesButDoesNotCache(t *testing.T) {
 	store := memstore.New()
 	index := memindex.New(time.Minute, nil)
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
-	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, fakeRouter{present: false}, nil)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, fakeRouter{present: false}, nil, nil)
 
 	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
 	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194}
@@ -155,7 +157,7 @@ func TestEstimateBeyondBoundComputesButDoesNotCache(t *testing.T) {
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
 	// A tight 500 m bound: the ~2.2 km trip below falls outside it.
 	router := fakeRouter{id: testArea, resolution: 9, maxRadius: 500, present: true}
-	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, nil)
 
 	ctx := context.Background()
 	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
@@ -181,7 +183,7 @@ func TestEstimateWithinBoundDemandFillIsTracked(t *testing.T) {
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
 	// A generous 10 km bound easily contains the ~2.2 km trip.
 	router := fakeRouter{id: testArea, resolution: 9, maxRadius: 10000, present: true}
-	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, nil)
 
 	ctx := context.Background()
 	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
@@ -235,7 +237,7 @@ func newTableHandler(t *testing.T, resolution int, ttl time.Duration, maxRadius 
 	engine := &countingEngine{inner: haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)}
 	router := fakeRouter{id: testArea, resolution: resolution, maxRadius: maxRadius, targetTTL: ttl, present: true}
 
-	return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil), store, index, engine
+	return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, nil), store, index, engine
 }
 
 // wide table coordinates: sources and destinations far enough apart that every cell is
@@ -436,7 +438,7 @@ func TestTableOutOfAreaComputesButDoesNotCache(t *testing.T) {
 	store := memstore.New()
 	index := memindex.New(time.Minute, nil)
 	engine := &countingEngine{inner: haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)}
-	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, fakeRouter{present: false}, nil)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, fakeRouter{present: false}, nil, nil)
 
 	result, err := handler.Table(context.Background(), &query.TableQuery{
 		Sources:      tableSources[:1],
@@ -490,7 +492,7 @@ func TestTableSpansMultipleAreas(t *testing.T) {
 		srcA: {ID: areaA, Layers: []beeline.RoutedLayer{{Resolution: 9}}, TargetTTL: time.Minute},
 		srcB: {ID: areaB, Layers: []beeline.RoutedLayer{{Resolution: 7}}, TargetTTL: time.Minute},
 	}}
-	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, nil)
 	ctx := context.Background()
 
 	// Seed the srcA→dest cell in area A's partition only.
@@ -552,4 +554,201 @@ func TestEstimateStaleHitBumps(t *testing.T) {
 	claimed, err := index.Claim(ctx, 10, time.Second)
 	require.NoError(t, err)
 	assert.Contains(t, claimed, key)
+}
+
+// captureRecorder collects telemetry events for tee assertions. The handler calls
+// it synchronously, but a mutex keeps it honest under -race regardless.
+type captureRecorder struct {
+	events []telemetry.FetchEvent
+	mu     sync.Mutex
+}
+
+func (c *captureRecorder) RecordFetch(ev *telemetry.FetchEvent) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, *ev)
+}
+
+func (c *captureRecorder) snapshot() []telemetry.FetchEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return append([]telemetry.FetchEvent(nil), c.events...)
+}
+
+// The telemetry package duplicates the query Source strings (query imports
+// telemetry, so they cannot be shared); this pins the two sets together.
+func TestTelemetrySourceConstantsMatch(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, string(query.SourceCache), telemetry.SourceCache)
+	assert.Equal(t, string(query.SourceSameCell), telemetry.SourceSameCell)
+	assert.Equal(t, string(query.SourceDemand), telemetry.SourceDemand)
+}
+
+func TestEstimateTelemetryEvents(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	origin := beeline.LatLng{Lat: 37.7749, Lng: -122.4194}
+	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194} // ~2.2 km north → distinct cell at res 9
+
+	oCell, err := beeline.CellAt(origin, 9)
+	require.NoError(t, err)
+	dCell, err := beeline.CellAt(dest, 9)
+	require.NoError(t, err)
+	wantKey := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
+
+	build := func(router query.AreaRouter) (*query.Handler, *memstore.Store, *captureRecorder) {
+		store := memstore.New()
+		index := memindex.New(time.Minute, nil)
+		engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
+		rec := &captureRecorder{}
+
+		return query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, rec), store, rec
+	}
+	inArea := fakeRouter{id: testArea, resolution: 9, targetTTL: time.Minute, present: true}
+
+	t.Run("fresh hit", func(t *testing.T) {
+		t.Parallel()
+
+		handler, store, rec := build(inArea)
+		require.NoError(t, store.Put(ctx, []beeline.Entry{{
+			Key:    wantKey,
+			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+		}}))
+
+		_, estErr := handler.Estimate(ctx, origin, dest, "car")
+		require.NoError(t, estErr)
+
+		events := rec.snapshot()
+		require.Len(t, events, 1)
+		assert.Equal(t, telemetry.SourceCache, events[0].Source)
+		assert.False(t, events[0].Stale)
+		assert.Equal(t, wantKey, events[0].Key)
+		assert.False(t, events[0].At.IsZero())
+	})
+
+	t.Run("stale hit", func(t *testing.T) {
+		t.Parallel()
+
+		handler, store, rec := build(inArea)
+		require.NoError(t, store.Put(ctx, []beeline.Entry{{
+			Key:    wantKey,
+			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now().Add(-2 * time.Minute)},
+		}}))
+
+		_, estErr := handler.Estimate(ctx, origin, dest, "car")
+		require.NoError(t, estErr)
+
+		events := rec.snapshot()
+		require.Len(t, events, 1)
+		assert.Equal(t, telemetry.SourceCache, events[0].Source)
+		assert.True(t, events[0].Stale)
+	})
+
+	t.Run("demand fill", func(t *testing.T) {
+		t.Parallel()
+
+		handler, _, rec := build(inArea)
+
+		_, estErr := handler.Estimate(ctx, origin, dest, "car")
+		require.NoError(t, estErr)
+
+		events := rec.snapshot()
+		require.Len(t, events, 1)
+		assert.Equal(t, telemetry.SourceDemand, events[0].Source)
+		assert.Equal(t, wantKey, events[0].Key)
+	})
+
+	t.Run("beyond-bound demand is still recorded", func(t *testing.T) {
+		t.Parallel()
+
+		handler, store, rec := build(fakeRouter{id: testArea, resolution: 9, maxRadius: 500, targetTTL: time.Minute, present: true})
+
+		_, estErr := handler.Estimate(ctx, origin, dest, "car")
+		require.NoError(t, estErr)
+
+		assert.Zero(t, store.Len(), "beyond the bound nothing is cached")
+		events := rec.snapshot()
+		require.Len(t, events, 1, "but the demand is real and recorded")
+		assert.Equal(t, telemetry.SourceDemand, events[0].Source)
+	})
+
+	t.Run("same cell", func(t *testing.T) {
+		t.Parallel()
+
+		handler, _, rec := build(fakeRouter{id: testArea, resolution: 5, targetTTL: time.Minute, present: true})
+		nearDest := beeline.LatLng{Lat: 37.7758, Lng: -122.4194} // ~100 m: same res-5 cell
+
+		cell, cellErr := beeline.CellAt(origin, 5)
+		require.NoError(t, cellErr)
+
+		_, estErr := handler.Estimate(ctx, origin, nearDest, "car")
+		require.NoError(t, estErr)
+
+		events := rec.snapshot()
+		require.Len(t, events, 1)
+		assert.Equal(t, telemetry.SourceSameCell, events[0].Source)
+		assert.Equal(t, cell, events[0].Key.Origin)
+		assert.Equal(t, cell, events[0].Key.Dest, "a same-cell event carries the shared cell twice")
+		assert.Equal(t, testArea, events[0].Key.Area)
+		assert.Equal(t, 5, events[0].Key.Res)
+	})
+
+	t.Run("out of area records nothing", func(t *testing.T) {
+		t.Parallel()
+
+		handler, _, rec := build(fakeRouter{present: false})
+
+		_, estErr := handler.Estimate(ctx, origin, dest, "car")
+		require.NoError(t, estErr)
+
+		assert.Empty(t, rec.snapshot(), "no area, no resolution, no event")
+	})
+}
+
+func TestTableTelemetryEvents(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := memstore.New()
+	index := memindex.New(time.Minute, nil)
+	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
+	router := fakeRouter{id: testArea, resolution: 9, targetTTL: time.Minute, present: true}
+	rec := &captureRecorder{}
+	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil, rec)
+
+	// Pre-cache source0→dest0 so the grid mixes a hit with filled misses.
+	oCell, err := beeline.CellAt(tableSources[0], 9)
+	require.NoError(t, err)
+	dCell, err := beeline.CellAt(tableDests[0], 9)
+	require.NoError(t, err)
+	require.NoError(t, store.Put(ctx, []beeline.Entry{{
+		Key:    beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9},
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+	}}))
+
+	result, err := handler.Table(ctx, &query.TableQuery{
+		Sources:      tableSources,
+		Destinations: tableDests,
+		Profile:      "car",
+		Fill:         true,
+		Skip:         map[[2]int]struct{}{{1, 2}: {}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Hits)
+	require.Equal(t, 1, result.Skipped)
+
+	events := rec.snapshot()
+	// 2×3 grid minus one skipped cell: one hit + four filled misses, every one recorded.
+	require.Len(t, events, 5)
+
+	bySource := map[string]int{}
+	for _, ev := range events {
+		bySource[ev.Source]++
+		assert.Equal(t, testArea, ev.Key.Area)
+		assert.Equal(t, 9, ev.Key.Res)
+	}
+	assert.Equal(t, map[string]int{telemetry.SourceCache: 1, telemetry.SourceDemand: 4}, bySource)
 }

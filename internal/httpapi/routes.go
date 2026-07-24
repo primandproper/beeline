@@ -60,6 +60,7 @@ func Register(router routing.Router, deps *Deps) {
 	router.Get("/_ops_/freshness", freshnessHandler(deps, logger))
 	router.Get("/_ops_/cells", cellsHandler(deps, logger))
 	router.Post("/_ops_/pairs", pairsHandler(deps, logger))
+	router.Post("/_ops_/warm", warmHandler(deps, logger))
 	router.Get("/_ops_/live", liveHandler(logger))
 	router.Get("/_ops_/ready", readyHandler(deps.Health, logger))
 
@@ -498,6 +499,122 @@ func pairsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		}
 
 		writeJSON(w, logger, http.StatusOK, pairsResponse{Pairs: pairs})
+	}
+}
+
+// maxWarmPairs bounds one warm request, mirroring maxTableCells. It caps a single
+// request, not the cumulative working set: repeated seed-mode calls keep pinning.
+const maxWarmPairs = 10_000
+
+// Warm modes: bump raises decayable refresh priority; seed additionally pins the
+// pairs against the demand sweep.
+const (
+	warmModeBump = "bump"
+	warmModeSeed = "seed"
+)
+
+// warmRequest feeds predicted demand — typically a model trained on this service's
+// telemetry export — into an enabled area's refresh queue. Pairs are hex H3 cells
+// at the area's finest (read) resolution; Profile defaults to the server's default
+// profile; Mode defaults to bump (decayable — recommended), while seed pins the
+// pairs until the area is disabled. Origin+radius expansion is deliberately not
+// offered: the telemetry is pair-granular, so a model's natural output is pairs.
+type warmRequest struct {
+	Profile string         `json:"profile"`
+	Mode    string         `json:"mode"`
+	Pairs   []warmPairBody `json:"pairs"`
+	Area    int64          `json:"area"`
+}
+
+type warmPairBody struct {
+	Origin string `json:"origin"`
+	Dest   string `json:"dest"`
+}
+
+type warmResponse struct {
+	Mode     string `json:"mode"`
+	Accepted int    `json:"accepted"`
+}
+
+// warmHandler is the model-feed ingestion point: it validates the request shape
+// here and delegates area membership to the coordinator, whose ErrInvalidWarm maps
+// to 400. Like every endpoint in this prototype it is unauthenticated; a real
+// deploy would gate it.
+func warmHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req warmRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid warm body: "+err.Error())
+			return
+		}
+		if req.Area <= 0 {
+			writeError(w, logger, http.StatusBadRequest, "area must be a positive id")
+			return
+		}
+		if len(req.Pairs) == 0 {
+			writeError(w, logger, http.StatusBadRequest, "pairs must be non-empty")
+			return
+		}
+		if len(req.Pairs) > maxWarmPairs {
+			writeError(w, logger, http.StatusBadRequest,
+				"too many pairs: limit "+strconv.Itoa(maxWarmPairs))
+			return
+		}
+
+		mode := warmModeBump
+		if m := strings.TrimSpace(req.Mode); m != "" {
+			if m != warmModeBump && m != warmModeSeed {
+				writeError(w, logger, http.StatusBadRequest, "unknown mode "+m+" (want bump or seed)")
+				return
+			}
+			mode = m
+		}
+
+		profile := deps.DefaultProfile
+		if p := strings.TrimSpace(req.Profile); p != "" {
+			profile = beeline.Profile(p)
+		}
+
+		keys := make([]beeline.PairKey, 0, len(req.Pairs))
+		for i := range req.Pairs {
+			p := &req.Pairs[i]
+			origin, err := parseCell(p.Origin)
+			if err != nil {
+				writeError(w, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
+				return
+			}
+			dest, err := parseCell(p.Dest)
+			if err != nil {
+				writeError(w, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
+				return
+			}
+			if dest.Resolution() != origin.Resolution() {
+				writeError(w, logger, http.StatusBadRequest,
+					"dest "+p.Dest+" is resolution "+strconv.Itoa(dest.Resolution())+
+						", want the origin's "+strconv.Itoa(origin.Resolution()))
+				return
+			}
+			keys = append(keys, beeline.PairKey{
+				Area:    beeline.AreaID(req.Area),
+				Origin:  origin,
+				Dest:    dest,
+				Profile: profile,
+				Res:     origin.Resolution(),
+			})
+		}
+
+		accepted, err := deps.Coordinator.WarmPairs(r.Context(), beeline.AreaID(req.Area), keys, mode == warmModeSeed)
+		if err != nil {
+			if errors.Is(err, control.ErrInvalidWarm) {
+				writeError(w, logger, http.StatusBadRequest, err.Error())
+				return
+			}
+			logger.Error("warming pairs", err)
+			writeError(w, logger, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		writeJSON(w, logger, http.StatusOK, warmResponse{Accepted: accepted, Mode: mode})
 	}
 }
 

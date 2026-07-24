@@ -53,7 +53,11 @@ HTTP endpoints (default `:8080`):
   `POST /_ops_/pairs` (the console's hover probe: a pure cache read of one origin cell's
   estimates to a list of same-resolution destination cells, keyed at the cells' own
   resolution — unlike `/estimate`/`/table`, which key at the finest layer — so any layer's
-  cached pairs are inspectable).
+  cached pairs are inspectable), and `POST /_ops_/warm` (the model-feed ingestion point: a JSON
+  body of `area` + `pairs` (hex H3 origin/dest cells at the area's finest resolution, optional
+  `profile`) pushes predicted demand into the freshness index via `Coordinator.WarmPairs` —
+  `mode:"bump"` (default) as decayable demand at top refresh priority, `mode:"seed"` pinned
+  against the demand sweep).
 - Control plane — the area registry under `/_config_/areas`, served by `internal/control` over the
   SQLite store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
   `layers` list of precision levels);
@@ -83,7 +87,11 @@ HTTP endpoints (default `:8080`):
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
   `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs (`targetTTL`,
-  `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch). Service areas
+  `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch), plus the
+  `telemetry` sub-config (`TelemetryConfig`, env prefix `BEELINE_MATRIX_TELEMETRY_`): query-event
+  capture for offline demand-model training, off by default, with independently switchable raw
+  (`rawEnabled`) and aggregated (`aggregateEnabled`) channels, a JSONL sink path + rotation bounds,
+  and buffer/flush/bucket knobs. Service areas
   — including their per-area warm strategy, precision layers (with per-layer bounds), and demand-idle
   TTL — are not configured here; they live in the database (`internal/store/sqlite`).
 
@@ -94,6 +102,13 @@ HTTP endpoints (default `:8080`):
   `Estimate`, `Stored`, `DebtStats`, `RoutedArea`/`RoutedLayer`, …) and cell helpers (`Center`,
   `CellAt`). `H3Cell` aliases `h3.Cell`.
 - `internal/geo/` — pure `Haversine(a, b)` great-circle distance.
+- `internal/telemetry/` — query-event capture for offline demand-model training. The read path tees
+  every in-area fetch (cache hit/stale, same-cell, demand — H3 cells only, never coordinates) to a
+  `Recorder` over a bounded never-blocking buffer (overflow drops and counts); a flusher goroutine
+  writes raw `fetch` events and/or per-(pair, time-bucket) `demand` aggregates through the pluggable
+  `Sink` seam (`JSONLSink` today: append-only, size-rotated). Off unless a `matrix.telemetry` channel
+  is enabled; drained explicitly in `serve.go` after HTTP shutdown. The predictions flow back in via
+  `POST /_ops_/warm`.
 - `internal/engine/haversine/` — `RoutingEngine` implemented as Haversine ÷ per-profile speed. Swap
   a real engine in behind the interface without touching callers.
 - `internal/tessellate/` — turns an area's geometry into its pair set: `CellsFromGeoJSON` polyfills the

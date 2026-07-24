@@ -720,3 +720,121 @@ func TestProviderNamesListsDefaultFirst(t *testing.T) {
 	assert.Equal(t, config.DefaultProviderName, names[0], "the default is listed first")
 	assert.Contains(t, names, testProvider)
 }
+
+func TestWarmPairsValidation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name:         "warm",
+		WarmStrategy: beeline.WarmLazy,
+		GeoJSON:      diskGeoJSON(t, 1),
+		Layers:       layers1(1500, 0),
+	})
+
+	cells := diskCells(t, 1)
+	valid := beeline.PairKey{Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes}
+
+	// Not enabled yet: every warm attempt is rejected.
+	_, err := h.coord.WarmPairs(ctx, area.ID, []beeline.PairKey{valid}, false)
+	require.ErrorIs(t, err, control.ErrInvalidWarm)
+
+	_, err = h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	outside, err := beeline.CellAt(beeline.LatLng{Lat: 0, Lng: 0}, testRes)
+	require.NoError(t, err)
+
+	cases := map[string]beeline.PairKey{
+		"wrong resolution":        {Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes + 1},
+		"origin outside the area": {Origin: outside, Dest: cells[1], Profile: "car", Res: testRes},
+		"dest outside the area":   {Origin: cells[0], Dest: outside, Profile: "car", Res: testRes},
+		"unknown profile":         {Origin: cells[0], Dest: cells[1], Profile: "hovercraft", Res: testRes},
+		"origin equals dest":      {Origin: cells[0], Dest: cells[0], Profile: "car", Res: testRes},
+	}
+	for name, bad := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, warmErr := h.coord.WarmPairs(ctx, area.ID, []beeline.PairKey{valid, bad}, false)
+			require.ErrorIs(t, warmErr, control.ErrInvalidWarm, "one bad pair rejects the whole request")
+		})
+	}
+
+	_, err = h.coord.WarmPairs(ctx, area.ID, nil, false)
+	require.ErrorIs(t, err, control.ErrInvalidWarm, "an empty request is rejected")
+
+	_, err = h.coord.WarmPairs(ctx, area.ID+999, []beeline.PairKey{valid}, false)
+	require.ErrorIs(t, err, control.ErrInvalidWarm, "an unknown area is rejected")
+}
+
+func TestWarmPairsBumpIsClaimableAndDecays(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name:          "warm-bump",
+		WarmStrategy:  beeline.WarmLazy,
+		GeoJSON:       diskGeoJSON(t, 1),
+		Layers:        layers1(1500, 0),
+		DemandIdleTTL: time.Minute,
+	})
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	cells := diskCells(t, 1)
+	pair := beeline.PairKey{Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes}
+
+	accepted, err := h.coord.WarmPairs(ctx, area.ID, []beeline.PairKey{pair}, false)
+	require.NoError(t, err)
+	assert.Equal(t, 1, accepted)
+
+	// The Area is stamped by the coordinator: the caller's zero Area still lands in
+	// the right partition, at top refresh priority.
+	want := pair
+	want.Area = area.ID
+	claimed, err := h.index.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, []beeline.PairKey{want}, claimed, "a lazy area holds nothing else; the warmed pair is claimable immediately")
+	require.NoError(t, h.index.MarkComputed(ctx, claimed, time.Now()))
+
+	// Bump-mode warming is decayable demand: once idle past the cutoff it sweeps away.
+	removed, err := h.index.SweepArea(ctx, area.ID, time.Now().Add(time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, []beeline.PairKey{want}, removed, "a wrong prediction decays through the normal sweep")
+}
+
+func TestWarmPairsSeedModeSurvivesSweep(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name:          "warm-seed",
+		WarmStrategy:  beeline.WarmLazy,
+		GeoJSON:       diskGeoJSON(t, 1),
+		Layers:        layers1(1500, 0),
+		DemandIdleTTL: time.Minute,
+	})
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	cells := diskCells(t, 1)
+	pair := beeline.PairKey{Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes}
+
+	accepted, err := h.coord.WarmPairs(ctx, area.ID, []beeline.PairKey{pair}, true)
+	require.NoError(t, err)
+	assert.Equal(t, 1, accepted)
+
+	removed, err := h.index.SweepArea(ctx, area.ID, time.Now().Add(time.Hour))
+	require.NoError(t, err)
+	assert.Empty(t, removed, "a pinned (seed-mode) pair survives the demand sweep")
+
+	claimed, err := h.index.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	want := pair
+	want.Area = area.ID
+	assert.Equal(t, []beeline.PairKey{want}, claimed, "and is claimable at top priority")
+}

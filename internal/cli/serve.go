@@ -14,6 +14,7 @@ import (
 	"github.com/primandproper/beeline/internal/refresh"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
+	"github.com/primandproper/beeline/internal/telemetry"
 	"github.com/primandproper/beeline/internal/webui"
 
 	"github.com/primandproper/platform-go/v4/healthcheck"
@@ -102,9 +103,40 @@ func (a *application) serve(ctx context.Context) error {
 		SweepInterval: mcfg.SweepInterval,
 	})
 
+	// Query telemetry: when a capture channel is enabled, the read path tees every
+	// in-area fetch to a recorder over a bounded, never-blocking buffer, and a flusher
+	// goroutine writes raw events and/or aggregated demand counts through the JSONL
+	// sink — the training data for a demand-prediction model (fed back via
+	// POST /_ops_/warm). Disabled (the default), the handler gets a nil recorder and
+	// the read path records nothing.
+	var recorder *telemetry.Recorder
+	var fetchRecorder query.FetchRecorder
+	if tcfg := mcfg.Telemetry; tcfg.Enabled() {
+		sink, sinkErr := telemetry.NewJSONLSink(tcfg.Path, tcfg.MaxFileBytes, tcfg.MaxFiles)
+		if sinkErr != nil {
+			return sinkErr
+		}
+		recorder = telemetry.NewRecorder(sink, telemetry.Config{
+			BufferSize:       tcfg.BufferSize,
+			FlushInterval:    tcfg.FlushInterval,
+			RawEnabled:       tcfg.RawEnabled,
+			AggregateEnabled: tcfg.AggregateEnabled,
+			AggregateBucket:  tcfg.AggregateBucket,
+			AggregateMaxKeys: tcfg.AggregateMaxKeys,
+		}, a.logger)
+		// Assigned only when non-nil so the interface itself stays nil when telemetry
+		// is off (a typed-nil *Recorder would defeat the handler's nil check).
+		fetchRecorder = recorder
+		a.log().WithValues(map[string]any{
+			"path":      tcfg.Path,
+			"raw":       tcfg.RawEnabled,
+			"aggregate": tcfg.AggregateEnabled,
+		}).Info("query telemetry capture enabled")
+	}
+
 	// Read path: routes each query through the coordinator to the enabled area that
 	// contains it (and its resolution); staleness is judged against that area's own TTL.
-	handler := query.NewHandler(store, index, coordinator, coordinator, a.logger)
+	handler := query.NewHandler(store, index, coordinator, coordinator, a.logger, fetchRecorder)
 
 	// Seed the areas that were already enabled in a prior run.
 	if err = coordinator.ResumeEnabled(ctx); err != nil {
@@ -171,6 +203,13 @@ func (a *application) serve(ctx context.Context) error {
 	go pool.Run(ctx)
 	go srv.Serve()
 
+	// The telemetry flusher is deliberately not tied to ctx: it must keep consuming
+	// while srv.Shutdown drains in-flight requests (which still record events), and
+	// is stopped explicitly below once the server is fully drained.
+	if recorder != nil {
+		go recorder.Run()
+	}
+
 	// Demand-decay janitor: ticks on a fixed base cadence and asks the coordinator to
 	// sweep each enabled area that is due on its own SweepInterval, evicting cold demand
 	// pairs (unqueried past their DemandIdleTTL) from the index and store so cost tracks
@@ -183,7 +222,19 @@ func (a *application) serve(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serveShutdownTimeout)
 	defer cancel()
 
-	return srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
+
+	// Only after the server has drained (no more requests can record events): drain
+	// the telemetry buffer, flush the aggregator, and close the sink, within what
+	// remains of the shutdown budget. A drain failure is logged, not returned — it
+	// must not mask a server shutdown error.
+	if recorder != nil {
+		if drainErr := recorder.Close(shutdownCtx); drainErr != nil {
+			a.log().Error("draining telemetry recorder", drainErr)
+		}
+	}
+
+	return err
 }
 
 // sweepBaseTick is how often the janitor wakes to check which areas are due for a demand-

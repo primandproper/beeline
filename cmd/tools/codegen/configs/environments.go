@@ -70,6 +70,24 @@ func buildLocalDevConfig() *config.Config {
 				Min:     25 * time.Millisecond,
 				Max:     120 * time.Millisecond,
 			},
+			// Query telemetry stays OFF even locally — the capture pipeline is young.
+			// The sink/buffer knobs are pre-filled so trying it is a single env-var
+			// flip (BEELINE_MATRIX_TELEMETRY_RAW_ENABLED=true and/or
+			// …_AGGREGATE_ENABLED=true) writing into the gitignored artifacts dir,
+			// with short flush/bucket windows so activity shows quickly. Production
+			// leaves the whole block unset.
+			Telemetry: config.TelemetryConfig{
+				RawEnabled:       false,
+				AggregateEnabled: false,
+				Path:             "artifacts/telemetry.jsonl",
+				Sink:             config.TelemetrySinkJSONL,
+				MaxFileBytes:     8 << 20,
+				MaxFiles:         3,
+				BufferSize:       8192,
+				FlushInterval:    2 * time.Second,
+				AggregateBucket:  time.Minute,
+				AggregateMaxKeys: 100_000,
+			},
 			TargetTTL:           30 * time.Second,
 			LeaseDuration:       15 * time.Second,
 			SweepInterval:       15 * time.Second,

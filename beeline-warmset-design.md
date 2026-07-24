@@ -32,6 +32,12 @@ solid. It is sketched in Phase 4 so the earlier phases don't paint us into a cor
 ## 2. Non-goals / out of scope
 
 - **ML demand prediction.** We use observed demand instead. Not building a model.
+  *(Update: the scaffolding for this now exists, though the model itself remains out of scope.
+  `internal/telemetry` exports the read path's fetch events — raw and/or per-(pair, bucket)
+  aggregates, H3 cells only — through a pluggable sink (JSONL file today) when
+  `matrix.telemetry` is enabled, and `POST /_ops_/warm` feeds a trained model's predicted pairs
+  back into the freshness index via `control.Coordinator.WarmPairs` (bump = decayable demand,
+  seed = pinned). Observed demand is still the default behavior.)*
 - **Swapping the engine (OSRM/Valhalla) or store (Redis).** These are independent tracks already
   enabled by the `beeline.RoutingEngine` / `beeline.Store` seams (`internal/beeline/types.go`). This
   doc changes neither interface. Do not entangle them with this work.

@@ -11,13 +11,15 @@
 #                         to 80 km recorded to serve trips beyond 20 km once
 #                         distance-based layer selection lands.
 #
-# All three route through the raw "haversine" provider with a 5-minute target TTL.
+# All three route through the DEMO_PROVIDER routing provider (default: the raw
+# "haversine" in-process engine; demo_cluster.sh sets "latent-haversine" to model a
+# network-bound engine) with a 5-minute target TTL and a DEMO_LEASE claim lease.
 # Creation order matters: the read path resolves an overlapping point to the enabled
 # area with the LOWEST id, so the most specific area (downtown) is created first and
 # the coarsest (metro) last. The server polyfills every layer of each polygon into
 # its cell set (design §7). Ctrl-C stops the server.
 #
-# Overridable via environment: BINARY, CONFIG, DEMO_DB, PORT.
+# Overridable via environment: BINARY, CONFIG, DEMO_DB, PORT, DEMO_PROVIDER, DEMO_LEASE.
 set -euo pipefail
 
 BINARY="${BINARY:-artifacts/beeline}"
@@ -25,6 +27,8 @@ CONFIG="${CONFIG:-config/localdev.json}"
 DEMO_DB="${DEMO_DB:-artifacts/demo.db}"
 PORT="${PORT:-8080}"
 BASE="http://localhost:${PORT}"
+DEMO_PROVIDER="${DEMO_PROVIDER:-haversine}"
+DEMO_LEASE="${DEMO_LEASE:-15s}"
 
 if [[ ! -x "${BINARY}" ]]; then
   echo "demo: ${BINARY} not found — run 'make build' first" >&2
@@ -71,14 +75,15 @@ create_area() {
 }
 
 echo "▶ creating + enabling Downtown Austin (res 9, full mesh)"
-downtown_id="$(create_area "Downtown Austin" <<'JSON'
+downtown_id="$(create_area "Downtown Austin" <<JSON
 {
   "name": "Downtown Austin",
   "layers": [
     { "resolution": 9, "minDistanceMeters": 0, "maxRadiusMeters": 0 }
   ],
-  "routingProvider": "haversine",
+  "routingProvider": "${DEMO_PROVIDER}",
   "targetTTL": "5m",
+  "leaseDuration": "${DEMO_LEASE}",
   "geojson": {
     "type": "Polygon",
     "coordinates": [[
@@ -94,14 +99,15 @@ JSON
 )"
 
 echo "▶ creating + enabling Austin proper (res 8, 8 km bound)"
-austin_id="$(create_area "Austin" <<'JSON'
+austin_id="$(create_area "Austin" <<JSON
 {
   "name": "Austin",
   "layers": [
     { "resolution": 8, "minDistanceMeters": 0, "maxRadiusMeters": 8000 }
   ],
-  "routingProvider": "haversine",
+  "routingProvider": "${DEMO_PROVIDER}",
   "targetTTL": "5m",
+  "leaseDuration": "${DEMO_LEASE}",
   "geojson": {
     "type": "Polygon",
     "coordinates": [[
@@ -121,15 +127,16 @@ JSON
 )"
 
 echo "▶ creating + enabling Austin metro (layers: res 7 / 40 km + res 6 / 80 km)"
-metro_id="$(create_area "Austin Metro" <<'JSON'
+metro_id="$(create_area "Austin Metro" <<JSON
 {
   "name": "Austin Metro",
   "layers": [
     { "resolution": 7, "minDistanceMeters": 0, "maxRadiusMeters": 40000 },
     { "resolution": 6, "minDistanceMeters": 20000, "maxRadiusMeters": 80000 }
   ],
-  "routingProvider": "haversine",
+  "routingProvider": "${DEMO_PROVIDER}",
   "targetTTL": "5m",
+  "leaseDuration": "${DEMO_LEASE}",
   "geojson": {
     "type": "Polygon",
     "coordinates": [[

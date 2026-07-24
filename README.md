@@ -53,6 +53,22 @@ make run ARGS="serve --config config/localdev.json"   # or ./artifacts/beeline s
 
 Then open **http://localhost:8080**.
 
+The pipeline scales horizontally with the `work` subcommand: the same binary pointed at a running
+`serve` instance becomes a stateless **follower** that claims pending pairs from the leader, computes
+them locally, and submits the results back — add followers until the freshness debt burns down
+smoothly (a leader started with `refreshWorkers: 0` does no computing of its own).
+
+```bash
+./artifacts/beeline work --config config/localdev.json --leader http://localhost:8080
+```
+
+**`make demo-cluster`** stages the whole story in one command: a coordinator-only leader
+(`refreshWorkers: 0`) seeds the demo areas against the simulated network-latency engine — a workload
+one follower cannot keep fresh — and three followers claim, compute, and submit until achieved
+throughput clears the freshness contract's requirement. The script tails `/_ops_/freshness` so you
+can watch it happen; try `make demo-cluster FOLLOWERS=1` to see the contract missed, or kill one
+follower mid-run and watch the burn rate sag.
+
 Started with plain `serve`, a fresh database has **no areas** — nothing refreshes
 until you configure one. In the
 console: click **+ New**, give it a name, upload a **GeoJSON polygon** (required —

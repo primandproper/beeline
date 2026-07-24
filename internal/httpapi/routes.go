@@ -47,6 +47,10 @@ type Deps struct {
 	Health         healthcheck.Registry
 	Logger         logging.Logger
 	DefaultProfile beeline.Profile
+	// RefreshBatch and LeaseDuration are the defaults a /_work_/claim request
+	// falls back to when it doesn't name its own batch size or lease.
+	RefreshBatch  int
+	LeaseDuration time.Duration
 }
 
 // Register attaches all routes to the router.
@@ -63,6 +67,9 @@ func Register(router routing.Router, deps *Deps) {
 	router.Post("/_ops_/warm", warmHandler(deps, logger))
 	router.Get("/_ops_/live", liveHandler(logger))
 	router.Get("/_ops_/ready", readyHandler(deps.Health, logger))
+
+	router.Post("/_work_/claim", claimHandler(deps, logger))
+	router.Post("/_work_/submit", submitHandler(deps, logger))
 
 	router.Get("/_config_/providers", providersListHandler(deps, logger))
 	router.Get("/_config_/areas", areasListHandler(deps, logger))

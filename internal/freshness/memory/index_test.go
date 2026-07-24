@@ -204,3 +204,31 @@ func TestIndexInvalidateReenqueues(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, due, 3)
 }
+
+func TestIndexClaimClustersByOrigin(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	idx := memory.New(time.Hour, nil)
+
+	// 20 origins × 10 dests, all never-computed (equal priority). A batch-sized
+	// claim must come back grouped by origin — dense 1×K packing (§6) — not
+	// scattered across as many origins as pairs.
+	var seeded []beeline.PairKey
+	for origin := beeline.H3Cell(1); origin <= 20; origin++ {
+		for dest := beeline.H3Cell(100); dest < 110; dest++ {
+			seeded = append(seeded, beeline.PairKey{Origin: origin, Dest: dest, Profile: "car", Res: 8})
+		}
+	}
+	require.NoError(t, idx.Seed(ctx, seeded))
+
+	claimed, err := idx.Claim(ctx, 30, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 30)
+
+	distinct := make(map[beeline.H3Cell]struct{})
+	for _, k := range claimed {
+		distinct[k.Origin] = struct{}{}
+	}
+	assert.Len(t, distinct, 3, "30 pairs at 10 dests per origin should span exactly 3 origins")
+}

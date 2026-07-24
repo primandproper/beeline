@@ -27,16 +27,16 @@ type Config struct {
 // Pool owns the worker goroutines and the dependencies they share.
 type Pool struct {
 	resolver beeline.EngineResolver
-	store    beeline.Store
-	index    beeline.FreshnessIndex
+	source   WorkSource
 	logger   logging.Logger
 	cfg      Config
 }
 
 // NewPool wires a refresh pool. The resolver selects the routing engine per area, so a
-// claimed batch spanning several areas routes each through its own provider. It does
-// not start any goroutines; call Run.
-func NewPool(resolver beeline.EngineResolver, store beeline.Store, index beeline.FreshnessIndex, logger logging.Logger, cfg Config) *Pool {
+// claimed batch spanning several areas routes each through its own provider. The source
+// is where claims come from and results go — local index+store on a leader, an HTTP
+// client on a follower. It does not start any goroutines; call Run.
+func NewPool(resolver beeline.EngineResolver, source WorkSource, logger logging.Logger, cfg Config) *Pool {
 	if cfg.Workers < 1 {
 		cfg.Workers = 1
 	}
@@ -47,7 +47,7 @@ func NewPool(resolver beeline.EngineResolver, store beeline.Store, index beeline
 		cfg.IdleBackoff = 250 * time.Millisecond
 	}
 
-	return &Pool{resolver: resolver, store: store, index: index, logger: logging.EnsureLogger(logger), cfg: cfg}
+	return &Pool{resolver: resolver, source: source, logger: logging.EnsureLogger(logger), cfg: cfg}
 }
 
 // Run starts the workers and blocks until ctx is cancelled, then waits for them to
@@ -72,7 +72,7 @@ func (p *Pool) work(ctx context.Context) {
 			return
 		}
 
-		keys, err := p.index.Claim(ctx, p.cfg.Batch, p.cfg.Lease)
+		keys, err := p.source.Claim(ctx, p.cfg.Batch, p.cfg.Lease)
 		if err != nil {
 			p.logger.Error("claiming refresh work", err)
 			if !sleep(ctx, p.cfg.IdleBackoff) {
@@ -118,10 +118,7 @@ func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
 
 	now := time.Now()
 
-	var (
-		entries []beeline.Entry
-		done    []beeline.PairKey
-	)
+	var entries []beeline.Entry
 
 	for g, groupKeys := range groups {
 		origin, err := beeline.Center(g.origin)
@@ -165,7 +162,6 @@ func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
 				Key:    groupKeys[j],
 				Stored: beeline.Stored{Estimate: est, ComputedAt: now},
 			})
-			done = append(done, groupKeys[j])
 		}
 	}
 
@@ -173,13 +169,9 @@ func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
 		return
 	}
 
-	if err := p.store.Put(ctx, entries); err != nil {
-		p.logger.Error("writing estimates", err)
-		return // leave the lease to expire and be retried
-	}
-
-	if err := p.index.MarkComputed(ctx, done, now); err != nil {
-		p.logger.Error("marking computed", err)
+	if err := p.source.Submit(ctx, entries); err != nil {
+		p.logger.Error("submitting computed estimates", err)
+		// Leave the leases to expire and the pairs to be reclaimed.
 	}
 }
 

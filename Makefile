@@ -137,6 +137,17 @@ PORT ?= 8080
 demo: build
 	PORT=$(PORT) $(SCRIPTS_DIR)/demo.sh
 
+# demo-cluster runs the leader/follower split live: the same demo, but the leader
+# starts with zero local refresh workers (pure coordinator) and the areas route
+# through the simulated network-latency provider, so keeping them fresh genuinely
+# needs the three follower processes the script starts alongside. It tails the
+# leader's freshness contract so you can watch achieved throughput clear required.
+# Override the follower count with `make demo-cluster FOLLOWERS=5`.
+FOLLOWERS ?= 3
+.PHONY: demo-cluster
+demo-cluster: build
+	PORT=$(PORT) FOLLOWERS=$(FOLLOWERS) $(SCRIPTS_DIR)/demo_cluster.sh
+
 .PHONY: test
 test: $(ARTIFACTS_DIR)
 	$(SCRIPTS_DIR)/test.sh

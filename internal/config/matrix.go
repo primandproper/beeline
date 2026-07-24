@@ -3,8 +3,10 @@ package config
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"time"
 
+	"github.com/primandproper/platform-go/v4/httpclient"
 	serverhttp "github.com/primandproper/platform-go/v4/server/http"
 )
 
@@ -21,12 +23,13 @@ import (
 // in Load (BEELINE_MATRIX_… environment overlay) and LoadFromFile (JSON), per the
 // project's configuration convention.
 type MatrixConfig struct {
-	Profiles            map[string]float64        `env:"PROFILES"              json:"profiles"`
 	Providers           map[string]ProviderConfig `env:"PROVIDERS"             json:"providers,omitempty"`
+	Profiles            map[string]float64        `env:"PROFILES"              json:"profiles"`
 	DefaultProfile      string                    `env:"DEFAULT_PROFILE"       json:"defaultProfile"`
 	DatabasePath        string                    `env:"DATABASE_PATH"         json:"databasePath"`
 	Server              serverhttp.Config         `envPrefix:"SERVER_"         json:"server"`
 	Telemetry           TelemetryConfig           `envPrefix:"TELEMETRY_"      json:"telemetry,omitzero"`
+	Follower            FollowerConfig            `envPrefix:"FOLLOWER_"       json:"follower,omitzero"`
 	EngineLatency       EngineLatencyConfig       `envPrefix:"ENGINE_LATENCY_" json:"engineLatency,omitzero"`
 	TargetTTL           time.Duration             `env:"TARGET_TTL"            json:"targetTTL"`
 	LeaseDuration       time.Duration             `env:"LEASE_DURATION"        json:"leaseDuration"`
@@ -49,6 +52,62 @@ type EngineLatencyConfig struct {
 	Min     time.Duration `env:"MIN"     json:"min,omitempty"`
 	Max     time.Duration `env:"MAX"     json:"max,omitempty"`
 	Enabled bool          `env:"ENABLED" json:"enabled,omitempty"`
+}
+
+// FollowerConfig configures the `work` subcommand: the same binary run as a
+// follower that claims pending pairs from a leader's /_work_/ endpoints, computes
+// them with its local routing engine, and submits the results back. It is inert for
+// `serve` — a leader ignores it entirely — and the subcommand refuses to start
+// unless a leader URL arrives here or via the --leader flag. Batch and Lease of
+// zero fall back to the shared RefreshBatch/LeaseDuration knobs so a follower
+// paces itself like a local worker unless tuned otherwise (remote workers may want
+// a longer lease to cover network latency).
+type FollowerConfig struct {
+	// LeaderURL is the base URL of the leader instance (e.g. http://host:8080).
+	LeaderURL string `env:"LEADER_URL" json:"leaderURL,omitempty"`
+	// HTTP tunes the outbound client used for claim/submit calls.
+	HTTP httpclient.Config `envPrefix:"HTTP_" json:"http,omitzero"`
+	// Lease is the visibility timeout requested per claim; 0 uses LeaseDuration.
+	Lease time.Duration `env:"LEASE" json:"lease,omitempty"`
+	// IdleBackoff is how long a worker sleeps when the leader has no due work or
+	// is unreachable.
+	IdleBackoff time.Duration `env:"IDLE_BACKOFF" json:"idleBackoff,omitempty"`
+	// Port serves the follower's own health probes (/_ops_/live, /_ops_/ready).
+	Port uint16 `env:"PORT" json:"port,omitempty"`
+	// Workers is the number of concurrent claim→compute→submit loops.
+	Workers int `env:"WORKERS" json:"workers,omitempty"`
+	// Batch is the max pairs requested per claim; 0 uses RefreshBatch.
+	Batch int `env:"BATCH" json:"batch,omitempty"`
+}
+
+// validate constrains the follower knobs only when a leader URL is set (the
+// Telemetry/EngineLatency convention), so serve deployments that never touch the
+// block pass untouched.
+func (f *FollowerConfig) validate() error {
+	if f.LeaderURL == "" {
+		return nil
+	}
+	u, err := url.Parse(f.LeaderURL)
+	if err != nil {
+		return fmt.Errorf("follower leader URL %q: %w", f.LeaderURL, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("follower leader URL %q must be http(s)://host[:port]", f.LeaderURL)
+	}
+	if f.Workers < 1 {
+		return fmt.Errorf("follower workers %d must be >= 1", f.Workers)
+	}
+	if f.Batch < 0 {
+		return fmt.Errorf("follower batch %d must be >= 0", f.Batch)
+	}
+	if f.Lease < 0 {
+		return fmt.Errorf("follower lease %v must be >= 0", f.Lease)
+	}
+	if f.IdleBackoff < 0 {
+		return fmt.Errorf("follower idle backoff %v must be >= 0", f.IdleBackoff)
+	}
+
+	return nil
 }
 
 // TelemetrySinkJSONL is the only telemetry sink type implemented today: an
@@ -235,6 +294,14 @@ func defaultMatrixConfig() MatrixConfig {
 			AggregateBucket:  5 * time.Minute,
 			AggregateMaxKeys: 100_000,
 		},
+		// Follower defaults are ready-to-enable, like Telemetry: pointing LeaderURL
+		// (or --leader) at an instance needs no other knob.
+		Follower: FollowerConfig{
+			Port:        8081,
+			Workers:     4,
+			IdleBackoff: time.Second,
+			HTTP:        httpclient.Config{Timeout: 10 * time.Second},
+		},
 	}
 }
 
@@ -264,8 +331,10 @@ func (m *MatrixConfig) validate(ctx context.Context) error {
 	if m.SweepInterval <= 0 {
 		return fmt.Errorf("sweep interval %v must be positive", m.SweepInterval)
 	}
-	if m.RefreshWorkers < 1 {
-		return fmt.Errorf("refresh workers %d must be >= 1", m.RefreshWorkers)
+	// 0 is a deliberate operating mode: a coordinator-only leader that seeds and
+	// serves work over /_work_/ while followers do all the computing.
+	if m.RefreshWorkers < 0 {
+		return fmt.Errorf("refresh workers %d must be >= 0", m.RefreshWorkers)
 	}
 	if m.RefreshBatch < 1 {
 		return fmt.Errorf("refresh batch %d must be >= 1", m.RefreshBatch)
@@ -274,6 +343,9 @@ func (m *MatrixConfig) validate(ctx context.Context) error {
 		return err
 	}
 	if err := m.Telemetry.validate(); err != nil {
+		return err
+	}
+	if err := m.Follower.validate(); err != nil {
 		return err
 	}
 	for name := range m.Providers {

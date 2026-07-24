@@ -173,6 +173,8 @@ func (a *application) serve(ctx context.Context) error {
 		Health:         healthcheck.NewRegistry(),
 		Logger:         a.logger,
 		DefaultProfile: beeline.Profile(mcfg.DefaultProfile),
+		RefreshBatch:   mcfg.RefreshBatch,
+		LeaseDuration:  mcfg.LeaseDuration,
 	})
 
 	// Serve the embedded operator console at / (talks to the endpoints above).
@@ -193,14 +195,19 @@ func (a *application) serve(ctx context.Context) error {
 
 	// Start the background refresh loop and the HTTP server. Serve() blocks and
 	// panics on a bind/serve error, so run it in its own goroutine and coordinate
-	// shutdown through the signal-cancellable context.
-	pool := refresh.NewPool(coordinator, store, index, a.logger, refresh.Config{
-		Workers: mcfg.RefreshWorkers,
-		Batch:   mcfg.RefreshBatch,
-		Lease:   mcfg.LeaseDuration,
-	})
-
-	go pool.Run(ctx)
+	// shutdown through the signal-cancellable context. With RefreshWorkers 0 the
+	// local pool never starts and this instance is a pure coordinator: it seeds and
+	// serves work over /_work_/ and relies on followers for all compute.
+	if mcfg.RefreshWorkers > 0 {
+		pool := refresh.NewPool(coordinator, refresh.NewLocalSource(index, store), a.logger, refresh.Config{
+			Workers: mcfg.RefreshWorkers,
+			Batch:   mcfg.RefreshBatch,
+			Lease:   mcfg.LeaseDuration,
+		})
+		go pool.Run(ctx)
+	} else {
+		a.log().Info("local refresh pool disabled; coordinator-only mode (followers do the computing)")
+	}
 	go srv.Serve()
 
 	// The telemetry flusher is deliberately not tied to ctx: it must keep consuming

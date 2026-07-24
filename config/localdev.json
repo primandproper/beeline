@@ -55,6 +55,18 @@
 			"max": 120000000,
 			"enabled": true
 		},
+		"follower": {
+			"leaderURL": "http://localhost:8080",
+			"http": {
+				"timeout": 10000000000,
+				"maxIdleConns": 0,
+				"maxIdleConnsPerHost": 0,
+				"enableTracing": false
+			},
+			"idleBackoff": 1000000000,
+			"port": 8081,
+			"workers": 4
+		},
 		"targetTTL": 30000000000,
 		"leaseDuration": 15000000000,
 		"sweepInterval": 15000000000,

@@ -313,50 +313,102 @@ func (i *Index) due(e *entry, now time.Time, area beeline.AreaID) bool {
 	return now.Sub(e.computedAt) >= i.ttlFor(area)
 }
 
-// Claim leases up to limit of the stalest due keys for the given visibility
-// timeout. Bumped and never-computed keys sort ahead of merely-aged ones; among
-// the rest, oldest-computed wins.
+// claimCandidate pairs a due key with its entry while Claim ranks it.
+type claimCandidate struct {
+	e   *entry
+	key beeline.PairKey
+}
+
+// claimBefore reports whether a should be refreshed before b: demand-bumped keys
+// first, then never-computed, then oldest-computed. Equal-priority keys are ordered
+// by origin (then dest, for determinism) so a claimed batch clusters into few dense
+// origin-centric 1×K table requests (§6) instead of scattering across as many
+// origins as pairs — against a network-bound engine that is the difference between
+// one round-trip per ~K pairs and one per pair. MarkComputed stamps a whole batch
+// with one timestamp, so batches recomputed later still tie on age and keep
+// clustering by origin.
+func claimBefore(a, b claimCandidate) bool {
+	if a.e.bumped != b.e.bumped {
+		return a.e.bumped
+	}
+	na, nb := a.e.computedAt.IsZero(), b.e.computedAt.IsZero()
+	if na != nb {
+		return na
+	}
+	if !a.e.computedAt.Equal(b.e.computedAt) {
+		return a.e.computedAt.Before(b.e.computedAt)
+	}
+	if a.key.Origin != b.key.Origin {
+		return a.key.Origin < b.key.Origin
+	}
+
+	return a.key.Dest < b.key.Dest
+}
+
+// Claim leases up to limit of the stalest due keys (claimBefore order) for the
+// given visibility timeout. Selection is a bounded worst-at-root heap — O(n·log
+// limit) over the due set, not a full O(n·log n) sort — because Claim holds the
+// index mutex and is called concurrently by every worker (local and follower):
+// against a large cold working set, sorting millions of candidates per claim
+// would serialize the whole pool behind the sort.
 func (i *Index) Claim(_ context.Context, limit int, lease time.Duration) ([]beeline.PairKey, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
 	now := i.now()
 
-	type candidate struct {
-		e   *entry
-		key beeline.PairKey
+	// top holds the best `limit` candidates seen so far as a binary heap whose
+	// root is the WORST of them, so each further candidate is one comparison
+	// against the root to accept or reject. limit <= 0 keeps everything.
+	var top []claimCandidate
+	if limit > 0 {
+		top = make([]claimCandidate, 0, limit)
 	}
 
-	candidates := make([]candidate, 0)
+	// siftDown restores the worst-at-root property from position pos.
+	siftDown := func(pos int) {
+		for {
+			worst := pos
+			if l := 2*pos + 1; l < len(top) && claimBefore(top[worst], top[l]) {
+				worst = l
+			}
+			if r := 2*pos + 2; r < len(top) && claimBefore(top[worst], top[r]) {
+				worst = r
+			}
+			if worst == pos {
+				return
+			}
+			top[pos], top[worst] = top[worst], top[pos]
+			pos = worst
+		}
+	}
+
 	for k, e := range i.entries {
-		if i.due(e, now, k.Area) {
-			candidates = append(candidates, candidate{key: k, e: e})
+		if !i.due(e, now, k.Area) {
+			continue
+		}
+		c := claimCandidate{key: k, e: e}
+		switch {
+		case limit <= 0 || len(top) < limit:
+			top = append(top, c)
+			if limit > 0 && len(top) == limit {
+				for pos := len(top)/2 - 1; pos >= 0; pos-- {
+					siftDown(pos)
+				}
+			}
+		case claimBefore(c, top[0]):
+			top[0] = c
+			siftDown(0)
 		}
 	}
 
-	sort.Slice(candidates, func(a, b int) bool {
-		ea, eb := candidates[a].e, candidates[b].e
-		// Priority 1: demand-bumped keys.
-		if ea.bumped != eb.bumped {
-			return ea.bumped
-		}
-		// Priority 2: never-computed keys.
-		na, nb := ea.computedAt.IsZero(), eb.computedAt.IsZero()
-		if na != nb {
-			return na
-		}
-		// Priority 3: oldest computed first.
-		return ea.computedAt.Before(eb.computedAt)
-	})
+	// Order the survivors for the caller: the batch arrives origin-clustered.
+	sort.Slice(top, func(a, b int) bool { return claimBefore(top[a], top[b]) })
 
-	if limit > 0 && len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
-
-	claimed := make([]beeline.PairKey, len(candidates))
-	for idx := range candidates {
-		candidates[idx].e.leaseUntil = now.Add(i.leaseFor(candidates[idx].key.Area, lease))
-		claimed[idx] = candidates[idx].key
+	claimed := make([]beeline.PairKey, len(top))
+	for idx := range top {
+		top[idx].e.leaseUntil = now.Add(i.leaseFor(top[idx].key.Area, lease))
+		claimed[idx] = top[idx].key
 	}
 
 	return claimed, nil

@@ -19,6 +19,30 @@ func TestMatrixConfigValidate(t *testing.T) {
 		assert.False(t, m.Telemetry.Enabled(), "telemetry capture is opt-in")
 	})
 
+	t.Run("zero refresh workers is coordinator-only mode, not an error", func(t *testing.T) {
+		t.Parallel()
+
+		m := defaultMatrixConfig()
+		m.RefreshWorkers = 0
+		require.NoError(t, m.validate(context.Background()))
+	})
+
+	t.Run("a zero-value follower config validates while no leader URL is set", func(t *testing.T) {
+		t.Parallel()
+
+		m := defaultMatrixConfig()
+		m.Follower = FollowerConfig{}
+		require.NoError(t, m.validate(context.Background()))
+	})
+
+	t.Run("the follower defaults validate once a leader URL is set", func(t *testing.T) {
+		t.Parallel()
+
+		m := defaultMatrixConfig()
+		m.Follower.LeaderURL = "http://leader:8080"
+		require.NoError(t, m.validate(context.Background()), "pointing at a leader must need no other knob")
+	})
+
 	t.Run("a zero-value telemetry config validates while disabled", func(t *testing.T) {
 		t.Parallel()
 
@@ -46,8 +70,22 @@ func TestMatrixConfigValidate(t *testing.T) {
 			"non-positive speed":  func(m *MatrixConfig) { m.Profiles["car"] = 0 },
 			"unknown default":     func(m *MatrixConfig) { m.DefaultProfile = "hovercraft" },
 			"zero ttl":            func(m *MatrixConfig) { m.TargetTTL = 0 },
-			"zero workers":        func(m *MatrixConfig) { m.RefreshWorkers = 0 },
+			"negative workers":    func(m *MatrixConfig) { m.RefreshWorkers = -1 },
 			"missing server port": func(m *MatrixConfig) { m.Server.Port = 0 },
+			"follower with a garbage leader URL": func(m *MatrixConfig) {
+				m.Follower.LeaderURL = "not a url"
+			},
+			"follower with a non-http scheme": func(m *MatrixConfig) {
+				m.Follower.LeaderURL = "ftp://leader:8080"
+			},
+			"follower with zero workers": func(m *MatrixConfig) {
+				m.Follower.LeaderURL = "http://leader:8080"
+				m.Follower.Workers = 0
+			},
+			"follower with a negative lease": func(m *MatrixConfig) {
+				m.Follower.LeaderURL = "http://leader:8080"
+				m.Follower.Lease = -1
+			},
 			"telemetry on without a path": func(m *MatrixConfig) {
 				m.Telemetry.RawEnabled = true
 				m.Telemetry.Path = ""

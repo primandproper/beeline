@@ -78,6 +78,7 @@ func (a *application) newRootCommand() *cobra.Command {
 
 	rootCmd.AddCommand(a.newVersionCommand())
 	rootCmd.AddCommand(a.newServeCommand())
+	rootCmd.AddCommand(a.newWorkCommand())
 
 	return rootCmd
 }

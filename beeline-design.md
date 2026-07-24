@@ -296,6 +296,110 @@ Recommendation for v1: **shared leased queue, stateless workers, no consensus,
 per-worker self-throttling.** Revisit a central planner only if per-worker budget
 allocation proves insufficient.
 
+### 8.1 The implemented protocol: `/_work_/claim` + `/_work_/submit`
+
+This is what shipped — the shared-leased-queue shape above, split over HTTP. The
+`serve` process is the **leader**: it owns the in-memory freshness index (the
+queue) and the hot store. Any number of `beeline work` processes are
+**followers**. "Leader" here means "the process that owns the index," not an
+elected role — there is still no consensus and no membership. Followers are fully
+stateless: no database, no store, no index, just the claim→compute→submit loop
+plus health probes. One pool implementation (`internal/refresh.Pool`) drives both
+roles through the `refresh.WorkSource` seam: a leader wires it to its own
+index+store (`LocalSource`), a follower to the HTTP client in `internal/follower`.
+
+Both endpoints are JSON POSTs on the leader's main port. Like every endpoint in
+the prototype they are unauthenticated; a real deploy would gate them.
+
+**`POST /_work_/claim`** — lease up to `batchSize` due pairs.
+
+```json
+// request
+{"batchSize": 512, "leaseSeconds": 30}
+
+// response
+{
+  "pairs": [
+    {"profile": "car", "origin": "882a100d2bfffff",
+     "dest": "882a100d2dfffff", "area": 3, "res": 8}
+  ],
+  "areas": {"3": {"routingProvider": "latency-sim"}},
+  "leaseSeconds": 30
+}
+```
+
+- Zero `batchSize`/`leaseSeconds` fall back to the leader's own `refreshBatch`
+  and `leaseDuration`; explicit values are capped (10 000 pairs, 10 minutes) so
+  a buggy client cannot park huge swaths of the queue out of sight. The granted
+  (defaulted/capped) lease is echoed back so the follower knows its visibility
+  budget — though an area's per-area lease override, when set, wins over the
+  requested value.
+- Cells travel as hex H3 strings; `area` + `res` name the partition and
+  precision layer the estimate must be written back under. Submit echoes all
+  five fields verbatim.
+- `areas` carries metadata for each distinct area in the batch — today just the
+  routing-provider name, which the follower resolves against its own provider
+  registry (built from the same `matrix.providers` config a leader uses). An
+  unknown name falls back to the follower's default engine with a once-per-name
+  warning: the work still completes, but that area is being computed with
+  different routing than the leader intended.
+- Claims go through the same `Index.Claim` the leader's local workers use, so
+  local workers and followers drain one queue in identical priority order.
+
+**`POST /_work_/submit`** — write a computed batch back.
+
+```json
+// request
+{"results": [
+  {"profile": "car", "origin": "882a100d2bfffff",
+   "dest": "882a100d2dfffff", "area": 3, "res": 8,
+   "durationSec": 118.4, "distanceMeters": 986.2}
+]}
+
+// response
+{"accepted": 1}
+```
+
+Submit is `Store.Put` + `MarkComputed` — the remote half of what
+`LocalSource.Submit` does in-process. Three deliberate choices:
+
+- **No timestamp travels.** The leader stamps `ComputedAt` with its own clock at
+  receipt, so follower clock skew can never distort freshness ordering. The
+  cost — one network RTT of apparent extra freshness — is noise against TTLs
+  measured in tens of seconds.
+- **Results for areas disabled since the claim are silently dropped** (`accepted`
+  counts only what was written). `MarkComputed` would ignore the vanished keys
+  anyway, but `Store.Put` would happily resurrect estimates the disable just
+  purged.
+- **An invalid H3 cell fails the whole request** (400). Results echo
+  leader-issued keys, so garbage here means a broken follower — protocol drift —
+  not bad user input worth partial tolerance.
+
+Error surface: both endpoints answer 400 for a malformed body or negative/
+oversized values and 500 for an index/store failure. The follower treats any
+non-200 as an error carrying the (truncated) response body.
+
+**Failure semantics: idempotent by construction.** The protocol has no acks, no
+retries, no session state, because none are needed:
+
+- A follower that dies, hangs, or loses connectivity simply lets its leases
+  expire; the pairs become claimable again and another worker recomputes them.
+- A duplicate submit — say, after a lease expired and someone else recomputed
+  the pair — is a harmless overwrite with an equally valid estimate.
+- On a submit error the pool drops the batch and moves on; the leases expire and
+  the pairs are reclaimed. Every failure mode costs wasted compute, never
+  corruption.
+
+**Follower loop behavior.** Each follower worker loops claim→compute→submit; an
+empty claim (caught up) or a claim error sleeps `idleBackoff` (default 250 ms)
+and retries. Knobs live in `matrix.follower` (leader URL, workers, batch, lease,
+idle backoff, outbound HTTP client, health port); zero batch/lease fall back to
+the shared `refreshBatch`/`leaseDuration`, so an untuned follower paces itself
+like a local worker. The follower's only HTTP surface is `/_ops_/live` and
+`/_ops_/ready` (= leader reachable) on `matrix.follower.port` (default 8081). A
+leader started with `refreshWorkers: 0` computes nothing itself — a pure
+coordinator; `make demo-cluster` stages exactly that.
+
 ## 9. Accuracy semantics (document these; don't let them surprise callers)
 
 - **Center-to-center error.** Every estimate is cell-center to cell-center; true

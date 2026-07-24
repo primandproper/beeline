@@ -9,9 +9,18 @@ matrices between H3 cells and serves cached scalar estimates under a freshness c
 [`github.com/primandproper/platform-go`](https://github.com/primandproper/platform-go). Go 1.26.
 See `beeline-design.md` for the full design; section references (§) below point into it.
 
-The application is a **Cobra CLI**. Two subcommands:
+The application is a **Cobra CLI**. Three subcommands:
 
 - `version` — prints build metadata to stdout.
+- `work` — the follower half of the leader/follower split (design §8): the same binary pointed at a
+  running `serve` instance (`--leader <url>`, `BEELINE_MATRIX_FOLLOWER_LEADER_URL`, or
+  `matrix.follower.leaderURL`). It claims pending pairs from the leader over `POST /_work_/claim`,
+  computes them with its local routing engines (built from the same `matrix.providers` config), and
+  submits the scalars back over `POST /_work_/submit`; the leader's leased freshness index is the
+  only coordination, so followers are stateless — one that dies just lets its leases expire. A
+  follower serves only health probes (`/_ops_/live`, and `/_ops_/ready` = leader reachable) on
+  `matrix.follower.port` (default 8081). Scale a saturated leader by starting more `work` processes;
+  a leader with `refreshWorkers: 0` computes nothing itself (pure coordinator).
 - `serve` — the prototype. It opens the SQLite **area store**, re-seeds the freshness index from any
   already-**enabled** service areas, runs a background refresh loop that keeps those areas' pairs
   fresh (plus a demand-decay janitor that evicts cold demand-filled pairs on the `sweepInterval`
@@ -58,6 +67,12 @@ HTTP endpoints (default `:8080`):
   `profile`) pushes predicted demand into the freshness index via `Coordinator.WarmPairs` —
   `mode:"bump"` (default) as decayable demand at top refresh priority, `mode:"seed"` pinned
   against the demand sweep).
+- Work distribution — `POST /_work_/claim` (lease up to `batchSize` due pairs — hex H3 cells +
+  area/profile/res — with per-area `routingProvider` metadata; zero `batchSize`/`leaseSeconds` fall
+  back to `refreshBatch`/`leaseDuration`, both capped) and `POST /_work_/submit` (write a follower's
+  computed estimates: `store.Put` + `MarkComputed`, stamped with the **leader's** clock; results for
+  since-disabled areas are dropped). Idempotent by construction — duplicate submits and expired-lease
+  submits are waste, never corruption.
 - Control plane — the area registry under `/_config_/areas`, served by `internal/control` over the
   SQLite store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
   `layers` list of precision levels);
@@ -87,7 +102,10 @@ HTTP endpoints (default `:8080`):
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
   `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs (`targetTTL`,
-  `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch), plus the
+  `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch —
+  `refreshWorkers: 0` runs a coordinator-only leader), the `follower` sub-config (`FollowerConfig`,
+  env prefix `BEELINE_MATRIX_FOLLOWER_`: leader URL, worker/batch/lease/backoff knobs, health port,
+  outbound HTTP client — inert unless the `work` subcommand runs), plus the
   `telemetry` sub-config (`TelemetryConfig`, env prefix `BEELINE_MATRIX_TELEMETRY_`): query-event
   capture for offline demand-model training, off by default, with independently switchable raw
   (`rawEnabled`) and aggregated (`aggregateEnabled`) channels, a JSONL sink path + rotation bounds,
@@ -130,7 +148,14 @@ HTTP endpoints (default `:8080`):
   pins the eager core), the `Debt` signals (§3), and per-area `Seed`/`Unseed` + `DebtForArea`/
   `CellStatesForArea` (each area keeps its own throughput baseline). Clock is injectable for tests.
 - `internal/refresh/` — the worker+engine pool (§4): claim stalest → dense origin-centric 1×K table
-  request → write → mark computed. Claims span all enabled areas from the shared index.
+  request → write → mark computed. Claims span all enabled areas from the shared index. The pool
+  talks to a `WorkSource` seam (`Claim`/`Submit`): `LocalSource` adapts the in-process index+store
+  (the leader), while `internal/follower` implements the same seam over a leader's HTTP endpoints —
+  one pool implementation serves both roles.
+- `internal/follower/` — the `work` subcommand's client: implements `refresh.WorkSource` and
+  `beeline.EngineResolver` against a leader's `/_work_/` endpoints, resolving each claimed area's
+  `routingProvider` name against the local registry (unknown names fall back to the default engine
+  with a once-per-name log). Also the follower's health endpoints (`RegisterHealth`).
 - `internal/query/` — the read path (§9): resolves the origin to its enabled area via the `AreaRouter`
   seam, then keys the lookup against that area's partition at the **finest layer**
   (`RoutedArea.ReadLayer()`; distance-based fallthrough to coarser layers is deliberately not
@@ -167,6 +192,8 @@ make build          # Compile all packages, then build artifacts/beeline with ve
 make run ARGS="version"   # go run the CLI with arguments
 make run ARGS="serve --config config/localdev.json"   # open area store + refresh + serve HTTP on :8080
 make demo           # fresh gitignored SQLite db (artifacts/demo.db) + auto-seed & enable a demo area, then serve
+make demo-cluster   # leader/follower live: coordinator-only leader (refreshWorkers=0) + 3 `work` followers
+                    # against the latency-simulated engine; tails /_ops_/freshness. FOLLOWERS=n to scale.
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
 make test           # Run tests (race detector, shuffle, failfast); excludes cmd packages

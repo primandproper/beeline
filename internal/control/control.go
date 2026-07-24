@@ -108,6 +108,7 @@ type enabledLayer struct {
 // once at seed time so per-pair routing is a map lookup, not a registry walk.
 type enabledArea struct {
 	engine        beeline.RoutingEngine
+	provider      string
 	layers        []enabledLayer
 	demandIdleTTL time.Duration
 	targetTTL     time.Duration
@@ -436,6 +437,33 @@ func (c *Coordinator) EngineFor(id beeline.AreaID) beeline.RoutingEngine {
 	return c.providers[c.defaultProvider]
 }
 
+// ProviderNameFor returns the name of the routing provider an enabled area resolves
+// through, or the default provider's name for an unknown/zero id. Follower processes
+// use it (via the /_work_/claim response) to pick the matching engine from their own
+// registry, mirroring what EngineFor resolves in-process.
+func (c *Coordinator) ProviderNameFor(id beeline.AreaID) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if ea, ok := c.enabled[id]; ok && ea.provider != "" {
+		return ea.provider
+	}
+
+	return c.defaultProvider
+}
+
+// AreaEnabled reports whether the area is currently enabled. The work-submit path
+// uses it to drop results for areas disabled after the claim was handed out, so a
+// late submit cannot resurrect estimates the disable already purged from the store.
+func (c *Coordinator) AreaEnabled(id beeline.AreaID) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	_, ok := c.enabled[id]
+
+	return ok
+}
+
 // ProviderNames returns the configured provider names (the default first, then the
 // rest ascending), so the operator console can populate its provider picker from live
 // config rather than a hard-coded list.
@@ -684,9 +712,11 @@ func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error 
 		return err
 	}
 
+	provider := c.normalizeProvider(area.RoutingProvider)
 	c.enabled[area.ID] = &enabledArea{
 		layers:        layers,
-		engine:        c.providers[c.normalizeProvider(area.RoutingProvider)],
+		engine:        c.providers[provider],
+		provider:      provider,
 		demandIdleTTL: area.DemandIdleTTL,
 		targetTTL:     area.TargetTTL,
 		sweepInterval: area.SweepInterval,

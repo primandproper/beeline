@@ -5,6 +5,7 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
+	"github.com/primandproper/platform-go/v4/httpclient"
 	"github.com/primandproper/platform-go/v4/observability"
 	"github.com/primandproper/platform-go/v4/observability/logging"
 	loggingcfg "github.com/primandproper/platform-go/v4/observability/logging/config"
@@ -87,6 +88,17 @@ func buildLocalDevConfig() *config.Config {
 				FlushInterval:    2 * time.Second,
 				AggregateBucket:  time.Minute,
 				AggregateMaxKeys: 100_000,
+			},
+			// Follower knobs for `beeline work` against a local leader. Inert for
+			// `serve`; the subcommand still requires --leader (or
+			// BEELINE_MATRIX_FOLLOWER_LEADER_URL) to actually start, so having the
+			// block filled in costs nothing.
+			Follower: config.FollowerConfig{
+				LeaderURL:   "http://localhost:8080",
+				Port:        8081,
+				Workers:     4,
+				IdleBackoff: time.Second,
+				HTTP:        httpclient.Config{Timeout: 10 * time.Second},
 			},
 			TargetTTL:           30 * time.Second,
 			LeaseDuration:       15 * time.Second,

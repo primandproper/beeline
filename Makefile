@@ -106,9 +106,10 @@ lint: golang_lint shellcheck
 configs:
 	$(SCRIPTS_DIR)/configs.sh $(THIS)
 
-# sqlc regenerates the typed area queries under internal/store/sqlite/generated from
-# the hand-written SQL in sqlc_queries and the schema in migrations. Edit the .sql,
-# then re-run this; commit the generated Go so it stays reviewable and in lockstep.
+# sqlc regenerates the typed queries for both database targets (SQLite under
+# internal/store/sqlite/generated, Postgres under internal/store/postgres/generated)
+# from their sqlc_queries + migrations. Edit the .sql, then re-run this; commit the
+# generated Go so it stays reviewable and in lockstep.
 .PHONY: sqlc
 sqlc:
 	$(SQL_GENERATOR) generate
@@ -148,6 +149,29 @@ FOLLOWERS ?= 3
 demo-cluster: build
 	PORT=$(PORT) FOLLOWERS=$(FOLLOWERS) $(SCRIPTS_DIR)/demo_cluster.sh
 
+# demo-multihead runs the distributed deployment live: two identical serve heads
+# over one shared (containerized) Postgres, followers split across both, one area
+# enabled through head A and served by both. Kill either head and the other keeps
+# the freshness contract. FOLLOWERS=n to scale; needs Docker.
+.PHONY: demo-multihead
+demo-multihead: build
+	PORT=$(PORT) FOLLOWERS=$(FOLLOWERS) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/demo_multihead.sh
+
 .PHONY: test
 test: $(ARTIFACTS_DIR)
 	$(SCRIPTS_DIR)/test.sh
+
+# test-integration runs the same suite with real Postgres + Redis containers, so
+# the env-gated integration tests (internal/store/postgres, internal/store/redis)
+# execute instead of skipping. Needs Docker, like lint and sqlc.
+.PHONY: test-integration
+test-integration: $(ARTIFACTS_DIR)
+	CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/test_integration.sh
+
+# bench-store runs the hot-store benchmark gate: 300k-key BatchGet p50/p95 for
+# the in-memory baseline, Postgres, and Redis. The numbers decide the blessed
+# distributed-mode hot store (postgres p95 < 1s keeps the single-dependency
+# default). Needs Docker.
+.PHONY: bench-store
+bench-store:
+	CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/bench_store.sh

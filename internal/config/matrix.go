@@ -30,6 +30,7 @@ type MatrixConfig struct {
 	DefaultProfile      string                    `env:"DEFAULT_PROFILE"       json:"defaultProfile"`
 	DatabasePath        string                    `env:"DATABASE_PATH"         json:"databasePath"`
 	Server              serverhttp.Config         `envPrefix:"SERVER_"         json:"server"`
+	Backend             BackendConfig             `envPrefix:"BACKEND_"        json:"backend,omitzero"`
 	Telemetry           TelemetryConfig           `envPrefix:"TELEMETRY_"      json:"telemetry,omitzero"`
 	Follower            FollowerConfig            `envPrefix:"FOLLOWER_"       json:"follower,omitzero"`
 	EngineLatency       EngineLatencyConfig       `envPrefix:"ENGINE_LATENCY_" json:"engineLatency,omitzero"`
@@ -305,6 +306,12 @@ func defaultMatrixConfig() MatrixConfig {
 			AggregateBucket:  5 * time.Minute,
 			AggregateMaxKeys: 100_000,
 		},
+		// Backend defaults are ready-to-enable: distributed mode needs only a mode
+		// and a Postgres URL; the poll cadence for cross-head config convergence is
+		// pre-filled.
+		Backend: BackendConfig{
+			ConfigPollInterval: 2 * time.Second,
+		},
 		// Follower defaults are ready-to-enable, like Telemetry: pointing LeaderURL
 		// (or --leader) at an instance needs no other knob.
 		Follower: FollowerConfig{
@@ -349,6 +356,9 @@ func (m *MatrixConfig) validate(ctx context.Context) error {
 	}
 	if m.RefreshBatch < 1 {
 		return fmt.Errorf("refresh batch %d must be >= 1", m.RefreshBatch)
+	}
+	if err := m.Backend.validate(); err != nil {
+		return err
 	}
 	if err := m.EngineLatency.validate(); err != nil {
 		return err

@@ -410,6 +410,74 @@ like a local worker. The follower's only HTTP surface is `/_ops_/live` and
 leader started with `refreshWorkers: 0` computes nothing itself — a pure
 coordinator; `make demo-cluster` stages exactly that.
 
+### 8.2 Distributed mode: stateless heads over shared Postgres
+
+This is the scale-out of the *leader* itself, and it is deliberately **not a
+consensus pool**. Every piece of mutable coordination state moves out of the
+process into shared storage, after which "leader" stops being a role: every
+`serve` instance is an identical, disposable request head, and there is nothing
+left to elect a leader *of* except two singleton chores. Opt in via
+`matrix.backend` (`mode: "postgres"`); the zero-value config keeps the
+single-node in-memory/SQLite behavior and `make demo` stays dependency-free.
+
+Where the state went:
+
+- **FreshnessIndex → Postgres** (`internal/freshness/postgres`). Claim is the
+  §5.3 shape verbatim: `SELECT … ORDER BY bumped DESC, computed_at ASC NULLS
+  FIRST LIMIT n FOR UPDATE SKIP LOCKED`, then stamp `lease_until` — the leased
+  queue with the same due-ness, priority, and per-area TTL/lease semantics as
+  the memory index (one conformance suite, `internal/freshness/freshnesstest`,
+  runs against both so they cannot drift). The read path's per-query `Access`
+  stamps coalesce in a bounded in-process buffer and flush in batches;
+  `MarkComputed` flushes its own keys first, inside its transaction, so the
+  demand-fill commit's Access→Mark ordering holds.
+- **Hot store → Postgres or Redis** (`internal/store/postgres`,
+  `internal/store/redis`), selected by `matrix.backend.hotStore`. The
+  benchmark gate (`make bench-store`, 300k-key `BatchGet`) measured Postgres
+  p95 ≈ 275 ms and Redis ≈ 146 ms on the reference setup — both far inside the
+  sub-second contract — so **Postgres is the blessed default** (one shared
+  dependency); Redis remains a config flip for deployments that want the batch
+  headroom.
+- **Operator config → Postgres** (`internal/store/postgres` repositories; the
+  SQLite `databasePath` is ignored in this mode). Derived projections —
+  polyfilled cell sets, built engines, the provider catalog — stay per-head
+  in-process, converged by a `config_version` generation counter bumped in the
+  same transaction as every mutation and polled every
+  `matrix.backend.configPollInterval` (default 2 s): an Enable through head A
+  routes on head B within one poll. LISTEN/NOTIFY is a drop-in accelerant if
+  sub-second convergence is ever wanted.
+- **The clock → Postgres `now()`.** Leases, staleness, `computed_at`, access
+  recency: all stamped and compared by the database, so head/follower clock
+  skew is irrelevant. The single-clock argument from 8.1 survives scale-out by
+  making the shared store the clock. (The read path's `time.Since(ComputedAt)`
+  staleness display and the sweep cadence remain process-clock: NTP-scale skew
+  against tens-of-seconds TTLs. The Redis store's value-embedded `ComputedAt`
+  is head-stamped — worst case a skewed staleness *display*, never a skewed
+  refresh order.)
+- **Still no fencing tokens.** `SKIP LOCKED` + `lease_until` reproduce the
+  visibility timeout; writes stay idempotent; and because the pg index stamps
+  its own authoritative `computed_at`, a straggler's late submit cannot regress
+  freshness ordering. The consensus that legitimately remains is tiny and
+  off-the-shelf, exactly as predicted above: a per-tick
+  `pg_try_advisory_xact_lock` elects which head runs a janitor sweep, a boot
+  advisory lock serializes simultaneous first boots (the winner seeds the
+  index; later heads find the working set populated and only re-project), and
+  per-area advisory locks keep two heads' lifecycle mutations of one area from
+  interleaving.
+
+Followers are untouched: they still speak `/_work_/claim|submit` to "the
+leader," which is now any head behind a load balancer. `make demo-multihead`
+stages the whole thing — two heads over one containerized Postgres, followers
+split between them, one area enabled through head A and served by both; kill
+either head and the other keeps the freshness contract.
+
+Accepted looseness: a head's `AreaEnabled` snapshot lags a disable elsewhere by
+up to one poll interval, so a follower submit routed through the lagging head
+can re-insert store rows the disable just purged. The index rows stay gone, the
+orphans are invisible to reads (routing only consults enabled areas), and a
+re-enable reseeds and refreshes them; bounded, self-healing, documented rather
+than defended with more machinery.
+
 ## 9. Accuracy semantics (document these; don't let them surprise callers)
 
 - **Center-to-center error.** Every estimate is cell-center to cell-center; true

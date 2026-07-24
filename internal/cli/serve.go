@@ -8,12 +8,10 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/control"
 	"github.com/primandproper/beeline/internal/engine/registry"
-	memindex "github.com/primandproper/beeline/internal/freshness/memory"
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/query"
 	"github.com/primandproper/beeline/internal/refresh"
-	memstore "github.com/primandproper/beeline/internal/store/memory"
-	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
+	pgstore "github.com/primandproper/beeline/internal/store/postgres"
 	"github.com/primandproper/beeline/internal/telemetry"
 	"github.com/primandproper/beeline/internal/webui"
 
@@ -73,32 +71,29 @@ func (a *application) serve(ctx context.Context) error {
 		}).Info("registered simulated-network-latency routing provider")
 	}
 
-	store := memstore.New()
-	index := memindex.New(mcfg.TargetTTL, nil)
-
-	// Area store: SQLite-backed area and provider definitions. Opening it runs
-	// migrations; a fresh database has no areas, so nothing is seeded and the refresh
-	// pool idles until an area is created and enabled via the control plane.
-	db, err := areasqlite.Open(mcfg.DatabasePath)
+	// Backend selection: memory (the default) keeps everything in process; a
+	// configured matrix.backend moves the hot store — and, in distributed mode,
+	// the coordination state — into shared Postgres/Redis so multiple heads can
+	// serve one working set.
+	backend, err := a.buildBackend(ctx, &mcfg)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if closeErr := db.Close(); closeErr != nil {
-			a.log().Error("closing area database", closeErr)
-		}
-	}()
-	repo := areasqlite.NewRepository(db, nil)
+	defer backend.close()
+	store, index := backend.store, backend.index
 
 	// Control plane: owns the enabled-area set and drives per-area seed/unseed on the
 	// shared index/store. It also routes read-path queries to the containing area and
 	// owns the provider registry (built-ins + the database-backed operator entries,
 	// published to followers as a content-hashed catalog). The global freshness knobs
 	// seed a new area's per-area contract when the operator leaves them unset; each
-	// area then stores and honors its own values.
+	// area then stores and honors its own values. The area/provider repositories (and
+	// the cross-head mutation locker) come from the backend: local SQLite single-node,
+	// shared Postgres distributed.
 	coordinator, err := control.New(&control.Config{
-		Areas:     repo,
-		Providers: repo,
+		Areas:     backend.areas,
+		Providers: backend.providers,
+		Locker:    backend.locker,
 		Index:     index,
 		Store:     store,
 		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
@@ -172,6 +167,7 @@ func (a *application) serve(ctx context.Context) error {
 	enabled := coordinator.EnabledAreas()
 	a.log().WithValues(map[string]any{
 		"database":      mcfg.DatabasePath,
+		"hot_store":     mcfg.Backend.EffectiveHotStore(),
 		"enabled_areas": len(enabled),
 		"profiles":      len(profiles),
 		"target_ttl":    mcfg.TargetTTL.String(),
@@ -247,7 +243,15 @@ func (a *application) serve(ctx context.Context) error {
 	// sweep each enabled area that is due on its own SweepInterval, evicting cold demand
 	// pairs (unqueried past their DemandIdleTTL) from the index and store so cost tracks
 	// real usage. Areas with decay disabled (TTL 0) are skipped inside the sweep.
-	go a.runSweeper(ctx, coordinator)
+	go a.runSweeper(ctx, coordinator, backend.sweepGate)
+
+	// Cross-head config convergence (distributed mode only): poll the shared
+	// config_version generations and re-derive this head's projections when
+	// another head mutates areas or providers, so an Enable on one head routes
+	// on all heads within one poll interval.
+	if backend.configSource != nil {
+		go a.runConfigWatcher(ctx, coordinator, backend.configSource, mcfg.Backend.ConfigPollInterval)
+	}
 
 	<-ctx.Done()
 	a.log().Info("shutdown signal received; draining HTTP server")
@@ -276,24 +280,95 @@ func (a *application) serve(ctx context.Context) error {
 // interval; a second is well below any realistic decay cadence and the check is cheap.
 const sweepBaseTick = time.Second
 
+// defaultConfigPollInterval paces the config watcher when the knob is unset.
+const defaultConfigPollInterval = 2 * time.Second
+
+// runConfigWatcher polls the shared config_version generations and converges
+// this head's projections when they move: areas (enable/disable/update
+// elsewhere) re-project the routing snapshot, providers rebuild engines and the
+// catalog hash. The first tick resyncs unconditionally, closing the window
+// between boot-time loading and the first observed generation. Poll-based by
+// design — a 2s convergence lag matches the follower catalog-sync grain;
+// LISTEN/NOTIFY can accelerate it later without changing the shape.
+func (a *application) runConfigWatcher(ctx context.Context, coordinator *control.Coordinator, source *pgstore.Repository, interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultConfigPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var last map[string]int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		generations, err := source.ConfigGenerations(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				a.log().Error("reading config generations", err)
+			}
+			continue
+		}
+
+		if last == nil || generations[pgstore.ConfigKindProviders] != last[pgstore.ConfigKindProviders] {
+			if err = coordinator.ResyncProviders(ctx); err != nil {
+				a.log().Error("resyncing providers", err)
+				continue // retry next tick with last unchanged
+			}
+		}
+		if last == nil || generations[pgstore.ConfigKindAreas] != last[pgstore.ConfigKindAreas] {
+			if err = coordinator.ResyncAreas(ctx); err != nil {
+				a.log().Error("resyncing areas", err)
+				continue
+			}
+		}
+		last = generations
+	}
+}
+
 // runSweeper ticks on the fixed base cadence and asks the coordinator to sweep every
 // enabled area that is due on its own SweepInterval. It runs until ctx is cancelled.
-func (a *application) runSweeper(ctx context.Context, coordinator *control.Coordinator) {
+// With a gate (distributed mode), every head keeps ticking but only the tick's
+// advisory-lock winner sweeps — per-tick election means zero session bookkeeping
+// and automatic failover on the next tick after a holder dies. Sweeps are
+// idempotent deletes, so the per-head lastSwept cadence state at worst costs one
+// extra sweep after a failover.
+func (a *application) runSweeper(
+	ctx context.Context,
+	coordinator *control.Coordinator,
+	gate func(ctx context.Context, fn func(ctx context.Context) error) (bool, error),
+) {
 	ticker := time.NewTicker(sweepBaseTick)
 	defer ticker.Stop()
+
+	sweep := func(ctx context.Context) error {
+		swept, err := coordinator.SweepDue(ctx, time.Now())
+		if err != nil {
+			return err
+		}
+		if swept > 0 {
+			a.log().WithValues(map[string]any{"swept": swept}).Debug("demand-decay sweep evicted cold pairs")
+		}
+
+		return nil
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			swept, err := coordinator.SweepDue(ctx, time.Now())
-			if err != nil {
-				a.log().Error("sweeping cold demand pairs", err)
-				continue
+			var err error
+			if gate != nil {
+				_, err = gate(ctx, sweep) // not winning is normal: another head swept
+			} else {
+				err = sweep(ctx)
 			}
-			if swept > 0 {
-				a.log().WithValues(map[string]any{"swept": swept}).Debug("demand-decay sweep evicted cold pairs")
+			if err != nil && ctx.Err() == nil {
+				a.log().Error("sweeping cold demand pairs", err)
 			}
 		}
 	}

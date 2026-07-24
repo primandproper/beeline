@@ -1,0 +1,60 @@
+{
+	"observability": {
+		"profiling": {
+			"serviceName": ""
+		},
+		"logging": {
+			"serviceName": "beeline",
+			"level": "info",
+			"provider": "slog"
+		},
+		"metrics": {
+			"serviceName": "",
+			"enabled": false
+		},
+		"tracing": {}
+	},
+	"matrix": {
+		"profiles": {
+			"bike": 4.2,
+			"car": 13.9,
+			"walk": 1.4
+		},
+		"defaultProfile": "car",
+		"databasePath": "beeline.db",
+		"server": {
+			"startupDeadline": 5000000000,
+			"port": 8080,
+			"debug": false
+		},
+		"backend": {
+			"mode": "postgres",
+			"postgres": {
+				"url": "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable"
+			},
+			"configPollInterval": 2000000000
+		},
+		"follower": {
+			"http": {
+				"timeout": 10000000000,
+				"maxIdleConns": 0,
+				"maxIdleConnsPerHost": 0,
+				"enableTracing": false
+			},
+			"idleBackoff": 1000000000,
+			"port": 8081,
+			"workers": 4
+		},
+		"engineLatency": {
+			"min": 25000000,
+			"max": 120000000,
+			"enabled": true
+		},
+		"targetTTL": 30000000000,
+		"leaseDuration": 15000000000,
+		"sweepInterval": 15000000000,
+		"refreshWorkers": 0,
+		"refreshBatch": 256,
+		"silenceRouteLogging": true
+	}
+}

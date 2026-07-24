@@ -114,6 +114,62 @@ func buildLocalDevConfig() *config.Config {
 	}
 }
 
+// buildClusterConfig is the distributed-mode config the multi-head demo (and
+// any real multi-head deployment) starts from: identical heads over a shared
+// Postgres — the freshness index, operator config, and estimate cache all live
+// there, so every head is stateless and disposable. Heads run coordinator-only
+// (refreshWorkers 0) with the simulated-latency provider available, so compute
+// comes from `work` followers pointed at any head. The SQLite databasePath is
+// ignored in this mode (config lives in Postgres); it is set only to satisfy
+// validation. Deployments override the Postgres URL via
+// BEELINE_MATRIX_BACKEND_POSTGRES_URL.
+func buildClusterConfig() *config.Config {
+	return &config.Config{
+		Observability: observability.Config{
+			Logging: loggingcfg.Config{
+				Provider:    loggingcfg.ProviderSlog,
+				ServiceName: config.DefaultServiceName,
+				Level:       logging.InfoLevel,
+			},
+		},
+		Matrix: config.MatrixConfig{
+			Server: serverhttp.Config{
+				Port:            8080,
+				StartupDeadline: 5 * time.Second,
+			},
+			DatabasePath:   "beeline.db", // unused in postgres mode; validation requires it
+			Profiles:       defaultProfiles(),
+			DefaultProfile: "car",
+			Backend: config.BackendConfig{
+				Mode: config.BackendModePostgres,
+				// Demo credentials for the throwaway local docker postgres; real
+				// deploys override via BEELINE_MATRIX_BACKEND_POSTGRES_URL.
+				Postgres: config.PostgresConfig{ //nolint:gosec // local demo creds
+					URL: "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable",
+				},
+				ConfigPollInterval: 2 * time.Second,
+			},
+			EngineLatency: config.EngineLatencyConfig{
+				Enabled: true,
+				Min:     25 * time.Millisecond,
+				Max:     120 * time.Millisecond,
+			},
+			Follower: config.FollowerConfig{
+				Port:        8081,
+				Workers:     4,
+				IdleBackoff: time.Second,
+				HTTP:        httpclient.Config{Timeout: 10 * time.Second},
+			},
+			TargetTTL:           30 * time.Second,
+			LeaseDuration:       15 * time.Second,
+			SweepInterval:       15 * time.Second,
+			RefreshWorkers:      0, // heads coordinate; followers compute
+			RefreshBatch:        256,
+			SilenceRouteLogging: true,
+		},
+	}
+}
+
 // buildProductionConfig is the config for a production deployment: the same
 // structured slog logging dialed back to info, a longer freshness TTL, and more
 // refresh workers to keep the working set fresh at scale.

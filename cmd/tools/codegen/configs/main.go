@@ -21,6 +21,11 @@ func main() {
 			Config: buildLocalDevConfig(),
 		},
 		{
+			Name:   "cluster",
+			Path:   "config/cluster.json",
+			Config: buildClusterConfig(),
+		},
+		{
 			Name:   "production",
 			Path:   "config/production.json",
 			Config: buildProductionConfig(),

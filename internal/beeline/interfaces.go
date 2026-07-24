@@ -46,6 +46,9 @@ type FreshnessIndex interface {
 	// visibility timeout. At-least-once; writes are idempotent so a double-compute
 	// is waste, not corruption.
 	Claim(ctx context.Context, limit int, lease time.Duration) ([]PairKey, error)
+	// MarkComputed records successful refreshes. The at parameter is advisory:
+	// a backend with its own clock authority (Postgres) substitutes its own
+	// timestamp, so distributed heads never compare process clocks.
 	MarkComputed(ctx context.Context, keys []PairKey, at time.Time) error
 	Bump(ctx context.Context, keys []PairKey) error // demand-driven priority
 	// Access records that a pair was queried: it adds unknown keys to the working set

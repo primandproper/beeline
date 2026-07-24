@@ -74,6 +74,31 @@ type AreaStore interface {
 	Delete(ctx context.Context, keys []beeline.PairKey) error
 }
 
+// Locker serializes one area's lifecycle mutations across processes. A single
+// node needs no cross-process lock (the Coordinator's own mutex serializes
+// everything), so the default is a no-op; distributed mode injects a
+// Postgres advisory-lock implementation so two heads cannot interleave, say,
+// an Enable and a Disable of the same area between repository write and index
+// seed.
+type Locker interface {
+	WithAreaLock(ctx context.Context, id beeline.AreaID, fn func(ctx context.Context) error) error
+}
+
+// noopLocker is the single-node default.
+type noopLocker struct{}
+
+func (noopLocker) WithAreaLock(ctx context.Context, _ beeline.AreaID, fn func(ctx context.Context) error) error {
+	return fn(ctx)
+}
+
+// BootSeedLocker is the optional Locker extension for multi-head boot:
+// ResumeEnabled runs under this lock when the locker provides it, so heads
+// booting simultaneously seed the shared index one at a time (the first
+// populates it, the rest observe populated areas and only project).
+type BootSeedLocker interface {
+	WithBootSeedLock(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
 // CreateAreaInput describes a new area. GeoJSON is the canonical, required
 // geometry: every layer's cell set is derived from it by polyfill at seed time,
 // so nothing cell-shaped is supplied here. Layers may arrive in any order; the
@@ -145,6 +170,7 @@ type Coordinator struct {
 	providersRepo   ProvidersRepository
 	index           AreaIndex
 	store           AreaStore
+	locker          Locker
 	buildEngine     EngineBuilder
 	providers       map[string]beeline.RoutingEngine
 	builtinSpecs    map[string]beeline.ProviderSpec
@@ -169,12 +195,14 @@ type FreshnessDefaults struct {
 	SweepInterval time.Duration
 }
 
-// Config wires a Coordinator's seams and registry inputs.
+// Config wires a Coordinator's seams and registry inputs. Locker is optional:
+// nil means single-node (no cross-process serialization needed).
 type Config struct {
 	Areas           AreasRepository
 	Providers       ProvidersRepository
 	Index           AreaIndex
 	Store           AreaStore
+	Locker          Locker
 	BuildEngine     EngineBuilder
 	Speeds          map[string]float64
 	DefaultProvider string
@@ -192,11 +220,17 @@ func New(cfg *Config) (*Coordinator, error) {
 	}
 	slices.Sort(profiles)
 
+	locker := cfg.Locker
+	if locker == nil {
+		locker = noopLocker{}
+	}
+
 	c := &Coordinator{
 		repo:            cfg.Areas,
 		providersRepo:   cfg.Providers,
 		index:           cfg.Index,
 		store:           cfg.Store,
+		locker:          locker,
 		buildEngine:     cfg.BuildEngine,
 		speeds:          cfg.Speeds,
 		profiles:        profiles,
@@ -334,37 +368,47 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateA
 		return beeline.Area{}, err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var out beeline.Area
+	err := c.locker.WithAreaLock(ctx, id, func(ctx context.Context) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	area, err := c.repo.Get(ctx, id)
+		area, err := c.repo.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+
+		sample, err := tessellate.SamplePoint(area.GeoJSON)
+		if err != nil {
+			return err
+		}
+		layers, err := normalizeAndValidateLayers(in.Layers, strategy, sample)
+		if err != nil {
+			return err
+		}
+		targetTTL, lease, sweep, err := c.resolveFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
+		if err != nil {
+			return err
+		}
+
+		area.Name = in.Name
+		area.Layers = layers
+		area.WarmStrategy = strategy
+		area.RoutingProvider = provider
+		area.DemandIdleTTL = in.DemandIdleTTL
+		area.TargetTTL = targetTTL
+		area.LeaseDuration = lease
+		area.SweepInterval = sweep
+
+		out, err = c.persistAndConvergeLocked(ctx, &area)
+
+		return err
+	})
 	if err != nil {
 		return beeline.Area{}, err
 	}
 
-	sample, err := tessellate.SamplePoint(area.GeoJSON)
-	if err != nil {
-		return beeline.Area{}, err
-	}
-	layers, err := normalizeAndValidateLayers(in.Layers, strategy, sample)
-	if err != nil {
-		return beeline.Area{}, err
-	}
-	targetTTL, lease, sweep, err := c.resolveFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
-	if err != nil {
-		return beeline.Area{}, err
-	}
-
-	area.Name = in.Name
-	area.Layers = layers
-	area.WarmStrategy = strategy
-	area.RoutingProvider = provider
-	area.DemandIdleTTL = in.DemandIdleTTL
-	area.TargetTTL = targetTTL
-	area.LeaseDuration = lease
-	area.SweepInterval = sweep
-
-	return c.persistAndConvergeLocked(ctx, &area)
+	return out, nil
 }
 
 // SetGeoJSON replaces an area's canonical geometry from an uploaded polygon. The
@@ -372,85 +416,136 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateA
 // depend on where on the globe the sample cell lands); the layers' cell sets are
 // re-derived at seed time. An enabled area is re-converged.
 func (c *Coordinator) SetGeoJSON(ctx context.Context, id beeline.AreaID, raw []byte) (beeline.Area, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var out beeline.Area
+	err := c.locker.WithAreaLock(ctx, id, func(ctx context.Context) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	area, err := c.repo.Get(ctx, id)
+		area, err := c.repo.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+
+		sample, err := tessellate.SamplePoint(raw)
+		if err != nil {
+			return err
+		}
+		if _, err = normalizeAndValidateLayers(area.Layers, area.WarmStrategy, sample); err != nil {
+			return err
+		}
+		area.GeoJSON = raw
+
+		out, err = c.persistAndConvergeLocked(ctx, &area)
+
+		return err
+	})
 	if err != nil {
 		return beeline.Area{}, err
 	}
 
-	sample, err := tessellate.SamplePoint(raw)
-	if err != nil {
-		return beeline.Area{}, err
-	}
-	if _, err = normalizeAndValidateLayers(area.Layers, area.WarmStrategy, sample); err != nil {
-		return beeline.Area{}, err
-	}
-	area.GeoJSON = raw
-
-	return c.persistAndConvergeLocked(ctx, &area)
+	return out, nil
 }
 
 // Enable seeds an area's pairs into the shared index and marks it enabled, so the
 // refresh pool begins keeping it fresh. Enabling an already-enabled area is a no-op
 // re-seed.
 func (c *Coordinator) Enable(ctx context.Context, id beeline.AreaID) (beeline.Area, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var out beeline.Area
+	err := c.locker.WithAreaLock(ctx, id, func(ctx context.Context) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	area, err := c.repo.Get(ctx, id)
+		area, err := c.repo.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+
+		if err = c.seedLocked(ctx, &area); err != nil {
+			return err
+		}
+
+		if err = c.repo.SetEnabled(ctx, id, true); err != nil {
+			// Roll back the seed so persisted state and the index don't diverge.
+			delete(c.enabled, id)
+			return errors.Join(err, c.index.Unseed(ctx, id))
+		}
+
+		area.Enabled = true
+		out = area
+
+		return nil
+	})
 	if err != nil {
 		return beeline.Area{}, err
 	}
 
-	if err = c.seedLocked(ctx, &area); err != nil {
-		return beeline.Area{}, err
-	}
-
-	if err = c.repo.SetEnabled(ctx, id, true); err != nil {
-		// Roll back the seed so persisted state and the index don't diverge.
-		delete(c.enabled, id)
-		return beeline.Area{}, errors.Join(err, c.index.Unseed(ctx, id))
-	}
-
-	area.Enabled = true
-
-	return area, nil
+	return out, nil
 }
 
 // Disable removes an area's pairs and cached estimates and marks it disabled. The
 // refresh pool stops working it. Disabling an already-disabled area is a no-op.
 func (c *Coordinator) Disable(ctx context.Context, id beeline.AreaID) (beeline.Area, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	var out beeline.Area
+	err := c.locker.WithAreaLock(ctx, id, func(ctx context.Context) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	if err := c.unseedLocked(ctx, id); err != nil {
+		if err := c.unseedLocked(ctx, id); err != nil {
+			return err
+		}
+
+		if err := c.repo.SetEnabled(ctx, id, false); err != nil {
+			return err
+		}
+
+		area, err := c.repo.Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		out = area
+
+		return nil
+	})
+	if err != nil {
 		return beeline.Area{}, err
 	}
 
-	if err := c.repo.SetEnabled(ctx, id, false); err != nil {
-		return beeline.Area{}, err
-	}
-
-	return c.repo.Get(ctx, id)
+	return out, nil
 }
 
 // Delete removes an area entirely, first tearing down its working set if enabled.
 func (c *Coordinator) Delete(ctx context.Context, id beeline.AreaID) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.locker.WithAreaLock(ctx, id, func(ctx context.Context) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
 
-	if err := c.unseedLocked(ctx, id); err != nil {
-		return err
-	}
+		if err := c.unseedLocked(ctx, id); err != nil {
+			return err
+		}
 
-	return c.repo.Delete(ctx, id)
+		return c.repo.Delete(ctx, id)
+	})
 }
 
-// ResumeEnabled seeds every already-enabled area into the index. Call it once at boot
-// after opening the store: an empty database seeds nothing and the pool idles.
+// ResumeEnabled brings every already-enabled area back into service at boot.
+// Single-node, the in-memory index is empty after a restart, so every enabled
+// area is seeded from scratch (today's behavior). Distributed, the shared index
+// usually already holds the working set: an area whose pairs survive is only
+// projected (snapshot + freshness contract), preserving its throughput baseline
+// across head restarts, and only an area with no tracked pairs is seeded. Heads
+// booting simultaneously serialize on the boot-seed lock when the locker
+// provides one, so exactly one seeds and the rest observe its work.
 func (c *Coordinator) ResumeEnabled(ctx context.Context) error {
+	if bootLocker, ok := c.locker.(BootSeedLocker); ok {
+		return bootLocker.WithBootSeedLock(ctx, c.resumeEnabled)
+	}
+
+	return c.resumeEnabled(ctx)
+}
+
+// resumeEnabled is ResumeEnabled's body, run under the boot-seed lock when one
+// exists.
+func (c *Coordinator) resumeEnabled(ctx context.Context) error {
 	areas, err := c.repo.List(ctx)
 	if err != nil {
 		return err
@@ -461,6 +556,19 @@ func (c *Coordinator) ResumeEnabled(ctx context.Context) error {
 
 	for i := range areas {
 		if !areas[i].Enabled {
+			continue
+		}
+
+		stats, statsErr := c.index.DebtForArea(ctx, areas[i].ID)
+		if statsErr != nil {
+			return statsErr
+		}
+		if stats.WorkingSet > 0 {
+			// Another head (or a prior run of this one) already seeded this
+			// area into the shared index; just project it.
+			if projErr := c.projectAreaLocked(ctx, &areas[i]); projErr != nil {
+				return projErr
+			}
 			continue
 		}
 		if seedErr := c.seedLocked(ctx, &areas[i]); seedErr != nil {
@@ -955,20 +1063,71 @@ func (c *Coordinator) persistAndConvergeLocked(ctx context.Context, area *beelin
 // the (unseeded) tail. Layers stay distinct downstream via PairKey.Res. Callers hold
 // c.mu.
 func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error {
+	ea, layerCells, err := c.buildProjectionLocked(area)
+	if err != nil {
+		return err
+	}
+
 	var pairs []beeline.PairKey
+	for i := range area.Layers {
+		eager, eagerErr := c.eagerSeedPairs(area, area.Layers[i], layerCells[i])
+		if eagerErr != nil {
+			return eagerErr
+		}
+		pairs = append(pairs, eager...)
+	}
+
+	if err = c.index.Seed(ctx, pairs); err != nil {
+		return err
+	}
+	// Register this area's freshness contract so the index applies its own target TTL
+	// (staleness) and lease (claim visibility) rather than the global defaults. Done for
+	// every strategy, including lazy — its demand-filled pairs must honor the same contract.
+	if err = c.index.SetAreaFreshness(ctx, area.ID, area.TargetTTL, area.LeaseDuration); err != nil {
+		return err
+	}
+
+	c.enabled[area.ID] = ea
+
+	return nil
+}
+
+// projectAreaLocked rebuilds one area's in-process routing snapshot without
+// touching the shared index's pair set: polyfill, engine resolution, and the
+// freshness-contract registration (idempotent in the index). It is the
+// non-mutating-head half of seedLocked — a head converging on another head's
+// Enable projects the area so Locate/EngineFor/AreaEnabled answer for it, while
+// the head that handled the Enable already seeded the shared index. Callers
+// hold c.mu.
+func (c *Coordinator) projectAreaLocked(ctx context.Context, area *beeline.Area) error {
+	ea, _, err := c.buildProjectionLocked(area)
+	if err != nil {
+		return err
+	}
+	if err = c.index.SetAreaFreshness(ctx, area.ID, area.TargetTTL, area.LeaseDuration); err != nil {
+		return err
+	}
+
+	c.enabled[area.ID] = ea
+
+	return nil
+}
+
+// buildProjectionLocked polyfills each of the area's layers from its GeoJSON
+// and assembles the routing snapshot, returning the per-layer cell slices for
+// eager-pair derivation. It mutates nothing. A provider name missing from the
+// registry (a cross-head resync racing a provider delete) falls back to the
+// default engine rather than leaving the area unroutable. Callers hold c.mu.
+func (c *Coordinator) buildProjectionLocked(area *beeline.Area) (*enabledArea, [][]beeline.H3Cell, error) {
+	layerCells := make([][]beeline.H3Cell, 0, len(area.Layers))
 	layers := make([]enabledLayer, 0, len(area.Layers))
 	for i := range area.Layers {
 		layer := area.Layers[i]
 		cells, err := tessellate.CellsFromGeoJSON(area.GeoJSON, layer.Resolution)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-
-		eager, err := c.eagerSeedPairs(area, layer, cells)
-		if err != nil {
-			return err
-		}
-		pairs = append(pairs, eager...)
+		layerCells = append(layerCells, cells)
 
 		cellSet := make(map[beeline.H3Cell]struct{}, len(cells))
 		for _, cell := range cells {
@@ -982,27 +1141,98 @@ func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error 
 		})
 	}
 
-	if err := c.index.Seed(ctx, pairs); err != nil {
-		return err
-	}
-	// Register this area's freshness contract so the index applies its own target TTL
-	// (staleness) and lease (claim visibility) rather than the global defaults. Done for
-	// every strategy, including lazy — its demand-filled pairs must honor the same contract.
-	if err := c.index.SetAreaFreshness(ctx, area.ID, area.TargetTTL, area.LeaseDuration); err != nil {
-		return err
+	provider := c.normalizeProvider(area.RoutingProvider)
+	engine, ok := c.providers[provider]
+	if !ok {
+		engine = c.providers[c.defaultProvider]
 	}
 
-	provider := c.normalizeProvider(area.RoutingProvider)
-	c.enabled[area.ID] = &enabledArea{
+	return &enabledArea{
 		layers:        layers,
-		engine:        c.providers[provider],
+		engine:        engine,
 		provider:      provider,
 		demandIdleTTL: area.DemandIdleTTL,
 		targetTTL:     area.TargetTTL,
 		sweepInterval: area.SweepInterval,
+	}, layerCells, nil
+}
+
+// ResyncAreas converges this head's routing snapshot with the shared area
+// registry: areas enabled elsewhere are projected in, areas disabled or
+// deleted elsewhere are dropped. It deliberately never seeds or unseeds the
+// shared index/store — the head that handled the mutation already did, and
+// doing it again from every head would reset baselines and re-purge stores.
+// The config watcher calls it when the areas generation moves.
+func (c *Coordinator) ResyncAreas(ctx context.Context) error {
+	areas, err := c.repo.List(ctx)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	enabled := make(map[beeline.AreaID]bool, len(areas))
+	for i := range areas {
+		if !areas[i].Enabled {
+			continue
+		}
+		enabled[areas[i].ID] = true
+		if projErr := c.projectAreaLocked(ctx, &areas[i]); projErr != nil {
+			return projErr
+		}
+	}
+
+	for id := range c.enabled {
+		if !enabled[id] {
+			delete(c.enabled, id)
+			delete(c.lastSwept, id)
+		}
 	}
 
 	return nil
+}
+
+// ResyncProviders converges this head's provider registry with the shared one:
+// operator specs are re-listed, engines rebuilt, enabled areas re-pointed, and
+// the catalog hash recomputed — the same effect PutProvider/DeleteProvider have
+// on the head that handled the call. The config watcher calls it when the
+// providers generation moves.
+func (c *Coordinator) ResyncProviders(ctx context.Context) error {
+	specs, err := c.providersRepo.ListProviders(ctx)
+	if err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	providers := make(map[string]beeline.RoutingEngine, len(c.builtinSpecs)+len(specs))
+	for name := range c.builtinSpecs {
+		providers[name] = c.providers[name]
+	}
+
+	dbSpecs := make(map[string]beeline.ProviderSpec, len(specs))
+	for i := range specs {
+		engine, buildErr := c.buildEngine(&specs[i])
+		if buildErr != nil {
+			return fmt.Errorf("control: rebuilding provider %q: %w", specs[i].Name, buildErr)
+		}
+		dbSpecs[specs[i].Name] = specs[i]
+		providers[specs[i].Name] = engine
+	}
+
+	c.dbSpecs = dbSpecs
+	c.providers = providers
+	for _, ea := range c.enabled {
+		if engine, ok := c.providers[ea.provider]; ok {
+			ea.engine = engine
+		} else {
+			ea.engine = c.providers[c.defaultProvider]
+		}
+	}
+
+	return c.rebuildCatalogLocked()
 }
 
 // eagerSeedPairs is the set of one layer's pairs to pin fresh at enable time, chosen

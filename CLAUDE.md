@@ -25,7 +25,18 @@ The application is a **Cobra CLI**. Three subcommands:
   follower serves only health probes (`/_ops_/live`, and `/_ops_/ready` = leader reachable) on
   `matrix.follower.port` (default 8081). Scale a saturated leader by starting more `work` processes;
   a leader with `refreshWorkers: 0` computes nothing itself (pure coordinator).
-- `serve` — the prototype. It opens the SQLite **area store**, re-seeds the freshness index from any
+- `serve` — the prototype. Runs in one of two backend modes (`matrix.backend`, design §8.2): the
+  zero-dependency **single-node default** described below, or **distributed mode** (`mode:
+  "postgres"`), where the freshness index, hot estimate store, and operator config all live in a
+  shared Postgres so any number of identical `serve` **heads** run at once — each head is stateless
+  and disposable, "leader" just means "any head a follower points at." In distributed mode SQLite is
+  ignored; heads converge on config changes by polling a `config_version` generation (bumped
+  transactionally by every mutation, `configPollInterval`, default 2s), singleton chores are elected
+  with Postgres advisory locks (janitor sweeps per-tick, boot seeding once — later heads find the
+  working set populated and only re-project), and the database's `now()` is the only clock that
+  matters for leases/staleness. The hot store is selectable (`hotStore`): `postgres` (default —
+  benchmarked ~275ms p95 for a 300k-key BatchGet, well inside the sub-second contract) or `redis`
+  (~146ms, for batch-read headroom). Single-node it opens the SQLite **area store**, re-seeds the freshness index from any
   already-**enabled** service areas, runs a background refresh loop that keeps those areas' pairs
   fresh (plus a demand-decay janitor that evicts cold demand-filled pairs on the `sweepInterval`
   cadence), and serves the read path over HTTP. Service areas live in the database (not the config file),
@@ -102,7 +113,8 @@ HTTP endpoints (default `:8080`):
   `*config.Config` as a real, typed Go object (`environments.go`), validates it, and renders it to
   `config/<env>.json` via `config.Render`. The checked-in JSON is a projection of these builders — edit
   the Go, never the JSON, then re-run `make configs`.
-- `config/` — generated per-environment config files (`localdev.json`, `production.json`); committed so
+- `config/` — generated per-environment config files (`localdev.json`, `cluster.json` — the
+  distributed-mode reference, used by `make demo-multihead` — and `production.json`); committed so
   they stay reviewable, and loadable at runtime via `--config`.
 - `internal/cli/` — cobra root command, observability bootstrap + shutdown, subcommands
   (`version.go`, `serve.go`). `serve.go` wires the whole matrix pipeline from `application.cfg` +
@@ -114,7 +126,10 @@ HTTP endpoints (default `:8080`):
   and then overlays the same environment variables. `Render` goes the other way: it validates typed
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
-  `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs (`targetTTL`,
+  `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, the `backend` sub-config
+  (`BackendConfig`, env prefix `BEELINE_MATRIX_BACKEND_`: `mode` memory|postgres, `hotStore`
+  postgres|redis, Postgres/Redis connection blocks, `configPollInterval` — the distributed-mode
+  switch; zero value = today's single-node behavior), and freshness knobs (`targetTTL`,
   `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch —
   `refreshWorkers: 0` runs a coordinator-only leader), the `follower` sub-config (`FollowerConfig`,
   env prefix `BEELINE_MATRIX_FOLLOWER_`: leader URL, worker/batch/lease/backoff knobs, health port,
@@ -157,6 +172,18 @@ HTTP endpoints (default `:8080`):
   bound in meters** (`RingsForRadius` converts it to an H3 ring count empirically via `geo.Haversine`;
   `radiusMeters == 0` is the full-mesh sentinel).
 - `internal/store/memory/` — in-memory `Store` (map + RWMutex); `DeleteArea` drops one area's estimates.
+- `internal/store/postgres/` — the distributed-mode backend home (pgx/v5): `Open` (pool + embedded
+  goose migrations, serialized across booting heads by a schema-scoped advisory lock),
+  `EstimateStore` (the hot `Store`: unnest-join `BatchGet` chunked/concurrent, server-stamped
+  `computed_at`), the control-plane `Repository` (areas/providers via a second sqlc target in
+  `generated/`, every mutation bumping its `config_version` generation transactionally),
+  `AdvisoryLocker` (per-area mutation locks, janitor try-lock, boot-seed lock), and `pgtest/` (test
+  helper: one random schema per test, gated on `BEELINE_TEST_POSTGRES_DSN`).
+- `internal/store/redis/` — the optional Redis hot `Store` (go-redis/v9): pipelined MGET/MSET over
+  fixed 24-byte binary values; only cached scalars live here, never coordination state. Gated tests
+  on `BEELINE_TEST_REDIS_ADDR`.
+- `internal/store/storebench/` — the shared 300k-key BatchGet benchmark harness behind `make
+  bench-store` (the hot-store decision gate; p50/p95 reported per backend).
 - `internal/store/sqlite/` — the persistent **area store** (`modernc.org/sqlite`, pure-Go): a
   `Repository` over sqlc-generated queries (`generated/`, regenerate with `make sqlc`) and embedded
   goose migrations (`migrations/`). Stores area definitions (name, `warm_strategy`,
@@ -169,6 +196,15 @@ HTTP endpoints (default `:8080`):
   raising refresh priority), per-area demand decay `SweepArea` (evicts unpinned, unqueried pairs; `Seed`
   pins the eager core), the `Debt` signals (§3), and per-area `Seed`/`Unseed` + `DebtForArea`/
   `CellStatesForArea` (each area keeps its own throughput baseline). Clock is injectable for tests.
+- `internal/freshness/postgres/` — the same `FreshnessIndex` contract over shared Postgres (design
+  §8.2): `Claim` is `FOR UPDATE SKIP LOCKED` over a denormalized `stale_at`, every scheduling
+  timestamp comes from the database's `now()` (the `at` param of `MarkComputed` is advisory),
+  `Seed` is CopyFrom + `ON CONFLICT DO NOTHING` (idempotent across racing heads), `Access` stamps
+  coalesce in a bounded buffer (flushed on interval/fullness; `MarkComputed` flushes its own keys
+  first inside its tx — the demand-fill ordering rule), and `Debt`/`CellStates` aggregates memoize
+  ~500ms per head for console polling. No fencing tokens by design — see §8.2.
+- `internal/freshness/freshnesstest/` — the conformance suite both index implementations run
+  (real-clock, window-tolerant), so the backends cannot drift apart.
 - `internal/refresh/` — the worker+engine pool (§4): claim stalest → dense origin-centric 1×K table
   request → write → mark computed. Claims span all enabled areas from the shared index. The pool
   talks to a `WorkSource` seam (`Claim`/`Submit`): `LocalSource` adapts the in-process index+store
@@ -217,16 +253,23 @@ HTTP endpoints (default `:8080`):
 ```bash
 make setup          # Create artifacts dir + download the module cache
 make configs        # Render config/<env>.json from the real Go objects in cmd/tools/codegen/configs
-make sqlc           # Regenerate internal/store/sqlite/generated from sqlc_queries + migrations (Docker)
+make sqlc           # Regenerate both sqlc targets (sqlite + postgres generated/) from sqlc_queries + migrations (Docker)
 make build          # Compile all packages, then build artifacts/beeline with version metadata
 make run ARGS="version"   # go run the CLI with arguments
 make run ARGS="serve --config config/localdev.json"   # open area store + refresh + serve HTTP on :8080
 make demo           # fresh gitignored SQLite db (artifacts/demo.db) + auto-seed & enable a demo area, then serve
 make demo-cluster   # leader/follower live: coordinator-only leader (refreshWorkers=0) + 3 `work` followers
                     # against the latency-simulated engine; tails /_ops_/freshness. FOLLOWERS=n to scale.
+make demo-multihead # distributed mode live: two identical serve heads over one containerized Postgres,
+                    # followers split across both, one area enabled via head A and served by both; kill a
+                    # head and the other keeps the contract. FOLLOWERS=n to scale; needs Docker.
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
 make test           # Run tests (race detector, shuffle, failfast); excludes cmd packages
+make test-integration  # Same suite with real Postgres+Redis containers, so the env-gated
+                       # integration tests execute instead of skipping. Needs Docker.
+make bench-store    # The hot-store benchmark gate: 300k-key BatchGet p50/p95 for memory,
+                    # Postgres, and Redis (decides the blessed distributed default). Needs Docker.
 ```
 
 Run a single test:

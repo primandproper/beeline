@@ -1,8 +1,9 @@
 // Package control is the runtime control plane for service areas. It turns the
 // persistent set of operator-configured areas into live refresh work: areas are
-// created disabled, and only when enabled does the Coordinator tessellate their cell
-// set into pairs and seed them into the shared freshness index for the refresh pool
-// to burn down. Disabling an area removes its pairs and cached estimates again.
+// created disabled, and only when enabled does the Coordinator polyfill each of the
+// area's layers from its GeoJSON geometry, tessellate the layers into pairs, and
+// seed them into the shared freshness index for the refresh pool to burn down.
+// Disabling an area removes its pairs and cached estimates again.
 //
 // A Coordinator owns the mutable enabled-set and drives three narrow seams: the areas
 // repository (persistence), the freshness index (per-area Seed/Unseed), and the hot
@@ -33,8 +34,6 @@ type AreasRepository interface {
 	Update(ctx context.Context, a *beeline.Area) error
 	Delete(ctx context.Context, id beeline.AreaID) error
 	SetEnabled(ctx context.Context, id beeline.AreaID, enabled bool) error
-	AddCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) error
-	RemoveCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) error
 }
 
 // AreaIndex is the freshness-index seam: seed an area's pairs, remove them, sweep its
@@ -57,53 +56,59 @@ type AreaStore interface {
 	Delete(ctx context.Context, keys []beeline.PairKey) error
 }
 
-// CreateAreaInput describes a new area. Exactly one geometry source is used: if
-// GeoJSON is non-empty it is polyfilled to the cell set (and kept as provenance);
-// otherwise Cells is taken verbatim (possibly empty, to be filled in by hand later).
+// CreateAreaInput describes a new area. GeoJSON is the canonical, required
+// geometry: every layer's cell set is derived from it by polyfill at seed time,
+// so nothing cell-shaped is supplied here. Layers may arrive in any order; the
+// coordinator sorts them finest→coarsest before validating and persisting.
 type CreateAreaInput struct {
-	Name             string
-	WarmStrategy     beeline.WarmStrategy
-	RoutingProvider  string
-	GeoJSON          []byte
-	Cells            []beeline.H3Cell
-	DemandIdleTTL    time.Duration
-	TargetTTL        time.Duration
-	LeaseDuration    time.Duration
-	SweepInterval    time.Duration
-	Resolution       int
-	MaxRadiusMeters  float64
-	CoreRadiusMeters float64
+	Name            string
+	WarmStrategy    beeline.WarmStrategy
+	RoutingProvider string
+	GeoJSON         []byte
+	Layers          []beeline.Layer
+	DemandIdleTTL   time.Duration
+	TargetTTL       time.Duration
+	LeaseDuration   time.Duration
+	SweepInterval   time.Duration
 }
 
-// UpdateAreaInput carries the mutable metadata of an area. Changing Resolution is
-// only allowed when the area has a GeoJSON provenance to re-polyfill from.
+// UpdateAreaInput carries the mutable metadata of an area. Layers replaces the
+// whole layer list (validated against the area's existing GeoJSON geometry);
+// geometry itself changes through SetGeoJSON.
 type UpdateAreaInput struct {
-	Name             string
-	WarmStrategy     beeline.WarmStrategy
-	RoutingProvider  string
-	DemandIdleTTL    time.Duration
-	TargetTTL        time.Duration
-	LeaseDuration    time.Duration
-	SweepInterval    time.Duration
-	Resolution       int
-	MaxRadiusMeters  float64
-	CoreRadiusMeters float64
+	Name            string
+	WarmStrategy    beeline.WarmStrategy
+	RoutingProvider string
+	Layers          []beeline.Layer
+	DemandIdleTTL   time.Duration
+	TargetTTL       time.Duration
+	LeaseDuration   time.Duration
+	SweepInterval   time.Duration
 }
 
-// enabledArea is the in-memory routing snapshot for one enabled area: its resolution,
-// cell membership set, outer travel bound, and the routing engine it is served by,
-// consulted by Locate and EngineFor on the read/refresh paths. The bound is carried
-// here so the read path can decide, without a store round-trip, whether a demand-fill
-// falls within the area's cacheable radius; the engine is resolved once at seed time
-// so per-pair routing is a map lookup, not a registry walk.
+// enabledLayer is one layer of an enabled area's routing snapshot: the cell
+// membership set polyfilled at seed time, and the per-layer knobs the read path
+// needs (resolution to key lookups, bound to gate demand-fill caching, min
+// distance for future selection). The finest layer (index 0) defines containment.
+type enabledLayer struct {
+	cells             map[beeline.H3Cell]struct{}
+	resolution        int
+	minDistanceMeters float64
+	maxRadiusMeters   float64
+}
+
+// enabledArea is the in-memory routing snapshot for one enabled area: its layers
+// (finest→coarsest, mirroring Area.Layers) and the routing engine it is served
+// by, consulted by Locate and EngineFor on the read/refresh paths. Layer bounds
+// are carried here so the read path can decide, without a store round-trip,
+// whether a demand-fill falls within the cacheable radius; the engine is resolved
+// once at seed time so per-pair routing is a map lookup, not a registry walk.
 type enabledArea struct {
-	cells           map[beeline.H3Cell]struct{}
-	engine          beeline.RoutingEngine
-	demandIdleTTL   time.Duration
-	targetTTL       time.Duration
-	sweepInterval   time.Duration
-	resolution      int
-	maxRadiusMeters float64
+	engine        beeline.RoutingEngine
+	layers        []enabledLayer
+	demandIdleTTL time.Duration
+	targetTTL     time.Duration
+	sweepInterval time.Duration
 }
 
 // Coordinator serializes area lifecycle operations over the repository, index, and
@@ -171,30 +176,29 @@ func (c *Coordinator) Get(ctx context.Context, id beeline.AreaID) (beeline.Area,
 	return c.repo.Get(ctx, id)
 }
 
-// Create validates and persists a new area, always disabled. It resolves the cell set
-// from GeoJSON (polyfill) when provided, else from the supplied cells. It does not
-// seed the index — an area does no refresh work until enabled.
+// Create validates and persists a new area, always disabled. GeoJSON is required —
+// it is the canonical geometry every layer polyfills from — but it is not polyfilled
+// here: cells are derived at seed time, so creation stays cheap and an area does no
+// refresh work until enabled.
 func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.Area, error) {
 	strategy := normalizeStrategy(in.WarmStrategy)
 	provider := c.normalizeProvider(in.RoutingProvider)
-	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy, in.DemandIdleTTL); err != nil {
+	if err := validateAreaFields(in.Name, strategy, in.DemandIdleTTL); err != nil {
 		return beeline.Area{}, err
 	}
 	if err := c.validateProvider(provider); err != nil {
 		return beeline.Area{}, err
 	}
+	if len(in.GeoJSON) == 0 {
+		return beeline.Area{}, errors.New("control: geojson geometry is required")
+	}
 
-	cells := in.Cells
-	if len(in.GeoJSON) > 0 {
-		polyfilled, err := tessellate.CellsFromGeoJSON(in.GeoJSON, in.Resolution)
-		if err != nil {
-			return beeline.Area{}, err
-		}
-		cells = polyfilled
-	} else if err := validateCellResolution(cells, in.Resolution); err != nil {
+	sample, err := tessellate.SamplePoint(in.GeoJSON)
+	if err != nil {
 		return beeline.Area{}, err
 	}
-	if err := validateRadiusFloor(in.Resolution, in.MaxRadiusMeters, cells); err != nil {
+	layers, err := normalizeAndValidateLayers(in.Layers, strategy, sample)
+	if err != nil {
 		return beeline.Area{}, err
 	}
 	targetTTL, lease, sweep, err := c.resolveFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
@@ -203,30 +207,26 @@ func (c *Coordinator) Create(ctx context.Context, in *CreateAreaInput) (beeline.
 	}
 
 	return c.repo.Create(ctx, &beeline.Area{
-		Name:             in.Name,
-		Resolution:       in.Resolution,
-		MaxRadiusMeters:  in.MaxRadiusMeters,
-		CoreRadiusMeters: in.CoreRadiusMeters,
-		WarmStrategy:     strategy,
-		RoutingProvider:  provider,
-		DemandIdleTTL:    in.DemandIdleTTL,
-		TargetTTL:        targetTTL,
-		LeaseDuration:    lease,
-		SweepInterval:    sweep,
-		Cells:            cells,
-		GeoJSON:          in.GeoJSON,
-		Enabled:          false,
+		Name:            in.Name,
+		WarmStrategy:    strategy,
+		RoutingProvider: provider,
+		DemandIdleTTL:   in.DemandIdleTTL,
+		TargetTTL:       targetTTL,
+		LeaseDuration:   lease,
+		SweepInterval:   sweep,
+		Layers:          layers,
+		GeoJSON:         in.GeoJSON,
+		Enabled:         false,
 	})
 }
 
-// Update rewrites an area's metadata. A resolution change re-polyfills the cell set
-// from the area's GeoJSON provenance; changing the resolution of a hand-built area
-// (no GeoJSON) is rejected because its cells cannot be reprojected. If the area is
-// enabled, its working set is re-converged.
+// Update rewrites an area's metadata, replacing its whole layer list. The layers are
+// validated against the area's existing GeoJSON geometry (geometry itself changes
+// through SetGeoJSON). If the area is enabled, its working set is re-converged.
 func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateAreaInput) (beeline.Area, error) {
 	strategy := normalizeStrategy(in.WarmStrategy)
 	provider := c.normalizeProvider(in.RoutingProvider)
-	if err := validateAreaFields(in.Name, in.Resolution, in.MaxRadiusMeters, in.CoreRadiusMeters, strategy, in.DemandIdleTTL); err != nil {
+	if err := validateAreaFields(in.Name, strategy, in.DemandIdleTTL); err != nil {
 		return beeline.Area{}, err
 	}
 	if err := c.validateProvider(provider); err != nil {
@@ -241,17 +241,12 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateA
 		return beeline.Area{}, err
 	}
 
-	if in.Resolution != area.Resolution {
-		if len(area.GeoJSON) == 0 {
-			return beeline.Area{}, errors.New("control: cannot change resolution of a hand-built area; replace its geometry instead")
-		}
-		cells, cellsErr := tessellate.CellsFromGeoJSON(area.GeoJSON, in.Resolution)
-		if cellsErr != nil {
-			return beeline.Area{}, cellsErr
-		}
-		area.Cells = cells
+	sample, err := tessellate.SamplePoint(area.GeoJSON)
+	if err != nil {
+		return beeline.Area{}, err
 	}
-	if err = validateRadiusFloor(in.Resolution, in.MaxRadiusMeters, area.Cells); err != nil {
+	layers, err := normalizeAndValidateLayers(in.Layers, strategy, sample)
+	if err != nil {
 		return beeline.Area{}, err
 	}
 	targetTTL, lease, sweep, err := c.resolveFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
@@ -260,9 +255,7 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateA
 	}
 
 	area.Name = in.Name
-	area.Resolution = in.Resolution
-	area.MaxRadiusMeters = in.MaxRadiusMeters
-	area.CoreRadiusMeters = in.CoreRadiusMeters
+	area.Layers = layers
 	area.WarmStrategy = strategy
 	area.RoutingProvider = provider
 	area.DemandIdleTTL = in.DemandIdleTTL
@@ -273,9 +266,10 @@ func (c *Coordinator) Update(ctx context.Context, id beeline.AreaID, in *UpdateA
 	return c.persistAndConvergeLocked(ctx, &area)
 }
 
-// SetGeoJSON replaces an area's geometry from an uploaded polygon, re-polyfilling the
-// cell set at the area's resolution and keeping the raw GeoJSON as provenance. An
-// enabled area is re-converged.
+// SetGeoJSON replaces an area's canonical geometry from an uploaded polygon. The
+// existing layer list is re-validated against the new geometry (the radius floors
+// depend on where on the globe the sample cell lands); the layers' cell sets are
+// re-derived at seed time. An enabled area is re-converged.
 func (c *Coordinator) SetGeoJSON(ctx context.Context, id beeline.AreaID, raw []byte) (beeline.Area, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -285,47 +279,16 @@ func (c *Coordinator) SetGeoJSON(ctx context.Context, id beeline.AreaID, raw []b
 		return beeline.Area{}, err
 	}
 
-	cells, err := tessellate.CellsFromGeoJSON(raw, area.Resolution)
+	sample, err := tessellate.SamplePoint(raw)
 	if err != nil {
 		return beeline.Area{}, err
 	}
-	area.Cells = cells
+	if _, err = normalizeAndValidateLayers(area.Layers, area.WarmStrategy, sample); err != nil {
+		return beeline.Area{}, err
+	}
 	area.GeoJSON = raw
 
 	return c.persistAndConvergeLocked(ctx, &area)
-}
-
-// AddCells adds cells to an area's set (manual refinement). Cells must be at the
-// area's resolution. An enabled area is re-converged so the new cells start refreshing.
-func (c *Coordinator) AddCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) (beeline.Area, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	area, err := c.repo.Get(ctx, id)
-	if err != nil {
-		return beeline.Area{}, err
-	}
-	if err = validateCellResolution(cells, area.Resolution); err != nil {
-		return beeline.Area{}, err
-	}
-	if err = c.repo.AddCells(ctx, id, cells); err != nil {
-		return beeline.Area{}, err
-	}
-
-	return c.reloadAndConvergeLocked(ctx, id)
-}
-
-// RemoveCells drops cells from an area's set (manual refinement). An enabled area is
-// re-converged so the removed cells stop being refreshed and their estimates are cleared.
-func (c *Coordinator) RemoveCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) (beeline.Area, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := c.repo.RemoveCells(ctx, id, cells); err != nil {
-		return beeline.Area{}, err
-	}
-
-	return c.reloadAndConvergeLocked(ctx, id)
 }
 
 // Enable seeds an area's pairs into the shared index and marks it enabled, so the
@@ -407,9 +370,12 @@ func (c *Coordinator) ResumeEnabled(ctx context.Context) error {
 	return nil
 }
 
-// Locate resolves a coordinate to the enabled area containing it, evaluated at that
-// area's resolution. On overlap the lowest area id wins, deterministically. It
-// implements the read path's AreaRouter seam.
+// Locate resolves a coordinate to the enabled area containing it. Containment is
+// membership in the finest layer's cell set, evaluated at the finest layer's
+// resolution — coarser layers polyfill the same geometry, so the finest set is the
+// most faithful footprint (and for one-layer areas this is exactly the old
+// single-resolution behavior). On overlap the lowest area id wins,
+// deterministically. It implements the read path's AreaRouter seam.
 func (c *Coordinator) Locate(p beeline.LatLng) (beeline.RoutedArea, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -422,16 +388,28 @@ func (c *Coordinator) Locate(p beeline.LatLng) (beeline.RoutedArea, bool) {
 
 	for _, id := range ids {
 		ea := c.enabled[id]
-		cell, err := beeline.CellAt(p, ea.resolution)
+		if len(ea.layers) == 0 {
+			continue
+		}
+		finest := ea.layers[0]
+		cell, err := beeline.CellAt(p, finest.resolution)
 		if err != nil {
 			continue
 		}
-		if _, ok := ea.cells[cell]; ok {
+		if _, ok := finest.cells[cell]; ok {
+			routedLayers := make([]beeline.RoutedLayer, len(ea.layers))
+			for i := range ea.layers {
+				routedLayers[i] = beeline.RoutedLayer{
+					Resolution:        ea.layers[i].resolution,
+					MinDistanceMeters: ea.layers[i].minDistanceMeters,
+					MaxRadiusMeters:   ea.layers[i].maxRadiusMeters,
+				}
+			}
+
 			return beeline.RoutedArea{
-				ID:              id,
-				Resolution:      ea.resolution,
-				MaxRadiusMeters: ea.maxRadiusMeters,
-				TargetTTL:       ea.targetTTL,
+				ID:        id,
+				Layers:    routedLayers,
+				TargetTTL: ea.targetTTL,
 			}, true
 		}
 	}
@@ -543,12 +521,16 @@ func (c *Coordinator) SweepDue(ctx context.Context, now time.Time) (int, error) 
 	return swept, nil
 }
 
-// CellStatesForArea proxies the index's per-area rollup for the progress map.
+// CellStatesForArea proxies the index's per-area rollup for the progress map. The
+// rollup spans all of the area's layers (origin cells at every layer resolution
+// appear side by side); each CellState's Origin self-encodes its resolution.
 func (c *Coordinator) CellStatesForArea(ctx context.Context, id beeline.AreaID) ([]beeline.CellState, error) {
 	return c.index.CellStatesForArea(ctx, id)
 }
 
-// DebtForArea proxies the index's per-area freshness contract.
+// DebtForArea proxies the index's per-area freshness contract. Freshness accounting
+// is per area, not per layer: a multi-layer area's debt and throughput blend all of
+// its layers (accepted — the contract is the area's).
 func (c *Coordinator) DebtForArea(ctx context.Context, id beeline.AreaID) (beeline.DebtStats, error) {
 	return c.index.DebtForArea(ctx, id)
 }
@@ -569,78 +551,81 @@ func (c *Coordinator) persistAndConvergeLocked(ctx context.Context, area *beelin
 	return *area, nil
 }
 
-// reloadAndConvergeLocked reloads an area from the repo (after a cell edit) and
-// re-converges it if enabled. Callers hold c.mu.
-func (c *Coordinator) reloadAndConvergeLocked(ctx context.Context, id beeline.AreaID) (beeline.Area, error) {
-	area, err := c.repo.Get(ctx, id)
-	if err != nil {
-		return beeline.Area{}, err
-	}
-
-	if _, ok := c.enabled[id]; ok {
-		if convErr := c.convergeLocked(ctx, &area); convErr != nil {
-			return beeline.Area{}, convErr
-		}
-	}
-
-	return area, nil
-}
-
-// seedLocked seeds an area's eager pairs into the index and records the routing
-// snapshot. How much is seeded depends on the warm strategy: eager pins the whole
-// MaxRadiusMeters bound (as before), lazy seeds nothing (the working set grows purely
-// from demand), and hybrid pins only the CoreRadiusMeters near field. In every case
-// the routing snapshot records the full cell set and bound so Locate works and the
-// read path can demand-fill the (unseeded) tail. Callers hold c.mu.
+// seedLocked derives each layer's cell set from the area's GeoJSON (polyfilled at
+// that layer's resolution), seeds the eager pairs of every layer into the index, and
+// records the layered routing snapshot. How much of each layer is seeded depends on
+// the area's warm strategy: eager pins the layer's whole MaxRadiusMeters bound, lazy
+// seeds nothing (the working set grows purely from demand), and hybrid pins only the
+// layer's CoreRadiusMeters near field. In every case the snapshot records every
+// layer's full cell set and bound so Locate works and the read path can demand-fill
+// the (unseeded) tail. Layers stay distinct downstream via PairKey.Res. Callers hold
+// c.mu.
 func (c *Coordinator) seedLocked(ctx context.Context, area *beeline.Area) error {
-	pairs, err := c.eagerSeedPairs(area)
-	if err != nil {
-		return err
+	var pairs []beeline.PairKey
+	layers := make([]enabledLayer, 0, len(area.Layers))
+	for i := range area.Layers {
+		layer := area.Layers[i]
+		cells, err := tessellate.CellsFromGeoJSON(area.GeoJSON, layer.Resolution)
+		if err != nil {
+			return err
+		}
+
+		eager, err := c.eagerSeedPairs(area, layer, cells)
+		if err != nil {
+			return err
+		}
+		pairs = append(pairs, eager...)
+
+		cellSet := make(map[beeline.H3Cell]struct{}, len(cells))
+		for _, cell := range cells {
+			cellSet[cell] = struct{}{}
+		}
+		layers = append(layers, enabledLayer{
+			cells:             cellSet,
+			resolution:        layer.Resolution,
+			minDistanceMeters: layer.MinDistanceMeters,
+			maxRadiusMeters:   layer.MaxRadiusMeters,
+		})
 	}
 
-	if err = c.index.Seed(ctx, pairs); err != nil {
+	if err := c.index.Seed(ctx, pairs); err != nil {
 		return err
 	}
 	// Register this area's freshness contract so the index applies its own target TTL
 	// (staleness) and lease (claim visibility) rather than the global defaults. Done for
 	// every strategy, including lazy — its demand-filled pairs must honor the same contract.
-	if err = c.index.SetAreaFreshness(ctx, area.ID, area.TargetTTL, area.LeaseDuration); err != nil {
+	if err := c.index.SetAreaFreshness(ctx, area.ID, area.TargetTTL, area.LeaseDuration); err != nil {
 		return err
 	}
 
-	cellSet := make(map[beeline.H3Cell]struct{}, len(area.Cells))
-	for _, cell := range area.Cells {
-		cellSet[cell] = struct{}{}
-	}
 	c.enabled[area.ID] = &enabledArea{
-		resolution:      area.Resolution,
-		cells:           cellSet,
-		engine:          c.providers[c.normalizeProvider(area.RoutingProvider)],
-		maxRadiusMeters: area.MaxRadiusMeters,
-		demandIdleTTL:   area.DemandIdleTTL,
-		targetTTL:       area.TargetTTL,
-		sweepInterval:   area.SweepInterval,
+		layers:        layers,
+		engine:        c.providers[c.normalizeProvider(area.RoutingProvider)],
+		demandIdleTTL: area.DemandIdleTTL,
+		targetTTL:     area.TargetTTL,
+		sweepInterval: area.SweepInterval,
 	}
 
 	return nil
 }
 
-// eagerSeedPairs is the set of pairs to pin fresh at enable time for an area, chosen by
-// its warm strategy. lazy pins nothing; hybrid pins the core near field (and only when
-// a positive core radius is set — a zero core is an empty core, not the full-mesh
-// sentinel); eager pins the entire bound (which may itself be the full mesh).
-func (c *Coordinator) eagerSeedPairs(area *beeline.Area) ([]beeline.PairKey, error) {
+// eagerSeedPairs is the set of one layer's pairs to pin fresh at enable time, chosen
+// by the area's warm strategy. lazy pins nothing; hybrid pins the layer's core near
+// field (and only when a positive core radius is set — a zero core is an empty core,
+// not the full-mesh sentinel); eager pins the layer's entire bound (which may itself
+// be the full mesh).
+func (c *Coordinator) eagerSeedPairs(area *beeline.Area, layer beeline.Layer, cells []beeline.H3Cell) ([]beeline.PairKey, error) {
 	switch area.WarmStrategy {
 	case beeline.WarmLazy:
 		return nil, nil
 	case beeline.WarmHybrid:
-		if area.CoreRadiusMeters <= 0 {
+		if layer.CoreRadiusMeters <= 0 {
 			return nil, nil
 		}
 
-		return tessellate.PairsFromCells(area.ID, area.Cells, area.Resolution, area.CoreRadiusMeters, c.profiles)
+		return tessellate.PairsFromCells(area.ID, cells, layer.Resolution, layer.CoreRadiusMeters, c.profiles)
 	default: // WarmEager
-		return tessellate.PairsFromCells(area.ID, area.Cells, area.Resolution, area.MaxRadiusMeters, c.profiles)
+		return tessellate.PairsFromCells(area.ID, cells, layer.Resolution, layer.MaxRadiusMeters, c.profiles)
 	}
 }
 
@@ -688,38 +673,83 @@ func normalizeStrategy(s beeline.WarmStrategy) beeline.WarmStrategy {
 	return s
 }
 
-// validateAreaFields rejects area metadata the tessellator or store would refuse. A
-// maxRadiusMeters of 0 is the full-mesh sentinel (every in-area pair); any positive
-// value is a travel-radius bound. The core radius is only meaningful for the hybrid
-// strategy and must lie within [0, max]. A full-mesh area (max == 0) must be eager,
-// since there is no bounded tail to fill on demand.
-func validateAreaFields(name string, resolution int, maxRadiusMeters, coreRadiusMeters float64, strategy beeline.WarmStrategy, demandIdleTTL time.Duration) error {
+// validateAreaFields rejects area metadata the store would refuse; the layer list
+// has its own validator (normalizeAndValidateLayers).
+func validateAreaFields(name string, strategy beeline.WarmStrategy, demandIdleTTL time.Duration) error {
 	if name == "" {
 		return errors.New("control: area name is required")
 	}
-	if resolution < 0 || resolution > 15 {
-		return fmt.Errorf("control: resolution %d out of range [0,15]", resolution)
-	}
-	if maxRadiusMeters < 0 {
-		return fmt.Errorf("control: max radius meters %.2f must be >= 0 (0 = full mesh)", maxRadiusMeters)
-	}
 	if !strategy.Valid() {
 		return fmt.Errorf("control: unknown warm strategy %q (want eager, lazy, or hybrid)", strategy)
-	}
-	if maxRadiusMeters == 0 && strategy != beeline.WarmEager {
-		return fmt.Errorf("control: full-mesh area (maxRadiusMeters 0) must use the eager strategy, got %q", strategy)
-	}
-	if coreRadiusMeters < 0 {
-		return fmt.Errorf("control: core radius meters %.2f must be >= 0", coreRadiusMeters)
-	}
-	if maxRadiusMeters > 0 && coreRadiusMeters > maxRadiusMeters {
-		return fmt.Errorf("control: core radius meters %.2f must be <= max radius meters %.2f", coreRadiusMeters, maxRadiusMeters)
 	}
 	if demandIdleTTL < 0 {
 		return fmt.Errorf("control: demand idle TTL %v must be >= 0 (0 = decay disabled)", demandIdleTTL)
 	}
 
 	return nil
+}
+
+// normalizeAndValidateLayers sorts the layer list finest→coarsest (descending
+// resolution — the ordering invariant Area.Layers carries everywhere) and validates
+// it as a whole:
+//
+//   - at least one layer; resolutions unique, each in [0,15];
+//   - the finest layer serves reads today, so its MinDistanceMeters must be 0, and
+//     min distances must not decrease toward coarser layers (a coarser layer serves
+//     longer trips — the DoorDash-style selection the field is recorded for);
+//   - per layer, a maxRadiusMeters of 0 is the full-mesh sentinel (every in-layer
+//     pair) and requires the eager strategy, since there is no bounded tail to fill
+//     on demand; any positive value is a travel-radius bound and must clear the
+//     layer's neighbor floor (a bound so small it reaches no neighbor cell would
+//     degenerate to self-pairs only), with the hybrid core inside it.
+//
+// sample is a representative in-area coordinate (tessellate.SamplePoint) used to
+// derive each layer's floor cell without polyfilling.
+func normalizeAndValidateLayers(in []beeline.Layer, strategy beeline.WarmStrategy, sample beeline.LatLng) ([]beeline.Layer, error) {
+	if len(in) == 0 {
+		return nil, errors.New("control: at least one layer is required")
+	}
+
+	layers := slices.Clone(in)
+	slices.SortFunc(layers, func(a, b beeline.Layer) int { return b.Resolution - a.Resolution })
+
+	for i := range layers {
+		layer := layers[i]
+		if layer.Resolution < 0 || layer.Resolution > 15 {
+			return nil, fmt.Errorf("control: layer resolution %d out of range [0,15]", layer.Resolution)
+		}
+		if i > 0 && layer.Resolution == layers[i-1].Resolution {
+			return nil, fmt.Errorf("control: duplicate layer resolution %d", layer.Resolution)
+		}
+		if layer.MinDistanceMeters < 0 {
+			return nil, fmt.Errorf("control: layer res %d: min distance meters %.2f must be >= 0", layer.Resolution, layer.MinDistanceMeters)
+		}
+		if i == 0 && layer.MinDistanceMeters != 0 {
+			return nil, fmt.Errorf("control: the finest layer (res %d) serves all reads and must have min distance 0, got %.2f", layer.Resolution, layer.MinDistanceMeters)
+		}
+		if i > 0 && layer.MinDistanceMeters < layers[i-1].MinDistanceMeters {
+			return nil, fmt.Errorf("control: layer res %d: min distance %.2f is below the finer res-%d layer's %.2f (coarser layers serve longer trips)",
+				layer.Resolution, layer.MinDistanceMeters, layers[i-1].Resolution, layers[i-1].MinDistanceMeters)
+		}
+		if layer.MaxRadiusMeters < 0 {
+			return nil, fmt.Errorf("control: layer res %d: max radius meters %.2f must be >= 0 (0 = full mesh)", layer.Resolution, layer.MaxRadiusMeters)
+		}
+		if layer.MaxRadiusMeters == 0 && strategy != beeline.WarmEager {
+			return nil, fmt.Errorf("control: full-mesh layer (res %d, maxRadiusMeters 0) must use the eager strategy, got %q", layer.Resolution, strategy)
+		}
+		if layer.CoreRadiusMeters < 0 {
+			return nil, fmt.Errorf("control: layer res %d: core radius meters %.2f must be >= 0", layer.Resolution, layer.CoreRadiusMeters)
+		}
+		if layer.MaxRadiusMeters > 0 && layer.CoreRadiusMeters > layer.MaxRadiusMeters {
+			return nil, fmt.Errorf("control: layer res %d: core radius meters %.2f must be <= max radius meters %.2f",
+				layer.Resolution, layer.CoreRadiusMeters, layer.MaxRadiusMeters)
+		}
+		if err := validateRadiusFloor(layer, sample); err != nil {
+			return nil, err
+		}
+	}
+
+	return layers, nil
 }
 
 // resolveFreshness fills any unset (non-positive) per-area freshness knob from the
@@ -749,37 +779,29 @@ func (c *Coordinator) resolveFreshness(targetTTL, lease, sweep time.Duration) (r
 }
 
 // validateRadiusFloor rejects a bounded travel radius so small it reaches no neighbor
-// cell at the area's resolution — the degenerate case where every origin pairs only
-// with itself (RingsForRadius == 0). A full-mesh area (maxRadiusMeters == 0) has no
-// floor; an area with no cells yet is skipped (it has no pairs to build). The floor is
-// measured from a representative cell (the same cells[0] PairsFromCells derives its ring
-// count from), so acceptance here matches the pair set the tessellator will actually build.
-func validateRadiusFloor(resolution int, maxRadiusMeters float64, cells []beeline.H3Cell) error {
-	if maxRadiusMeters <= 0 || len(cells) == 0 {
+// cell at the layer's resolution — the degenerate case where every origin pairs only
+// with itself (RingsForRadius == 0). A full-mesh layer (maxRadiusMeters == 0) has no
+// floor. The floor is measured from the cell containing the geometry's sample point,
+// a representative of the cells PairsFromCells will derive its ring count from, so
+// acceptance here matches the pair set the tessellator will actually build.
+func validateRadiusFloor(layer beeline.Layer, sample beeline.LatLng) error {
+	if layer.MaxRadiusMeters <= 0 {
 		return nil
 	}
 
-	floor, err := tessellate.MinRadiusForNeighbors(cells[0])
+	cell, err := beeline.CellAt(sample, layer.Resolution)
 	if err != nil {
 		return err
 	}
-	if maxRadiusMeters < floor {
+	floor, err := tessellate.MinRadiusForNeighbors(cell)
+	if err != nil {
+		return err
+	}
+	if layer.MaxRadiusMeters < floor {
 		return fmt.Errorf(
 			"control: max radius %.0fm is below the res-%d neighbor floor of ~%.0fm; raise it or use 0 (full mesh)",
-			maxRadiusMeters, resolution, floor,
+			layer.MaxRadiusMeters, layer.Resolution, floor,
 		)
-	}
-
-	return nil
-}
-
-// validateCellResolution ensures every cell matches the area resolution, so a
-// hand-supplied or added cell set cannot mix resolutions.
-func validateCellResolution(cells []beeline.H3Cell, resolution int) error {
-	for _, cell := range cells {
-		if cell.Resolution() != resolution {
-			return fmt.Errorf("control: cell %s is resolution %d, want %d", cell, cell.Resolution(), resolution)
-		}
 	}
 
 	return nil

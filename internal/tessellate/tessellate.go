@@ -1,10 +1,9 @@
 // Package tessellate turns a service area into the set of origin→destination pairs
 // the freshness index must keep fresh. It stands in for the design's ingestion path
-// (§7: polyfill → seed pair set). An area's cells come either from polyfilling an
-// uploaded GeoJSON polygon (CellsFromGeoJSON) or from a center cell and a ring count
-// (Seed); either way PairsFromCells derives the directed pair set. Operators refine
-// the cell set by hand (add/remove hexes) to carve out water or anywhere else that
-// should not be covered.
+// (§7: polyfill → seed pair set). An area's canonical geometry is its GeoJSON
+// polygon; each of the area's layers polyfills it at that layer's resolution
+// (CellsFromGeoJSON) and PairsFromCells derives the directed pair set from the
+// resulting cells.
 package tessellate
 
 import (
@@ -21,57 +20,10 @@ import (
 // resolves in a handful of rings; this is a safety backstop, not an operational limit.
 const maxRings = 10000
 
-// Area describes the service area and the pruning that keeps the pair set from
-// being quadratic (§7). The area is every cell within AreaRings of the center; for
-// each origin, destinations are only those within MaxRadiusMeters (the travel-radius
-// bound, in meters) that are also inside the area.
-type Area struct {
-	Center          beeline.LatLng
-	Resolution      int
-	AreaRings       int
-	MaxRadiusMeters float64
-}
-
-// Result is the output of tessellation: the cells covering the area and the
-// directed pair set (one entry per origin × reachable-destination × profile).
-type Result struct {
-	Cells []beeline.H3Cell
-	Pairs []beeline.PairKey
-}
-
-// Seed builds the pair set for the area across the given profiles. Origin-centric:
-// each origin contributes a dense ring of nearby destinations (§6), which is the
-// shape the refresh worker packs into a single 1×K table request.
-func Seed(area Area, profiles []beeline.Profile) (Result, error) {
-	if area.Resolution < 0 || area.Resolution > 15 {
-		return Result{}, fmt.Errorf("tessellate: resolution %d out of range [0,15]", area.Resolution)
-	}
-	if len(profiles) == 0 {
-		return Result{}, fmt.Errorf("tessellate: at least one profile required")
-	}
-
-	center, err := h3.LatLngToCell(h3.NewLatLng(area.Center.Lat, area.Center.Lng), area.Resolution)
-	if err != nil {
-		return Result{}, fmt.Errorf("tessellate: locating center cell: %w", err)
-	}
-
-	cells, err := h3.GridDisk(center, area.AreaRings)
-	if err != nil {
-		return Result{}, fmt.Errorf("tessellate: covering area: %w", err)
-	}
-
-	pairs, err := PairsFromCells(0, cells, area.Resolution, area.MaxRadiusMeters, profiles)
-	if err != nil {
-		return Result{}, err
-	}
-
-	return Result{Cells: cells, Pairs: pairs}, nil
-}
-
 // PairsFromCells builds the directed origin→destination pair set for an explicit set
 // of area cells, tagging every pair with the given service area. This is the
-// area-agnostic half of tessellation: whatever produced the cell set (a ring disk, a
-// GeoJSON polyfill, or manual hex editing), the pair set is derived the same way.
+// area-agnostic half of tessellation: whatever produced the cell set (a GeoJSON
+// polyfill, a test's ring disk), the pair set is derived the same way.
 //
 // Origin-centric (§6): each origin contributes a dense ring of destinations within
 // radiusMeters that are also inside the area, which is the shape the refresh worker

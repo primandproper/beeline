@@ -49,6 +49,28 @@ func CellsFromGeoJSON(raw []byte, resolution int) ([]beeline.H3Cell, error) {
 	return cells, nil
 }
 
+// SamplePoint returns a representative coordinate of the geometry — the first
+// vertex of the first polygon's outer ring — validating along the way that raw
+// parses to at least one polygon. Callers use it where they need one in-area
+// point without paying for a polyfill (e.g. deriving a sample cell per layer
+// resolution for radius-floor validation).
+func SamplePoint(raw []byte) (beeline.LatLng, error) {
+	polygons, err := polygonsFromGeoJSON(raw)
+	if err != nil {
+		return beeline.LatLng{}, err
+	}
+	if len(polygons) == 0 {
+		return beeline.LatLng{}, fmt.Errorf("tessellate: geojson contained no Polygon/MultiPolygon geometry")
+	}
+
+	loop := polygons[0].GeoLoop
+	if len(loop) == 0 {
+		return beeline.LatLng{}, fmt.Errorf("tessellate: polygon outer ring is empty")
+	}
+
+	return beeline.LatLng{Lat: loop[0].Lat, Lng: loop[0].Lng}, nil
+}
+
 // geometry is a minimal GeoJSON geometry: a type discriminator plus raw coordinates
 // decoded per-type (Polygon: [][]position, MultiPolygon: [][][]position).
 type geometry struct {

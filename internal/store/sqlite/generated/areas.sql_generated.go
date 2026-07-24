@@ -9,29 +9,10 @@ import (
 	"context"
 )
 
-const addAreaCell = `-- name: AddAreaCell :exec
-INSERT INTO area_cells (area_id, cell)
-VALUES (?1, ?2)
-ON CONFLICT (area_id, cell) DO NOTHING
-`
-
-type AddAreaCellParams struct {
-	AreaID int64
-	Cell   string
-}
-
-func (q *Queries) AddAreaCell(ctx context.Context, db DBTX, arg *AddAreaCellParams) error {
-	_, err := db.ExecContext(ctx, addAreaCell, arg.AreaID, arg.Cell)
-	return err
-}
-
 const createArea = `-- name: CreateArea :one
 INSERT INTO areas (
     name,
-    resolution,
-    radius_meters,
     warm_strategy,
-    core_radius_meters,
     demand_idle_ttl_seconds,
     target_ttl_seconds,
     lease_duration_seconds,
@@ -52,20 +33,14 @@ INSERT INTO areas (
     ?8,
     ?9,
     ?10,
-    ?11,
-    ?12,
-    ?13,
-    ?14
+    ?11
 )
 RETURNING id
 `
 
 type CreateAreaParams struct {
 	Name                 string
-	Resolution           int64
-	RadiusMeters         float64
 	WarmStrategy         string
-	CoreRadiusMeters     float64
 	DemandIdleTtlSeconds int64
 	TargetTtlSeconds     int64
 	LeaseDurationSeconds int64
@@ -80,10 +55,7 @@ type CreateAreaParams struct {
 func (q *Queries) CreateArea(ctx context.Context, db DBTX, arg *CreateAreaParams) (int64, error) {
 	row := db.QueryRowContext(ctx, createArea,
 		arg.Name,
-		arg.Resolution,
-		arg.RadiusMeters,
 		arg.WarmStrategy,
-		arg.CoreRadiusMeters,
 		arg.DemandIdleTtlSeconds,
 		arg.TargetTtlSeconds,
 		arg.LeaseDurationSeconds,
@@ -109,13 +81,13 @@ func (q *Queries) DeleteArea(ctx context.Context, db DBTX, id int64) error {
 	return err
 }
 
-const deleteAreaCells = `-- name: DeleteAreaCells :exec
-DELETE FROM area_cells
+const deleteAreaLayers = `-- name: DeleteAreaLayers :exec
+DELETE FROM area_layers
 WHERE area_id = ?1
 `
 
-func (q *Queries) DeleteAreaCells(ctx context.Context, db DBTX, areaID int64) error {
-	_, err := db.ExecContext(ctx, deleteAreaCells, areaID)
+func (q *Queries) DeleteAreaLayers(ctx context.Context, db DBTX, areaID int64) error {
+	_, err := db.ExecContext(ctx, deleteAreaLayers, areaID)
 	return err
 }
 
@@ -123,10 +95,7 @@ const getArea = `-- name: GetArea :one
 SELECT
     id,
     name,
-    resolution,
-    radius_meters,
     warm_strategy,
-    core_radius_meters,
     demand_idle_ttl_seconds,
     geojson,
     enabled,
@@ -146,10 +115,7 @@ func (q *Queries) GetArea(ctx context.Context, db DBTX, id int64) (*Areas, error
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
-		&i.Resolution,
-		&i.RadiusMeters,
 		&i.WarmStrategy,
-		&i.CoreRadiusMeters,
 		&i.DemandIdleTtlSeconds,
 		&i.Geojson,
 		&i.Enabled,
@@ -163,26 +129,72 @@ func (q *Queries) GetArea(ctx context.Context, db DBTX, id int64) (*Areas, error
 	return &i, err
 }
 
-const listAreaCells = `-- name: ListAreaCells :many
-SELECT cell
-FROM area_cells
-WHERE area_id = ?1
-ORDER BY cell
+const insertAreaLayer = `-- name: InsertAreaLayer :exec
+INSERT INTO area_layers (
+    area_id,
+    resolution,
+    min_distance_meters,
+    max_radius_meters,
+    core_radius_meters
+) VALUES (
+    ?1,
+    ?2,
+    ?3,
+    ?4,
+    ?5
+)
 `
 
-func (q *Queries) ListAreaCells(ctx context.Context, db DBTX, areaID int64) ([]string, error) {
-	rows, err := db.QueryContext(ctx, listAreaCells, areaID)
+type InsertAreaLayerParams struct {
+	AreaID            int64
+	Resolution        int64
+	MinDistanceMeters float64
+	MaxRadiusMeters   float64
+	CoreRadiusMeters  float64
+}
+
+func (q *Queries) InsertAreaLayer(ctx context.Context, db DBTX, arg *InsertAreaLayerParams) error {
+	_, err := db.ExecContext(ctx, insertAreaLayer,
+		arg.AreaID,
+		arg.Resolution,
+		arg.MinDistanceMeters,
+		arg.MaxRadiusMeters,
+		arg.CoreRadiusMeters,
+	)
+	return err
+}
+
+const listAreaLayers = `-- name: ListAreaLayers :many
+SELECT
+    area_id,
+    resolution,
+    min_distance_meters,
+    max_radius_meters,
+    core_radius_meters
+FROM area_layers
+WHERE area_id = ?1
+ORDER BY resolution DESC
+`
+
+func (q *Queries) ListAreaLayers(ctx context.Context, db DBTX, areaID int64) ([]*AreaLayers, error) {
+	rows, err := db.QueryContext(ctx, listAreaLayers, areaID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []string{}
+	items := []*AreaLayers{}
 	for rows.Next() {
-		var cell string
-		if err := rows.Scan(&cell); err != nil {
+		var i AreaLayers
+		if err := rows.Scan(
+			&i.AreaID,
+			&i.Resolution,
+			&i.MinDistanceMeters,
+			&i.MaxRadiusMeters,
+			&i.CoreRadiusMeters,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, cell)
+		items = append(items, &i)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -197,10 +209,7 @@ const listAreas = `-- name: ListAreas :many
 SELECT
     id,
     name,
-    resolution,
-    radius_meters,
     warm_strategy,
-    core_radius_meters,
     demand_idle_ttl_seconds,
     geojson,
     enabled,
@@ -226,10 +235,7 @@ func (q *Queries) ListAreas(ctx context.Context, db DBTX) ([]*Areas, error) {
 		if err := rows.Scan(
 			&i.ID,
 			&i.Name,
-			&i.Resolution,
-			&i.RadiusMeters,
 			&i.WarmStrategy,
-			&i.CoreRadiusMeters,
 			&i.DemandIdleTtlSeconds,
 			&i.Geojson,
 			&i.Enabled,
@@ -251,21 +257,6 @@ func (q *Queries) ListAreas(ctx context.Context, db DBTX) ([]*Areas, error) {
 		return nil, err
 	}
 	return items, nil
-}
-
-const removeAreaCell = `-- name: RemoveAreaCell :exec
-DELETE FROM area_cells
-WHERE area_id = ?1 AND cell = ?2
-`
-
-type RemoveAreaCellParams struct {
-	AreaID int64
-	Cell   string
-}
-
-func (q *Queries) RemoveAreaCell(ctx context.Context, db DBTX, arg *RemoveAreaCellParams) error {
-	_, err := db.ExecContext(ctx, removeAreaCell, arg.AreaID, arg.Cell)
-	return err
 }
 
 const setAreaEnabled = `-- name: SetAreaEnabled :exec
@@ -291,26 +282,20 @@ const updateArea = `-- name: UpdateArea :exec
 UPDATE areas
 SET
     name = ?1,
-    resolution = ?2,
-    radius_meters = ?3,
-    warm_strategy = ?4,
-    core_radius_meters = ?5,
-    demand_idle_ttl_seconds = ?6,
-    target_ttl_seconds = ?7,
-    lease_duration_seconds = ?8,
-    sweep_interval_seconds = ?9,
-    routing_provider = ?10,
-    geojson = ?11,
-    updated_at = ?12
-WHERE id = ?13
+    warm_strategy = ?2,
+    demand_idle_ttl_seconds = ?3,
+    target_ttl_seconds = ?4,
+    lease_duration_seconds = ?5,
+    sweep_interval_seconds = ?6,
+    routing_provider = ?7,
+    geojson = ?8,
+    updated_at = ?9
+WHERE id = ?10
 `
 
 type UpdateAreaParams struct {
 	Name                 string
-	Resolution           int64
-	RadiusMeters         float64
 	WarmStrategy         string
-	CoreRadiusMeters     float64
 	DemandIdleTtlSeconds int64
 	TargetTtlSeconds     int64
 	LeaseDurationSeconds int64
@@ -324,10 +309,7 @@ type UpdateAreaParams struct {
 func (q *Queries) UpdateArea(ctx context.Context, db DBTX, arg *UpdateAreaParams) error {
 	_, err := db.ExecContext(ctx, updateArea,
 		arg.Name,
-		arg.Resolution,
-		arg.RadiusMeters,
 		arg.WarmStrategy,
-		arg.CoreRadiusMeters,
 		arg.DemandIdleTtlSeconds,
 		arg.TargetTtlSeconds,
 		arg.LeaseDurationSeconds,

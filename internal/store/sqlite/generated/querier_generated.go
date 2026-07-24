@@ -9,14 +9,13 @@ import (
 )
 
 type Querier interface {
-	AddAreaCell(ctx context.Context, db DBTX, arg *AddAreaCellParams) error
 	CreateArea(ctx context.Context, db DBTX, arg *CreateAreaParams) (int64, error)
 	DeleteArea(ctx context.Context, db DBTX, id int64) error
-	DeleteAreaCells(ctx context.Context, db DBTX, areaID int64) error
+	DeleteAreaLayers(ctx context.Context, db DBTX, areaID int64) error
 	GetArea(ctx context.Context, db DBTX, id int64) (*Areas, error)
-	ListAreaCells(ctx context.Context, db DBTX, areaID int64) ([]string, error)
+	InsertAreaLayer(ctx context.Context, db DBTX, arg *InsertAreaLayerParams) error
+	ListAreaLayers(ctx context.Context, db DBTX, areaID int64) ([]*AreaLayers, error)
 	ListAreas(ctx context.Context, db DBTX) ([]*Areas, error)
-	RemoveAreaCell(ctx context.Context, db DBTX, arg *RemoveAreaCellParams) error
 	SetAreaEnabled(ctx context.Context, db DBTX, arg *SetAreaEnabledParams) error
 	UpdateArea(ctx context.Context, db DBTX, arg *UpdateAreaParams) error
 }

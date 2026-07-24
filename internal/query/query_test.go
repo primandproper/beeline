@@ -31,7 +31,11 @@ func (f fakeRouter) Locate(beeline.LatLng) (beeline.RoutedArea, bool) {
 		return beeline.RoutedArea{}, false
 	}
 
-	return beeline.RoutedArea{ID: f.id, Resolution: f.resolution, MaxRadiusMeters: f.maxRadius, TargetTTL: f.targetTTL}, true
+	return beeline.RoutedArea{
+		ID:        f.id,
+		Layers:    []beeline.RoutedLayer{{Resolution: f.resolution, MaxRadiusMeters: f.maxRadius}},
+		TargetTTL: f.targetTTL,
+	}, true
 }
 
 const testArea = beeline.AreaID(1)
@@ -483,8 +487,8 @@ func TestTableSpansMultipleAreas(t *testing.T) {
 	dest := beeline.LatLng{Lat: 37.7949, Lng: -122.4194} // near srcA; far from srcB
 
 	router := coordRouter{areas: map[beeline.LatLng]beeline.RoutedArea{
-		srcA: {ID: areaA, Resolution: 9, MaxRadiusMeters: 0, TargetTTL: time.Minute},
-		srcB: {ID: areaB, Resolution: 7, MaxRadiusMeters: 0, TargetTTL: time.Minute},
+		srcA: {ID: areaA, Layers: []beeline.RoutedLayer{{Resolution: 9}}, TargetTTL: time.Minute},
+		srcB: {ID: areaB, Layers: []beeline.RoutedLayer{{Resolution: 7}}, TargetTTL: time.Minute},
 	}}
 	handler := query.NewHandler(store, index, fixedResolver{engine: engine}, router, nil)
 	ctx := context.Background()

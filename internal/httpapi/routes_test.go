@@ -29,7 +29,7 @@ import (
 type oneArea struct{}
 
 func (oneArea) Locate(beeline.LatLng) (beeline.RoutedArea, bool) {
-	return beeline.RoutedArea{ID: 1, Resolution: 9, TargetTTL: time.Minute}, true
+	return beeline.RoutedArea{ID: 1, Layers: []beeline.RoutedLayer{{Resolution: 9}}, TargetTTL: time.Minute}, true
 }
 
 // oneEngine serves every area through one engine.
@@ -53,7 +53,7 @@ type tableEnvelope struct {
 	} `json:"meta"`
 }
 
-func newTestRouter(t *testing.T) http.Handler {
+func newTestRouter(t *testing.T) (http.Handler, *memstore.Store) {
 	t.Helper()
 
 	store := memstore.New()
@@ -67,9 +67,9 @@ func newTestRouter(t *testing.T) http.Handler {
 		metricsnoop.NewMetricsProvider(),
 		&chirouter.Config{ServiceName: "test"},
 	)
-	httpapi.Register(router, &httpapi.Deps{Handler: handler, DefaultProfile: "car"})
+	httpapi.Register(router, &httpapi.Deps{Handler: handler, Store: store, DefaultProfile: "car"})
 
-	return router.Handler()
+	return router.Handler(), store
 }
 
 func postTable(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
@@ -85,7 +85,7 @@ func postTable(t *testing.T, h http.Handler, body string) *httptest.ResponseReco
 func TestTableEndpointDenseMatricesAndSkip(t *testing.T) {
 	t.Parallel()
 
-	h := newTestRouter(t)
+	h, _ := newTestRouter(t)
 
 	// A 1×2 grid, demand-filling the first cell and skipping the second.
 	body := `{
@@ -120,7 +120,7 @@ func TestTableEndpointDenseMatricesAndSkip(t *testing.T) {
 func TestTableEndpointCacheOnlyLeavesMissesNull(t *testing.T) {
 	t.Parallel()
 
-	h := newTestRouter(t)
+	h, _ := newTestRouter(t)
 
 	body := `{
 		"sources": ["37.7749,-122.4194"],
@@ -153,7 +153,90 @@ func TestTableEndpointRejectsBadInput(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			rec := postTable(t, newTestRouter(t), body)
+			h, _ := newTestRouter(t)
+			rec := postTable(t, h, body)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for %s", name)
+		})
+	}
+}
+
+func postPairs(t *testing.T, h http.Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/_ops_/pairs", bytes.NewReader([]byte(body)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	return rec
+}
+
+// pairsEnvelope mirrors the /_ops_/pairs response wire shape.
+type pairsEnvelope struct {
+	Pairs []struct {
+		Dest           string  `json:"dest"`
+		ComputedAt     string  `json:"computedAt"`
+		DurationSec    float64 `json:"durationSec"`
+		DistanceMeters float64 `json:"distanceMeters"`
+	} `json:"pairs"`
+}
+
+func TestPairsEndpointReturnsOnlyCachedAtOwnResolution(t *testing.T) {
+	t.Parallel()
+
+	h, store := newTestRouter(t)
+
+	// Two res-7 neighbor cells with a cached estimate — a coarser resolution than
+	// the routed area's res 9, unreachable through /estimate or /table, but exactly
+	// what the hover probe must see.
+	origin, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, 7)
+	require.NoError(t, err)
+	cached, err := beeline.CellAt(beeline.LatLng{Lat: 37.85, Lng: -122.4194}, 7)
+	require.NoError(t, err)
+	uncached, err := beeline.CellAt(beeline.LatLng{Lat: 37.70, Lng: -122.4194}, 7)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Put(context.Background(), []beeline.Entry{{
+		Key:    beeline.PairKey{Area: 1, Origin: origin, Dest: cached, Profile: "car", Res: 7},
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 321, Distance: 4200}, ComputedAt: time.Now()},
+	}}))
+
+	body := `{"area": 1, "origin": "` + origin.String() + `", "dests": ["` +
+		cached.String() + `", "` + uncached.String() + `"]}`
+	rec := postPairs(t, h, body)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var env pairsEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+	require.Len(t, env.Pairs, 1, "only the cached pair is returned")
+	assert.Equal(t, cached.String(), env.Pairs[0].Dest)
+	assert.InDelta(t, 321, env.Pairs[0].DurationSec, 1e-9)
+	assert.InDelta(t, 4200, env.Pairs[0].DistanceMeters, 1e-9)
+	assert.NotEmpty(t, env.Pairs[0].ComputedAt)
+}
+
+func TestPairsEndpointRejectsBadInput(t *testing.T) {
+	t.Parallel()
+
+	origin, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, 7)
+	require.NoError(t, err)
+	res9, err := beeline.CellAt(beeline.LatLng{Lat: 37.7749, Lng: -122.4194}, 9)
+	require.NoError(t, err)
+
+	cases := map[string]string{
+		"malformed json": `{"area":`,
+		"missing area":   `{"origin": "` + origin.String() + `", "dests": ["` + origin.String() + `"]}`,
+		"empty dests":    `{"area": 1, "origin": "` + origin.String() + `", "dests": []}`,
+		"invalid origin": `{"area": 1, "origin": "nope", "dests": ["` + origin.String() + `"]}`,
+		"invalid dest":   `{"area": 1, "origin": "` + origin.String() + `", "dests": ["nope"]}`,
+		"mixed-res dest": `{"area": 1, "origin": "` + origin.String() + `", "dests": ["` + res9.String() + `"]}`,
+	}
+
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h, _ := newTestRouter(t)
+			rec := postPairs(t, h, body)
 			assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for %s", name)
 		})
 	}

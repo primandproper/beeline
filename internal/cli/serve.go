@@ -136,6 +136,7 @@ func (a *application) serve(ctx context.Context) error {
 	httpapi.Register(router, &httpapi.Deps{
 		Handler:        handler,
 		Index:          index,
+		Store:          store,
 		Coordinator:    coordinator,
 		Health:         healthcheck.NewRegistry(),
 		Logger:         a.logger,

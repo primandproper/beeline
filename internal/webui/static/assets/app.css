@@ -178,6 +178,51 @@ button.ghost.danger:hover { border-color: var(--stale); color: var(--stale); }
 }
 .detail-grid .dv { font-family: var(--mono); font-size: 15px; }
 
+/* Precision layers table (display-only). */
+.layers-table {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.layers-table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  font-weight: 600;
+  text-align: left;
+  padding: 2px 6px 4px 0;
+}
+.layers-table td {
+  padding: 3px 6px 3px 0;
+  border-top: 1px solid var(--border);
+}
+.layers-table tbody tr { cursor: pointer; }
+.layers-table tbody tr:hover td { background: var(--panel-2); }
+.layers-table tbody tr.active td {
+  background: rgba(255, 180, 84, 0.12);
+  color: var(--text);
+}
+
+/* Hover-estimate labels: cached duration/distance floated over neighbor cells. */
+.cell-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: max-content;
+  transform: translate(-50%, -50%);
+  font-family: var(--mono);
+  line-height: 1.15;
+  text-align: center;
+  pointer-events: none;
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.9), 0 0 6px rgba(0, 0, 0, 0.7);
+}
+.cell-label .t { font-size: 11px; font-weight: 700; color: #fff; }
+.cell-label .d { font-size: 10px; color: #cdd6e4; }
+.cell-label.missing .d { color: rgba(205, 214, 228, 0.45); text-shadow: none; }
+
 .text {
   width: 100%;
   background: var(--panel-2);

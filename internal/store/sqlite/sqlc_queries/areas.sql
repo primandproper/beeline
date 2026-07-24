@@ -1,10 +1,7 @@
 -- name: CreateArea :one
 INSERT INTO areas (
     name,
-    resolution,
-    radius_meters,
     warm_strategy,
-    core_radius_meters,
     demand_idle_ttl_seconds,
     target_ttl_seconds,
     lease_duration_seconds,
@@ -16,10 +13,7 @@ INSERT INTO areas (
     updated_at
 ) VALUES (
     sqlc.arg(name),
-    sqlc.arg(resolution),
-    sqlc.arg(radius_meters),
     sqlc.arg(warm_strategy),
-    sqlc.arg(core_radius_meters),
     sqlc.arg(demand_idle_ttl_seconds),
     sqlc.arg(target_ttl_seconds),
     sqlc.arg(lease_duration_seconds),
@@ -36,10 +30,7 @@ RETURNING id;
 SELECT
     id,
     name,
-    resolution,
-    radius_meters,
     warm_strategy,
-    core_radius_meters,
     demand_idle_ttl_seconds,
     geojson,
     enabled,
@@ -56,10 +47,7 @@ WHERE id = sqlc.arg(id);
 SELECT
     id,
     name,
-    resolution,
-    radius_meters,
     warm_strategy,
-    core_radius_meters,
     demand_idle_ttl_seconds,
     geojson,
     enabled,
@@ -76,10 +64,7 @@ ORDER BY id;
 UPDATE areas
 SET
     name = sqlc.arg(name),
-    resolution = sqlc.arg(resolution),
-    radius_meters = sqlc.arg(radius_meters),
     warm_strategy = sqlc.arg(warm_strategy),
-    core_radius_meters = sqlc.arg(core_radius_meters),
     demand_idle_ttl_seconds = sqlc.arg(demand_idle_ttl_seconds),
     target_ttl_seconds = sqlc.arg(target_ttl_seconds),
     lease_duration_seconds = sqlc.arg(lease_duration_seconds),
@@ -100,21 +85,32 @@ WHERE id = sqlc.arg(id);
 DELETE FROM areas
 WHERE id = sqlc.arg(id);
 
--- name: ListAreaCells :many
-SELECT cell
-FROM area_cells
+-- name: ListAreaLayers :many
+SELECT
+    area_id,
+    resolution,
+    min_distance_meters,
+    max_radius_meters,
+    core_radius_meters
+FROM area_layers
 WHERE area_id = sqlc.arg(area_id)
-ORDER BY cell;
+ORDER BY resolution DESC;
 
--- name: AddAreaCell :exec
-INSERT INTO area_cells (area_id, cell)
-VALUES (sqlc.arg(area_id), sqlc.arg(cell))
-ON CONFLICT (area_id, cell) DO NOTHING;
+-- name: InsertAreaLayer :exec
+INSERT INTO area_layers (
+    area_id,
+    resolution,
+    min_distance_meters,
+    max_radius_meters,
+    core_radius_meters
+) VALUES (
+    sqlc.arg(area_id),
+    sqlc.arg(resolution),
+    sqlc.arg(min_distance_meters),
+    sqlc.arg(max_radius_meters),
+    sqlc.arg(core_radius_meters)
+);
 
--- name: RemoveAreaCell :exec
-DELETE FROM area_cells
-WHERE area_id = sqlc.arg(area_id) AND cell = sqlc.arg(cell);
-
--- name: DeleteAreaCells :exec
-DELETE FROM area_cells
+-- name: DeleteAreaLayers :exec
+DELETE FROM area_layers
 WHERE area_id = sqlc.arg(area_id);

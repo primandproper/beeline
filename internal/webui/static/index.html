@@ -89,8 +89,8 @@
         </div>
         <div class="field">
           <label for="new-geojson">GeoJSON polygon</label>
-          <input type="file" id="new-geojson" accept=".json,.geojson,application/geo+json,application/json" />
-          <div class="hint">Upload a Polygon / MultiPolygon (Feature or FeatureCollection). Or leave empty and add hexes by hand.</div>
+          <input type="file" id="new-geojson" accept=".json,.geojson,application/geo+json,application/json" required />
+          <div class="hint">Required. Upload a Polygon / MultiPolygon (Feature or FeatureCollection) — the area's canonical geometry; every layer derives its cells from it.</div>
         </div>
         <div class="preview-stats" id="create-preview" hidden>
           <div class="stat"><span class="n" id="preview-cells">—</span><span class="k">cells (preview)</span></div>
@@ -108,53 +108,40 @@
           <span class="badge" id="detail-badge">disabled</span>
         </div>
         <div class="detail-grid">
-          <div><span class="dk">resolution</span><span class="dv" id="detail-res">—</span></div>
-          <div><span class="dk">max radius</span><span class="dv" id="detail-radius">—</span></div>
           <div><span class="dk">warm</span><span class="dv" id="detail-strategy">—</span></div>
           <div><span class="dk">provider</span><span class="dv" id="detail-provider">—</span></div>
           <div><span class="dk">demand TTL</span><span class="dv" id="detail-ttl">—</span></div>
           <div><span class="dk">target TTL</span><span class="dv" id="detail-target-ttl">—</span></div>
           <div><span class="dk">lease</span><span class="dv" id="detail-lease">—</span></div>
           <div><span class="dk">sweep</span><span class="dv" id="detail-sweep">—</span></div>
-          <div><span class="dk">cells</span><span class="dv" id="detail-cells">—</span></div>
         </div>
+
+        <!-- Precision layers (display-only; multi-layer areas are shaped via the API). -->
+        <table class="layers-table" id="detail-layers">
+          <thead>
+            <tr><th>res</th><th>min dist</th><th>max radius</th><th>core</th><th>cells</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
         <div class="btn-row">
           <button class="apply" id="toggle-enable">Enable</button>
           <button class="ghost" id="edit-settings-btn">Edit settings</button>
         </div>
 
-        <!-- Edit settings: PATCH the area's resolution / radius / warm knobs. -->
+        <!-- Edit settings: PATCH the area's metadata. Layers are display-only here
+             (passed through unchanged); reshape them via the API. -->
         <div class="edit-form" id="edit-settings" hidden>
           <div class="field">
             <label for="edit-name">Name</label>
             <input type="text" id="edit-name" class="text" />
           </div>
-          <div class="row">
-            <div class="field">
-              <label for="edit-res">H3 resolution <span class="val" id="edit-res-val">8</span></label>
-              <input type="range" id="edit-res" min="4" max="12" step="1" value="8" />
-              <div class="hint" id="edit-res-hint" hidden>Hand-built area — resolution is fixed. Replace its geometry to re-tessellate.</div>
-            </div>
-            <div class="field">
-              <label for="edit-radius">Max radius (m) <span class="val" id="edit-radius-val">3000</span></label>
-              <input type="range" id="edit-radius" min="0" max="20000" step="500" value="3000" />
-              <div class="hint">Per-origin travel-radius bound. 0 = full mesh (every in-area pair).</div>
-            </div>
-          </div>
-          <div class="row">
-            <div class="field">
-              <label for="edit-strategy">Warm strategy</label>
-              <select id="edit-strategy" class="text">
-                <option value="eager">eager — pin the whole bound</option>
-                <option value="lazy">lazy — demand only</option>
-                <option value="hybrid">hybrid — pin core, fill tail</option>
-              </select>
-            </div>
-            <div class="field" id="edit-core-field" hidden>
-              <label for="edit-core">Core radius (m) <span class="val" id="edit-core-val">1500</span></label>
-              <input type="range" id="edit-core" min="0" max="20000" step="500" value="1500" />
-              <div class="hint">Hybrid only: near field pinned fresh (≤ max radius).</div>
-            </div>
+          <div class="field">
+            <label for="edit-strategy">Warm strategy</label>
+            <select id="edit-strategy" class="text">
+              <option value="eager">eager — pin the whole bound</option>
+              <option value="lazy">lazy — demand only</option>
+              <option value="hybrid">hybrid — pin per-layer core, fill tail</option>
+            </select>
           </div>
           <div class="field">
             <label for="edit-provider">Routing provider</label>
@@ -190,25 +177,10 @@
         </div>
 
         <div class="btn-row">
-          <button class="ghost" id="edit-hexes">Edit hexes</button>
-          <button class="ghost" id="exclude-region">Exclude region</button>
-        </div>
-        <div class="btn-row">
           <label class="ghost file-btn">Replace GeoJSON
             <input type="file" id="replace-geojson" accept=".json,.geojson,application/geo+json,application/json" hidden />
           </label>
           <button class="ghost danger" id="delete-area">Delete</button>
-        </div>
-        <div class="hint" id="edit-hint" hidden>Click the map: hexes inside the area toggle off, hexes outside toggle on.</div>
-
-        <!-- Subtract-region editor: trace a polygon, remove the area cells it covers. -->
-        <div class="exclude-ctl" id="exclude-ctl" hidden>
-          <div class="hint">Click the map to trace a region to exclude — its cells are removed from this area. Double-back with Undo; close with Exclude.</div>
-          <div class="btn-row">
-            <button class="apply" id="exclude-apply" disabled>Exclude 0 cells</button>
-            <button class="ghost" id="exclude-undo">Undo</button>
-            <button class="ghost" id="exclude-cancel">Cancel</button>
-          </div>
         </div>
       </div>
 

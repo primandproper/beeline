@@ -17,20 +17,25 @@ The application is a **Cobra CLI**. Two subcommands:
   fresh (plus a demand-decay janitor that evicts cold demand-filled pairs on the `sweepInterval`
   cadence), and serves the read path over HTTP. Service areas live in the database (not the config file),
   are **disabled by default**, and only enter the working set once enabled — so a fresh database boots
-  with **no areas** and nothing to refresh until the operator creates and enables one. Multiple areas
-  can be enabled at once; each partitions the shared store/index by its `AreaID`. The routing engine is
+  with **no areas** and nothing to refresh until the operator creates and enables one. An area is a
+  **GeoJSON polygon plus an ordered list of precision layers** (DoorDash-style multi-resolution):
+  each layer `{resolution, minDistanceMeters, maxRadiusMeters, coreRadiusMeters}` polyfills the
+  polygon at its resolution and is precomputed/cached independently (`PairKey.Res` keeps layers
+  apart); reads key at the finest layer (`minDistanceMeters` is recorded for future distance-based
+  layer selection, not yet used). Multiple areas can be enabled at once; each partitions the shared
+  store/index by its `AreaID`. The routing engine is
   a **Haversine** stand-in (great-circle distance ÷ per-profile speed) behind the same `RoutingEngine`
   interface a real engine (OSRM/Valhalla) would implement. The hot store and freshness index are
   in-memory (only area *definitions* are persisted). `serve` also serves an **embedded operator
-  console** at `/` (see `internal/webui/`) for creating areas from GeoJSON, enabling them, refining
-  hexes, and watching the cache load.
+  console** at `/` (see `internal/webui/`) for creating areas from GeoJSON, enabling them, and
+  watching the cache load.
 
 HTTP endpoints (default `:8080`):
 
 - Read path — `GET /estimate?origin=lat,lng&dest=lat,lng&profile=car`. Routes the origin to the
   enabled area that contains it (cache hit, same-cell correction, or demand-fill against that area's
-  partition/resolution); a demand-fill is only cached when the trip is within the area's
-  `maxRadiusMeters` bound. A coordinate outside every enabled area — or a trip beyond the bound — is
+  partition, keyed at the area's finest layer); a demand-fill is only cached when the trip is within
+  that layer's `maxRadiusMeters` bound. A coordinate outside every enabled area — or a trip beyond the bound — is
   still answered directly but not cached.
 - Batch read path — `POST /table`. A sparse, OSRM-`/table`-shaped batch: a JSON body of `sources` and
   `destinations` (`"lat,lng"` strings) plus an optional `skip` denylist of `[sourceIdx, destIdx]` grid
@@ -42,13 +47,19 @@ HTTP endpoints (default `:8080`):
   `fill=false` is a pure cache read that never touches the engine. `maxTableCells` bounds the grid.
 - Freshness/progress — `GET /_ops_/freshness` (the §3 debt/throughput contract as JSON, wire shape of
   `beeline.DebtStats`; aggregate across enabled areas, or one area with `?area=<id>`) and
-  `GET /_ops_/cells` (per-origin-cell freshness rollup — `cell`/`area`/center/`total`/`fresh`/
-  `oldestAgeSeconds` — for one area with `?area=<id>` or all enabled areas otherwise).
+  `GET /_ops_/cells` (per-origin-cell freshness rollup — `cell`/`area`/`resolution`/center/
+  `total`/`fresh`/`oldestAgeSeconds` — for one area with `?area=<id>` or all enabled areas
+  otherwise; a multi-layer area's cells arrive at several resolutions side by side), and
+  `POST /_ops_/pairs` (the console's hover probe: a pure cache read of one origin cell's
+  estimates to a list of same-resolution destination cells, keyed at the cells' own
+  resolution — unlike `/estimate`/`/table`, which key at the finest layer — so any layer's
+  cached pairs are inspectable).
 - Control plane — the area registry under `/_config_/areas`, served by `internal/control` over the
-  SQLite store: `GET` (list) / `POST` (create disabled, from a GeoJSON polygon or explicit cells);
+  SQLite store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
+  `layers` list of precision levels);
   `GET`/`PATCH`/`DELETE /_config_/areas/{areaID}`; `POST …/{areaID}/enable` + `…/disable`;
-  `PUT …/{areaID}/geojson` (replace geometry); `POST …/{areaID}/cells` (`{add,remove}` hex
-  refinement). Unauthenticated, like the other endpoints; a real deploy would gate these.
+  `PUT …/{areaID}/geojson` (replace geometry). Unauthenticated, like the other endpoints; a
+  real deploy would gate these.
 - Health — `/_ops_/live` + `/_ops_/ready`.
 - UI — `GET /` (the embedded console) and `/assets/*` (its bundled JS/CSS + vendored Leaflet/h3-js).
 
@@ -73,29 +84,31 @@ HTTP endpoints (default `:8080`):
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
   `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, and freshness knobs (`targetTTL`,
   `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch). Service areas
-  — including their per-area warm strategy, radius bound, and demand-idle TTL — are not configured here;
-  they live in the database (`internal/store/sqlite`).
+  — including their per-area warm strategy, precision layers (with per-layer bounds), and demand-idle
+  TTL — are not configured here; they live in the database (`internal/store/sqlite`).
 
 ### Matrix service packages (design §5 seams)
 
 - `internal/beeline/` — domain model and the three pluggable interfaces: `RoutingEngine`, `Store`,
-  `FreshnessIndex` (§5). Core types (`Area`, `AreaID`, `PairKey` — keyed by `Area` — `Estimate`,
-  `Stored`, `DebtStats`, `RoutedArea`, …) and cell helpers (`Center`, `CellAt`). `H3Cell` aliases
-  `h3.Cell`.
+  `FreshnessIndex` (§5). Core types (`Area`, `Layer`, `AreaID`, `PairKey` — keyed by `Area` —
+  `Estimate`, `Stored`, `DebtStats`, `RoutedArea`/`RoutedLayer`, …) and cell helpers (`Center`,
+  `CellAt`). `H3Cell` aliases `h3.Cell`.
 - `internal/geo/` — pure `Haversine(a, b)` great-circle distance.
 - `internal/engine/haversine/` — `RoutingEngine` implemented as Haversine ÷ per-profile speed. Swap
   a real engine in behind the interface without touching callers.
-- `internal/tessellate/` — turns an area's geometry into its pair set: `CellsFromGeoJSON` polyfills an
-  uploaded polygon via `h3.PolygonToCells` (§7); `PairsFromCells` builds the directed, `AreaID`-tagged
-  pair set from an explicit cell set + a **travel-radius bound in meters** (`RingsForRadius` converts it
-  to an H3 ring count empirically via `geo.Haversine`; `radiusMeters == 0` is the full-mesh sentinel).
-  Roadless cells (water, private land) are carved out by hand from the console, not by an automated mask.
+- `internal/tessellate/` — turns an area's geometry into its pair set: `CellsFromGeoJSON` polyfills the
+  uploaded polygon via `h3.PolygonToCells` (§7), called once per layer resolution; `SamplePoint` returns
+  a representative in-polygon coordinate (cheap create-time validation + radius-floor sample cells);
+  `PairsFromCells` builds the directed, `AreaID`-tagged pair set from a cell set + a **travel-radius
+  bound in meters** (`RingsForRadius` converts it to an H3 ring count empirically via `geo.Haversine`;
+  `radiusMeters == 0` is the full-mesh sentinel).
 - `internal/store/memory/` — in-memory `Store` (map + RWMutex); `DeleteArea` drops one area's estimates.
 - `internal/store/sqlite/` — the persistent **area store** (`modernc.org/sqlite`, pure-Go): a
   `Repository` over sqlc-generated queries (`generated/`, regenerate with `make sqlc`) and embedded
-  goose migrations (`migrations/`). Stores area definitions (name, resolution, `radius_meters`,
-  `warm_strategy`, `core_radius_meters`, `demand_idle_ttl_seconds`, cell set, GeoJSON, enabled flag) —
-  not the computed matrix.
+  goose migrations (`migrations/`). Stores area definitions (name, `warm_strategy`,
+  `demand_idle_ttl_seconds`, GeoJSON, enabled flag, plus the `area_layers` child table — one row per
+  precision layer) — not the computed matrix and not cells (cells are derived by polyfill at seed
+  time).
 - `internal/freshness/memory/` — in-memory `FreshnessIndex`: leased queue (`Claim`/`MarkComputed`,
   §8), demand `Bump`, the query-access signal `Access` (tracks a pair + stamps last-access without
   raising refresh priority), per-area demand decay `SweepArea` (evicts unpinned, unqueried pairs; `Seed`
@@ -104,22 +117,27 @@ HTTP endpoints (default `:8080`):
 - `internal/refresh/` — the worker+engine pool (§4): claim stalest → dense origin-centric 1×K table
   request → write → mark computed. Claims span all enabled areas from the shared index.
 - `internal/query/` — the read path (§9): resolves the origin to its enabled area via the `AreaRouter`
-  seam, then keys the lookup against that area's partition/resolution (cache hit, same-cell correction,
-  demand-fill). A demand-fill is cached and tracked only when the trip falls within the area's
+  seam, then keys the lookup against that area's partition at the **finest layer**
+  (`RoutedArea.ReadLayer()`; distance-based fallthrough to coarser layers is deliberately not
+  implemented yet). A demand-fill is cached and tracked only when the trip falls within that layer's
   `MaxRadiusMeters` bound (measured with `geo.Haversine`); beyond the bound — like an out-of-area
   coordinate — it is computed but not cached.
 - `internal/control/` — the multi-area control plane. A `Coordinator` (backed by the SQLite
-  `AreasRepository`) owns the enabled-area set and, on `Enable`/`Disable`/`AddCells`/`SetGeoJSON`/…,
+  `AreasRepository`) owns the enabled-area set and, on `Enable`/`Disable`/`Update`/`SetGeoJSON`/…,
   drives per-area seed/unseed over the `AreaIndex`/`AreaStore` seams while the refresh pool keeps
-  running. `Enable` seeds by warm strategy (eager pins the whole bound, lazy nothing, hybrid the core);
+  running. `Enable` polyfills every layer from the area's GeoJSON and seeds by warm strategy (eager
+  pins each layer's whole bound, lazy nothing, hybrid each layer's core);
   `SweepExpired` (driven by a janitor goroutine in `serve.go`) evicts cold demand pairs per area. It
-  also implements `query.AreaRouter` (`Locate`). `serve.go` calls `ResumeEnabled` at boot.
+  also implements `query.AreaRouter` (`Locate` — containment is the finest layer's cell set; the
+  returned `RoutedArea` carries the full layer list finest→coarsest). `serve.go` calls
+  `ResumeEnabled` at boot.
 - `internal/httpapi/` — HTTP routes registered on the platform-go chi router (read path, freshness,
   cells, the `/_config_/areas` registry, health). `{areaID}` params via the router's param manager.
 - `internal/webui/` — the embedded single-page operator console (`go:embed static`): Leaflet + h3-js
-  (vendored under `static/assets/vendor/`, no CDN or build step). List/enable/disable areas, create one
-  from an uploaded GeoJSON polygon (client-side polyfill preview), refine hexes by clicking the map,
-  and watch a selected area's load via `/_ops_/freshness?area` + `/_ops_/cells?area`. Map tiles come
+  (vendored under `static/assets/vendor/`, no CDN or build step). List/enable/disable areas, create a
+  one-layer area from an uploaded GeoJSON polygon (client-side polyfill preview; multi-layer areas are
+  shaped via the API and rendered display-only), and watch a selected area's load via
+  `/_ops_/freshness?area` + `/_ops_/cells?area`. Map tiles come
   from OSM, so the basemap needs internet at runtime; cells/markers still render offline.
 - `version/` — build metadata (`CommitHash`/`BuildTime`/`CommitTime`), injected via `-ldflags` by
   `scripts/build.sh`.

@@ -146,7 +146,7 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 		return Result{}, err
 	}
 
-	if !withinBound(routed.MaxRadiusMeters, origin, dest) {
+	if !withinBound(routed.ReadLayer().MaxRadiusMeters, origin, dest) {
 		return res, nil
 	}
 
@@ -167,12 +167,16 @@ func (h *Handler) classify(routed beeline.RoutedArea, located bool, origin, dest
 		return pairPlan{class: classOutOfArea}, nil
 	}
 
-	originCell, err := beeline.CellAt(origin, routed.Resolution)
+	// Reads deliberately key at the area's finest layer only; distance-based
+	// fallthrough across the coarser layers in routed.Layers is not implemented yet.
+	layer := routed.ReadLayer()
+
+	originCell, err := beeline.CellAt(origin, layer.Resolution)
 	if err != nil {
 		return pairPlan{}, err
 	}
 
-	destCell, err := beeline.CellAt(dest, routed.Resolution)
+	destCell, err := beeline.CellAt(dest, layer.Resolution)
 	if err != nil {
 		return pairPlan{}, err
 	}
@@ -183,7 +187,7 @@ func (h *Handler) classify(routed beeline.RoutedArea, located bool, origin, dest
 
 	return pairPlan{
 		class: classCacheLookup,
-		key:   beeline.PairKey{Area: routed.ID, Origin: originCell, Dest: destCell, Profile: profile, Res: routed.Resolution},
+		key:   beeline.PairKey{Area: routed.ID, Origin: originCell, Dest: destCell, Profile: profile, Res: layer.Resolution},
 	}, nil
 }
 
@@ -429,7 +433,7 @@ func (h *Handler) Table(ctx context.Context, q *TableQuery) (TableResult, error)
 			// out-of-area cells are answered but never stored, matching Estimate.
 			if t.class == classCacheLookup {
 				result.Filled++
-				if withinBound(routed[i].MaxRadiusMeters, q.Sources[i], q.Destinations[t.j]) {
+				if withinBound(routed[i].ReadLayer().MaxRadiusMeters, q.Sources[i], q.Destinations[t.j]) {
 					fills = append(fills, beeline.Entry{
 						Key:    t.key,
 						Stored: beeline.Stored{Estimate: est, ComputedAt: now},

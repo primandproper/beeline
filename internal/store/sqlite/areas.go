@@ -9,8 +9,6 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/store/sqlite/generated"
-
-	"github.com/uber/h3-go/v4"
 )
 
 // ErrNotFound is returned when an area id does not exist.
@@ -21,7 +19,7 @@ const timeFormat = time.RFC3339Nano
 
 // Repository is the SQLite-backed area store. It wraps the sqlc-generated Querier and
 // converts between generated rows and the beeline.Area domain type. Multi-statement
-// writes (an area plus its cells) run in a transaction.
+// writes (an area plus its layers) run in a transaction.
 type Repository struct {
 	db      *sql.DB
 	queries generated.Querier
@@ -38,7 +36,7 @@ func NewRepository(db *sql.DB, clock func() time.Time) *Repository {
 	return &Repository{db: db, queries: generated.New(), now: clock}
 }
 
-// Create inserts an area and its cells in one transaction, stamping created/updated
+// Create inserts an area and its layers in one transaction, stamping created/updated
 // times, and returns the stored area with its assigned ID. The caller controls the
 // Enabled flag (the control plane creates areas disabled).
 func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area, error) {
@@ -49,10 +47,7 @@ func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area,
 	err := r.inTx(ctx, func(tx *sql.Tx) error {
 		id, createErr := r.queries.CreateArea(ctx, tx, &generated.CreateAreaParams{
 			Name:                 a.Name,
-			Resolution:           int64(a.Resolution),
-			RadiusMeters:         a.MaxRadiusMeters,
 			WarmStrategy:         string(a.WarmStrategy),
-			CoreRadiusMeters:     a.CoreRadiusMeters,
 			DemandIdleTtlSeconds: durationSeconds(a.DemandIdleTTL),
 			TargetTtlSeconds:     durationSeconds(a.TargetTTL),
 			LeaseDurationSeconds: durationSeconds(a.LeaseDuration),
@@ -68,7 +63,7 @@ func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area,
 		}
 		a.ID = beeline.AreaID(id)
 
-		return r.insertCells(ctx, tx, a.ID, a.Cells)
+		return r.insertLayers(ctx, tx, a.ID, a.Layers)
 	})
 	if err != nil {
 		return beeline.Area{}, err
@@ -77,7 +72,7 @@ func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area,
 	return *a, nil
 }
 
-// Get returns one area with its cells hydrated, or ErrNotFound.
+// Get returns one area with its layers hydrated, or ErrNotFound.
 func (r *Repository) Get(ctx context.Context, id beeline.AreaID) (beeline.Area, error) {
 	row, err := r.queries.GetArea(ctx, r.db, int64(id))
 	if err != nil {
@@ -88,15 +83,15 @@ func (r *Repository) Get(ctx context.Context, id beeline.AreaID) (beeline.Area, 
 		return beeline.Area{}, fmt.Errorf("sqlite: getting area %d: %w", id, err)
 	}
 
-	cells, err := r.cellsFor(ctx, r.db, id)
+	layers, err := r.layersFor(ctx, r.db, id)
 	if err != nil {
 		return beeline.Area{}, err
 	}
 
-	return convertArea(row, cells)
+	return convertArea(row, layers)
 }
 
-// List returns every area with its cells hydrated, ordered by id.
+// List returns every area with its layers hydrated, ordered by id.
 func (r *Repository) List(ctx context.Context) ([]beeline.Area, error) {
 	rows, err := r.queries.ListAreas(ctx, r.db)
 	if err != nil {
@@ -105,12 +100,12 @@ func (r *Repository) List(ctx context.Context) ([]beeline.Area, error) {
 
 	areas := make([]beeline.Area, 0, len(rows))
 	for _, row := range rows {
-		cells, cellsErr := r.cellsFor(ctx, r.db, beeline.AreaID(row.ID))
-		if cellsErr != nil {
-			return nil, cellsErr
+		layers, layersErr := r.layersFor(ctx, r.db, beeline.AreaID(row.ID))
+		if layersErr != nil {
+			return nil, layersErr
 		}
 
-		area, convErr := convertArea(row, cells)
+		area, convErr := convertArea(row, layers)
 		if convErr != nil {
 			return nil, convErr
 		}
@@ -120,7 +115,7 @@ func (r *Repository) List(ctx context.Context) ([]beeline.Area, error) {
 	return areas, nil
 }
 
-// Update rewrites an area's mutable fields and replaces its cell set, in one
+// Update rewrites an area's mutable fields and replaces its layer list, in one
 // transaction. It bumps updated_at.
 func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
 	now := r.now().UTC()
@@ -129,10 +124,7 @@ func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
 		if updErr := r.queries.UpdateArea(ctx, tx, &generated.UpdateAreaParams{
 			ID:                   int64(a.ID),
 			Name:                 a.Name,
-			Resolution:           int64(a.Resolution),
-			RadiusMeters:         a.MaxRadiusMeters,
 			WarmStrategy:         string(a.WarmStrategy),
-			CoreRadiusMeters:     a.CoreRadiusMeters,
 			DemandIdleTtlSeconds: durationSeconds(a.DemandIdleTTL),
 			TargetTtlSeconds:     durationSeconds(a.TargetTTL),
 			LeaseDurationSeconds: durationSeconds(a.LeaseDuration),
@@ -144,15 +136,15 @@ func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
 			return fmt.Errorf("sqlite: updating area %d: %w", a.ID, updErr)
 		}
 
-		if delErr := r.queries.DeleteAreaCells(ctx, tx, int64(a.ID)); delErr != nil {
-			return fmt.Errorf("sqlite: clearing cells for area %d: %w", a.ID, delErr)
+		if delErr := r.queries.DeleteAreaLayers(ctx, tx, int64(a.ID)); delErr != nil {
+			return fmt.Errorf("sqlite: clearing layers for area %d: %w", a.ID, delErr)
 		}
 
-		return r.insertCells(ctx, tx, a.ID, a.Cells)
+		return r.insertLayers(ctx, tx, a.ID, a.Layers)
 	})
 }
 
-// Delete removes an area; its cells cascade.
+// Delete removes an area; its layers cascade.
 func (r *Repository) Delete(ctx context.Context, id beeline.AreaID) error {
 	if err := r.queries.DeleteArea(ctx, r.db, int64(id)); err != nil {
 		return fmt.Errorf("sqlite: deleting area %d: %w", id, err)
@@ -174,60 +166,44 @@ func (r *Repository) SetEnabled(ctx context.Context, id beeline.AreaID, enabled 
 	return nil
 }
 
-// AddCells adds cells to an area's set (idempotent — existing cells are ignored).
-func (r *Repository) AddCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) error {
-	return r.inTx(ctx, func(tx *sql.Tx) error {
-		return r.insertCells(ctx, tx, id, cells)
-	})
-}
-
-// RemoveCells removes cells from an area's set (missing cells are ignored).
-func (r *Repository) RemoveCells(ctx context.Context, id beeline.AreaID, cells []beeline.H3Cell) error {
-	return r.inTx(ctx, func(tx *sql.Tx) error {
-		for _, c := range cells {
-			if err := r.queries.RemoveAreaCell(ctx, tx, &generated.RemoveAreaCellParams{
-				AreaID: int64(id),
-				Cell:   c.String(),
-			}); err != nil {
-				return fmt.Errorf("sqlite: removing cell %s from area %d: %w", c, id, err)
-			}
-		}
-
-		return nil
-	})
-}
-
-// insertCells inserts each cell for an area within the given executor.
-func (r *Repository) insertCells(ctx context.Context, tx generated.DBTX, id beeline.AreaID, cells []beeline.H3Cell) error {
-	for _, c := range cells {
-		if err := r.queries.AddAreaCell(ctx, tx, &generated.AddAreaCellParams{
-			AreaID: int64(id),
-			Cell:   c.String(),
+// insertLayers inserts each layer for an area within the given executor. The
+// (area_id, resolution) primary key rejects duplicate resolutions at the storage
+// layer; the control plane validates them before it gets here.
+func (r *Repository) insertLayers(ctx context.Context, tx generated.DBTX, id beeline.AreaID, layers []beeline.Layer) error {
+	for i := range layers {
+		if err := r.queries.InsertAreaLayer(ctx, tx, &generated.InsertAreaLayerParams{
+			AreaID:            int64(id),
+			Resolution:        int64(layers[i].Resolution),
+			MinDistanceMeters: layers[i].MinDistanceMeters,
+			MaxRadiusMeters:   layers[i].MaxRadiusMeters,
+			CoreRadiusMeters:  layers[i].CoreRadiusMeters,
 		}); err != nil {
-			return fmt.Errorf("sqlite: adding cell %s to area %d: %w", c, id, err)
+			return fmt.Errorf("sqlite: adding res-%d layer to area %d: %w", layers[i].Resolution, id, err)
 		}
 	}
 
 	return nil
 }
 
-// cellsFor loads an area's cell set, parsing the stored hex strings back to cells.
-func (r *Repository) cellsFor(ctx context.Context, db generated.DBTX, id beeline.AreaID) ([]beeline.H3Cell, error) {
-	rows, err := r.queries.ListAreaCells(ctx, db, int64(id))
+// layersFor loads an area's layer list, already ordered finest→coarsest by the
+// query (resolution descending — the domain ordering invariant).
+func (r *Repository) layersFor(ctx context.Context, db generated.DBTX, id beeline.AreaID) ([]beeline.Layer, error) {
+	rows, err := r.queries.ListAreaLayers(ctx, db, int64(id))
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: listing cells for area %d: %w", id, err)
+		return nil, fmt.Errorf("sqlite: listing layers for area %d: %w", id, err)
 	}
 
-	cells := make([]beeline.H3Cell, 0, len(rows))
-	for _, s := range rows {
-		cell := h3.CellFromString(s)
-		if !cell.IsValid() {
-			return nil, fmt.Errorf("sqlite: area %d has invalid stored cell %q", id, s)
-		}
-		cells = append(cells, cell)
+	layers := make([]beeline.Layer, 0, len(rows))
+	for _, row := range rows {
+		layers = append(layers, beeline.Layer{
+			Resolution:        int(row.Resolution),
+			MinDistanceMeters: row.MinDistanceMeters,
+			MaxRadiusMeters:   row.MaxRadiusMeters,
+			CoreRadiusMeters:  row.CoreRadiusMeters,
+		})
 	}
 
-	return cells, nil
+	return layers, nil
 }
 
 // inTx runs fn inside a transaction, committing on success and rolling back on error.
@@ -252,8 +228,8 @@ func (r *Repository) inTx(ctx context.Context, fn func(tx *sql.Tx) error) error 
 	return nil
 }
 
-// convertArea maps a generated row plus its cell set into a beeline.Area.
-func convertArea(row *generated.Areas, cells []beeline.H3Cell) (beeline.Area, error) {
+// convertArea maps a generated row plus its layer list into a beeline.Area.
+func convertArea(row *generated.Areas, layers []beeline.Layer) (beeline.Area, error) {
 	created, err := time.Parse(timeFormat, row.CreatedAt)
 	if err != nil {
 		return beeline.Area{}, fmt.Errorf("sqlite: parsing created_at for area %d: %w", row.ID, err)
@@ -270,22 +246,19 @@ func convertArea(row *generated.Areas, cells []beeline.H3Cell) (beeline.Area, er
 	}
 
 	return beeline.Area{
-		ID:               beeline.AreaID(row.ID),
-		Name:             row.Name,
-		Resolution:       int(row.Resolution),
-		MaxRadiusMeters:  row.RadiusMeters,
-		CoreRadiusMeters: row.CoreRadiusMeters,
-		WarmStrategy:     beeline.WarmStrategy(row.WarmStrategy),
-		RoutingProvider:  row.RoutingProvider,
-		DemandIdleTTL:    time.Duration(row.DemandIdleTtlSeconds) * time.Second,
-		TargetTTL:        time.Duration(row.TargetTtlSeconds) * time.Second,
-		LeaseDuration:    time.Duration(row.LeaseDurationSeconds) * time.Second,
-		SweepInterval:    time.Duration(row.SweepIntervalSeconds) * time.Second,
-		Cells:            cells,
-		GeoJSON:          geojson,
-		Enabled:          row.Enabled != 0,
-		CreatedAt:        created,
-		UpdatedAt:        updated,
+		ID:              beeline.AreaID(row.ID),
+		Name:            row.Name,
+		WarmStrategy:    beeline.WarmStrategy(row.WarmStrategy),
+		RoutingProvider: row.RoutingProvider,
+		DemandIdleTTL:   time.Duration(row.DemandIdleTtlSeconds) * time.Second,
+		TargetTTL:       time.Duration(row.TargetTtlSeconds) * time.Second,
+		LeaseDuration:   time.Duration(row.LeaseDurationSeconds) * time.Second,
+		SweepInterval:   time.Duration(row.SweepIntervalSeconds) * time.Second,
+		Layers:          layers,
+		GeoJSON:         geojson,
+		Enabled:         row.Enabled != 0,
+		CreatedAt:       created,
+		UpdatedAt:       updated,
 	}, nil
 }
 

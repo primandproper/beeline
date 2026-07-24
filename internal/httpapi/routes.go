@@ -18,6 +18,7 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/control"
 	"github.com/primandproper/beeline/internal/query"
+	"github.com/primandproper/beeline/internal/tessellate"
 
 	"github.com/primandproper/platform-go/v4/healthcheck"
 	"github.com/primandproper/platform-go/v4/observability/logging"
@@ -36,10 +37,12 @@ const maxGeoJSONBytes = 8 << 20 // 8 MiB
 // path to the engine's Capabilities.MaxTableSize.
 const maxTableCells = 10_000
 
-// Deps are the dependencies the routes close over.
+// Deps are the dependencies the routes close over. Store is read directly only by
+// the /_ops_/pairs cache probe; the read path proper goes through Handler.
 type Deps struct {
 	Handler        *query.Handler
 	Index          beeline.FreshnessIndex
+	Store          beeline.Store
 	Coordinator    *control.Coordinator
 	Health         healthcheck.Registry
 	Logger         logging.Logger
@@ -56,6 +59,7 @@ func Register(router routing.Router, deps *Deps) {
 
 	router.Get("/_ops_/freshness", freshnessHandler(deps, logger))
 	router.Get("/_ops_/cells", cellsHandler(deps, logger))
+	router.Post("/_ops_/pairs", pairsHandler(deps, logger))
 	router.Get("/_ops_/live", liveHandler(logger))
 	router.Get("/_ops_/ready", readyHandler(deps.Health, logger))
 
@@ -68,7 +72,6 @@ func Register(router routing.Router, deps *Deps) {
 	router.Post("/_config_/areas/{areaID}/enable", areaEnableHandler(deps, logger, areaID))
 	router.Post("/_config_/areas/{areaID}/disable", areaDisableHandler(deps, logger, areaID))
 	router.Put("/_config_/areas/{areaID}/geojson", areaGeoJSONHandler(deps, logger, areaID))
-	router.Post("/_config_/areas/{areaID}/cells", areaCellsHandler(deps, logger, areaID))
 }
 
 // estimateResponse is the JSON body for a successful estimate.
@@ -318,10 +321,13 @@ func freshnessHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 	}
 }
 
-// cellStateResponse is one origin cell's freshness rollup for the progress map.
+// cellStateResponse is one origin cell's freshness rollup for the progress map. A
+// multi-layer area's cells arrive at several resolutions side by side; Resolution
+// (decoded from the cell id) lets the console tell the layers apart.
 type cellStateResponse struct {
 	Cell             string  `json:"cell"` // H3 index, hex string (h3-js compatible)
 	Area             int64   `json:"area"`
+	Resolution       int     `json:"resolution"`
 	Lat              float64 `json:"lat"`
 	Lng              float64 `json:"lng"`
 	Total            int     `json:"total"`
@@ -370,6 +376,7 @@ func cellsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 				cells = append(cells, cellStateResponse{
 					Cell:             states[i].Origin.String(),
 					Area:             int64(id),
+					Resolution:       states[i].Origin.Resolution(),
 					Lat:              center.Lat,
 					Lng:              center.Lng,
 					Total:            states[i].Total,
@@ -383,51 +390,200 @@ func cellsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 	}
 }
 
-// areaResponse is the JSON shape of a configured area. Cells and GeoJSON are populated
-// only on the single-area detail view, not in list responses.
-type areaResponse struct {
-	CreatedAt        string          `json:"createdAt"`
-	UpdatedAt        string          `json:"updatedAt"`
-	Name             string          `json:"name"`
-	WarmStrategy     string          `json:"warmStrategy"`
-	RoutingProvider  string          `json:"routingProvider"`
-	DemandIdleTTL    string          `json:"demandIdleTTL"`
-	TargetTTL        string          `json:"targetTTL"`
-	LeaseDuration    string          `json:"leaseDuration"`
-	SweepInterval    string          `json:"sweepInterval"`
-	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
-	Cells            []string        `json:"cells,omitempty"`
-	ID               int64           `json:"id"`
-	Resolution       int             `json:"resolution"`
-	MaxRadiusMeters  float64         `json:"maxRadiusMeters"`
-	CoreRadiusMeters float64         `json:"coreRadiusMeters"`
-	CellCount        int             `json:"cellCount"`
-	Enabled          bool            `json:"enabled"`
+// maxPairsDests bounds a single /_ops_/pairs probe so one hover can't ask for an
+// unbounded BatchGet.
+const maxPairsDests = 512
+
+// pairsRequest asks for the cached estimates from one origin cell to a set of
+// destination cells (all hex H3 strings at the same resolution). Unlike /estimate
+// and /table — which route through the area's finest layer — the lookup is keyed at
+// the cells' own resolution, so any layer's cached pairs are inspectable.
+type pairsRequest struct {
+	Profile string   `json:"profile"`
+	Origin  string   `json:"origin"`
+	Dests   []string `json:"dests"`
+	Area    int64    `json:"area"`
 }
 
-func toAreaResponse(a *beeline.Area, includeGeometry bool) areaResponse {
-	resp := areaResponse{
-		ID:               int64(a.ID),
-		Name:             a.Name,
-		Resolution:       a.Resolution,
-		MaxRadiusMeters:  a.MaxRadiusMeters,
-		CoreRadiusMeters: a.CoreRadiusMeters,
-		WarmStrategy:     string(a.WarmStrategy),
-		RoutingProvider:  a.RoutingProvider,
-		DemandIdleTTL:    a.DemandIdleTTL.String(),
-		TargetTTL:        a.TargetTTL.String(),
-		LeaseDuration:    a.LeaseDuration.String(),
-		SweepInterval:    a.SweepInterval.String(),
-		CellCount:        len(a.Cells),
-		Enabled:          a.Enabled,
-		CreatedAt:        a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
-		UpdatedAt:        a.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+// pairEstimateResponse is one cached origin→dest estimate. Destinations with no
+// cached estimate are simply absent from the response.
+type pairEstimateResponse struct {
+	Dest           string  `json:"dest"`
+	ComputedAt     string  `json:"computedAt"`
+	DurationSec    float64 `json:"durationSec"`
+	DistanceMeters float64 `json:"distanceMeters"`
+}
+
+type pairsResponse struct {
+	Pairs []pairEstimateResponse `json:"pairs"`
+}
+
+// pairsHandler is the console's hover probe: a pure cache read (never the engine)
+// over the store seam, returning whichever of the asked origin→dest pairs are
+// cached right now.
+func pairsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req pairsRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid pairs body: "+err.Error())
+			return
+		}
+		if req.Area <= 0 {
+			writeError(w, logger, http.StatusBadRequest, "area must be a positive id")
+			return
+		}
+		if len(req.Dests) == 0 {
+			writeError(w, logger, http.StatusBadRequest, "dests must be non-empty")
+			return
+		}
+		if len(req.Dests) > maxPairsDests {
+			writeError(w, logger, http.StatusBadRequest,
+				"too many dests: limit "+strconv.Itoa(maxPairsDests))
+			return
+		}
+
+		origin, err := parseCell(req.Origin)
+		if err != nil {
+			writeError(w, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
+			return
+		}
+
+		profile := deps.DefaultProfile
+		if p := strings.TrimSpace(req.Profile); p != "" {
+			profile = beeline.Profile(p)
+		}
+
+		keys := make([]beeline.PairKey, 0, len(req.Dests))
+		dests := make([]beeline.H3Cell, 0, len(req.Dests))
+		for _, raw := range req.Dests {
+			dest, destErr := parseCell(raw)
+			if destErr != nil {
+				writeError(w, logger, http.StatusBadRequest, "invalid dest: "+destErr.Error())
+				return
+			}
+			if dest.Resolution() != origin.Resolution() {
+				writeError(w, logger, http.StatusBadRequest,
+					"dest "+raw+" is resolution "+strconv.Itoa(dest.Resolution())+
+						", want the origin's "+strconv.Itoa(origin.Resolution()))
+				return
+			}
+			dests = append(dests, dest)
+			keys = append(keys, beeline.PairKey{
+				Area:    beeline.AreaID(req.Area),
+				Origin:  origin,
+				Dest:    dest,
+				Profile: profile,
+				Res:     origin.Resolution(),
+			})
+		}
+
+		stored, err := deps.Store.BatchGet(r.Context(), keys)
+		if err != nil {
+			logger.Error("reading cached pairs", err)
+			writeError(w, logger, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		pairs := make([]pairEstimateResponse, 0, len(stored))
+		for i, s := range stored {
+			if s == nil {
+				continue
+			}
+			pairs = append(pairs, pairEstimateResponse{
+				Dest:           dests[i].String(),
+				DurationSec:    s.Duration,
+				DistanceMeters: s.Distance,
+				ComputedAt:     s.ComputedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+			})
+		}
+
+		writeJSON(w, logger, http.StatusOK, pairsResponse{Pairs: pairs})
+	}
+}
+
+// parseCell converts one hex H3 string to a cell, rejecting garbage.
+func parseCell(raw string) (beeline.H3Cell, error) {
+	cell := h3.CellFromString(strings.TrimSpace(raw))
+	if !cell.IsValid() {
+		return 0, errors.New("invalid h3 cell: " + raw)
 	}
 
-	if includeGeometry {
-		resp.Cells = cellStrings(a.Cells)
-		if len(a.GeoJSON) > 0 {
-			resp.GeoJSON = json.RawMessage(a.GeoJSON)
+	return cell, nil
+}
+
+// layerResponse is one precision layer of an area on the wire. CellCount is derived
+// (the layer's polyfill size) and only computed on single-area detail views; list
+// responses leave it 0.
+type layerResponse struct {
+	Resolution        int     `json:"resolution"`
+	MinDistanceMeters float64 `json:"minDistanceMeters"`
+	MaxRadiusMeters   float64 `json:"maxRadiusMeters"`
+	CoreRadiusMeters  float64 `json:"coreRadiusMeters"`
+	CellCount         int     `json:"cellCount"`
+}
+
+// areaResponse is the JSON shape of a configured area. Layers is ordered
+// finest→coarsest. Cells (the finest layer's polyfill, for the console map) and
+// GeoJSON are populated only on the single-area detail view, not in list responses.
+type areaResponse struct {
+	CreatedAt       string          `json:"createdAt"`
+	UpdatedAt       string          `json:"updatedAt"`
+	Name            string          `json:"name"`
+	WarmStrategy    string          `json:"warmStrategy"`
+	RoutingProvider string          `json:"routingProvider"`
+	DemandIdleTTL   string          `json:"demandIdleTTL"`
+	TargetTTL       string          `json:"targetTTL"`
+	LeaseDuration   string          `json:"leaseDuration"`
+	SweepInterval   string          `json:"sweepInterval"`
+	GeoJSON         json.RawMessage `json:"geojson,omitempty"`
+	Cells           []string        `json:"cells,omitempty"`
+	Layers          []layerResponse `json:"layers"`
+	ID              int64           `json:"id"`
+	Enabled         bool            `json:"enabled"`
+}
+
+// toAreaResponse projects an area onto the wire. The detail view (includeGeometry)
+// derives each layer's cell count — and the finest layer's cell list, which the
+// console map draws — by polyfilling the area's GeoJSON on the spot; cells are not
+// persisted. The polyfill is best-effort: a geometry that fails to fill logs and
+// leaves the counts 0 rather than failing the whole response.
+func toAreaResponse(logger logging.Logger, a *beeline.Area, includeGeometry bool) areaResponse {
+	resp := areaResponse{
+		ID:              int64(a.ID),
+		Name:            a.Name,
+		WarmStrategy:    string(a.WarmStrategy),
+		RoutingProvider: a.RoutingProvider,
+		DemandIdleTTL:   a.DemandIdleTTL.String(),
+		TargetTTL:       a.TargetTTL.String(),
+		LeaseDuration:   a.LeaseDuration.String(),
+		SweepInterval:   a.SweepInterval.String(),
+		Enabled:         a.Enabled,
+		CreatedAt:       a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+		UpdatedAt:       a.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+	}
+
+	resp.Layers = make([]layerResponse, 0, len(a.Layers))
+	for i := range a.Layers {
+		resp.Layers = append(resp.Layers, layerResponse{
+			Resolution:        a.Layers[i].Resolution,
+			MinDistanceMeters: a.Layers[i].MinDistanceMeters,
+			MaxRadiusMeters:   a.Layers[i].MaxRadiusMeters,
+			CoreRadiusMeters:  a.Layers[i].CoreRadiusMeters,
+		})
+	}
+
+	if includeGeometry && len(a.GeoJSON) > 0 {
+		resp.GeoJSON = json.RawMessage(a.GeoJSON)
+		for i := range a.Layers {
+			cells, err := tessellate.CellsFromGeoJSON(a.GeoJSON, a.Layers[i].Resolution)
+			if err != nil {
+				logger.Error("polyfilling layer for area detail", err)
+				continue
+			}
+			resp.Layers[i].CellCount = len(cells)
+			if i == 0 {
+				resp.Cells = cellStrings(cells)
+			}
 		}
 	}
 
@@ -453,28 +609,49 @@ func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 
 		out := make([]areaResponse, 0, len(areas))
 		for i := range areas {
-			out = append(out, toAreaResponse(&areas[i], false))
+			out = append(out, toAreaResponse(logger, &areas[i], false))
 		}
 
 		writeJSON(w, logger, http.StatusOK, out)
 	}
 }
 
-// createAreaRequest is the POST /_config_/areas body. Geometry comes from either an
-// inline GeoJSON polygon (polyfilled server-side) or an explicit cell set.
+// layerPayload is one precision layer in a create/update request body.
+type layerPayload struct {
+	Resolution        int     `json:"resolution"`
+	MinDistanceMeters float64 `json:"minDistanceMeters"`
+	MaxRadiusMeters   float64 `json:"maxRadiusMeters"`
+	CoreRadiusMeters  float64 `json:"coreRadiusMeters"`
+}
+
+// toLayers converts the wire layers to domain layers; ordering and validation are
+// the coordinator's job.
+func toLayers(in []layerPayload) []beeline.Layer {
+	out := make([]beeline.Layer, 0, len(in))
+	for i := range in {
+		out = append(out, beeline.Layer{
+			Resolution:        in[i].Resolution,
+			MinDistanceMeters: in[i].MinDistanceMeters,
+			MaxRadiusMeters:   in[i].MaxRadiusMeters,
+			CoreRadiusMeters:  in[i].CoreRadiusMeters,
+		})
+	}
+
+	return out
+}
+
+// createAreaRequest is the POST /_config_/areas body. GeoJSON is the required
+// canonical geometry; every layer's cell set is derived from it server-side.
 type createAreaRequest struct {
-	Name             string          `json:"name"`
-	WarmStrategy     string          `json:"warmStrategy"`
-	RoutingProvider  string          `json:"routingProvider"`
-	DemandIdleTTL    string          `json:"demandIdleTTL"`
-	TargetTTL        string          `json:"targetTTL"`
-	LeaseDuration    string          `json:"leaseDuration"`
-	SweepInterval    string          `json:"sweepInterval"`
-	GeoJSON          json.RawMessage `json:"geojson,omitempty"`
-	Cells            []string        `json:"cells,omitempty"`
-	Resolution       int             `json:"resolution"`
-	MaxRadiusMeters  float64         `json:"maxRadiusMeters"`
-	CoreRadiusMeters float64         `json:"coreRadiusMeters"`
+	Name            string          `json:"name"`
+	WarmStrategy    string          `json:"warmStrategy"`
+	RoutingProvider string          `json:"routingProvider"`
+	DemandIdleTTL   string          `json:"demandIdleTTL"`
+	TargetTTL       string          `json:"targetTTL"`
+	LeaseDuration   string          `json:"leaseDuration"`
+	SweepInterval   string          `json:"sweepInterval"`
+	GeoJSON         json.RawMessage `json:"geojson"`
+	Layers          []layerPayload  `json:"layers"`
 }
 
 func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
@@ -482,12 +659,6 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		var req createAreaRequest
 		if err := decodeJSON(r, &req); err != nil {
 			writeError(w, logger, http.StatusBadRequest, "invalid area body: "+err.Error())
-			return
-		}
-
-		cells, err := parseCells(req.Cells)
-		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -504,18 +675,15 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		}
 
 		area, err := deps.Coordinator.Create(r.Context(), &control.CreateAreaInput{
-			Name:             req.Name,
-			Resolution:       req.Resolution,
-			MaxRadiusMeters:  req.MaxRadiusMeters,
-			CoreRadiusMeters: req.CoreRadiusMeters,
-			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
-			RoutingProvider:  req.RoutingProvider,
-			DemandIdleTTL:    ttl,
-			TargetTTL:        fresh.targetTTL,
-			LeaseDuration:    fresh.lease,
-			SweepInterval:    fresh.sweep,
-			GeoJSON:          req.GeoJSON,
-			Cells:            cells,
+			Name:            req.Name,
+			WarmStrategy:    beeline.WarmStrategy(req.WarmStrategy),
+			RoutingProvider: req.RoutingProvider,
+			DemandIdleTTL:   ttl,
+			TargetTTL:       fresh.targetTTL,
+			LeaseDuration:   fresh.lease,
+			SweepInterval:   fresh.sweep,
+			GeoJSON:         req.GeoJSON,
+			Layers:          toLayers(req.Layers),
 		})
 		if err != nil {
 			writeError(w, logger, http.StatusBadRequest, err.Error())
@@ -523,7 +691,7 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		}
 
 		logger.Info("service area created")
-		writeJSON(w, logger, http.StatusCreated, toAreaResponse(&area, true))
+		writeJSON(w, logger, http.StatusCreated, toAreaResponse(logger, &area, true))
 	}
 }
 
@@ -540,22 +708,21 @@ func areaGetHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request
 			return
 		}
 
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(&area, true))
+		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
 	}
 }
 
-// updateAreaRequest is the PATCH body: an area's mutable metadata.
+// updateAreaRequest is the PATCH body: an area's mutable metadata. Layers replaces
+// the whole layer list; geometry changes through PUT …/geojson.
 type updateAreaRequest struct {
-	Name             string  `json:"name"`
-	WarmStrategy     string  `json:"warmStrategy"`
-	RoutingProvider  string  `json:"routingProvider"`
-	DemandIdleTTL    string  `json:"demandIdleTTL"`
-	TargetTTL        string  `json:"targetTTL"`
-	LeaseDuration    string  `json:"leaseDuration"`
-	SweepInterval    string  `json:"sweepInterval"`
-	Resolution       int     `json:"resolution"`
-	MaxRadiusMeters  float64 `json:"maxRadiusMeters"`
-	CoreRadiusMeters float64 `json:"coreRadiusMeters"`
+	Name            string         `json:"name"`
+	WarmStrategy    string         `json:"warmStrategy"`
+	RoutingProvider string         `json:"routingProvider"`
+	DemandIdleTTL   string         `json:"demandIdleTTL"`
+	TargetTTL       string         `json:"targetTTL"`
+	LeaseDuration   string         `json:"leaseDuration"`
+	SweepInterval   string         `json:"sweepInterval"`
+	Layers          []layerPayload `json:"layers"`
 }
 
 func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
@@ -584,23 +751,21 @@ func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Requ
 		}
 
 		area, err := deps.Coordinator.Update(r.Context(), id, &control.UpdateAreaInput{
-			Name:             req.Name,
-			Resolution:       req.Resolution,
-			MaxRadiusMeters:  req.MaxRadiusMeters,
-			CoreRadiusMeters: req.CoreRadiusMeters,
-			WarmStrategy:     beeline.WarmStrategy(req.WarmStrategy),
-			RoutingProvider:  req.RoutingProvider,
-			DemandIdleTTL:    ttl,
-			TargetTTL:        fresh.targetTTL,
-			LeaseDuration:    fresh.lease,
-			SweepInterval:    fresh.sweep,
+			Name:            req.Name,
+			WarmStrategy:    beeline.WarmStrategy(req.WarmStrategy),
+			RoutingProvider: req.RoutingProvider,
+			DemandIdleTTL:   ttl,
+			TargetTTL:       fresh.targetTTL,
+			LeaseDuration:   fresh.lease,
+			SweepInterval:   fresh.sweep,
+			Layers:          toLayers(req.Layers),
 		})
 		if err != nil {
 			writeAreaError(w, logger, err)
 			return
 		}
 
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(&area, true))
+		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
 	}
 }
 
@@ -634,7 +799,7 @@ func areaEnableHandler(deps *Deps, logger logging.Logger, areaID func(*http.Requ
 		}
 
 		logger.Info("service area enabled")
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(&area, true))
+		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
 	}
 }
 
@@ -652,7 +817,7 @@ func areaDisableHandler(deps *Deps, logger logging.Logger, areaID func(*http.Req
 		}
 
 		logger.Info("service area disabled")
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(&area, true))
+		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
 	}
 }
 
@@ -676,54 +841,7 @@ func areaGeoJSONHandler(deps *Deps, logger logging.Logger, areaID func(*http.Req
 			return
 		}
 
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(&area, true))
-	}
-}
-
-// cellsRequest is the POST /_config_/areas/{id}/cells body for manual hex refinement.
-type cellsRequest struct {
-	Add    []string `json:"add,omitempty"`
-	Remove []string `json:"remove,omitempty"`
-}
-
-func areaCellsHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
-		if !ok {
-			return
-		}
-
-		var req cellsRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid cells body: "+err.Error())
-			return
-		}
-
-		add, err := parseCells(req.Add)
-		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, err.Error())
-			return
-		}
-		remove, err := parseCells(req.Remove)
-		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, err.Error())
-			return
-		}
-
-		if len(remove) > 0 {
-			if _, err = deps.Coordinator.RemoveCells(r.Context(), id, remove); err != nil {
-				writeAreaError(w, logger, err)
-				return
-			}
-		}
-
-		area, err := deps.Coordinator.AddCells(r.Context(), id, add)
-		if err != nil {
-			writeAreaError(w, logger, err)
-			return
-		}
-
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(&area, true))
+		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
 	}
 }
 
@@ -778,24 +896,6 @@ func writeAreaError(w http.ResponseWriter, logger logging.Logger, err error) {
 // dependency on the store package.
 func isNotFound(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "not found")
-}
-
-// parseCells converts hex H3 strings to cells, rejecting any that don't parse.
-func parseCells(raw []string) ([]beeline.H3Cell, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-
-	cells := make([]beeline.H3Cell, 0, len(raw))
-	for _, s := range raw {
-		cell := h3.CellFromString(strings.TrimSpace(s))
-		if !cell.IsValid() {
-			return nil, errors.New("invalid h3 cell: " + s)
-		}
-		cells = append(cells, cell)
-	}
-
-	return cells, nil
 }
 
 // cellStrings renders a cell set as hex strings.

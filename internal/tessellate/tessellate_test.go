@@ -13,61 +13,25 @@ import (
 	"github.com/uber/h3-go/v4"
 )
 
-func TestSeed(t *testing.T) {
+func TestPairsFromCellsEmitsSelfPairs(t *testing.T) {
 	t.Parallel()
 
-	area := tessellate.Area{
-		Center:          beeline.LatLng{Lat: 37.7749, Lng: -122.4194},
-		Resolution:      8,
-		AreaRings:       2,
-		MaxRadiusMeters: 1500,
+	_, cells := resDisk(t, 8, 2)
+	profiles := []beeline.Profile{"car", "bike"}
+
+	pairs, err := tessellate.PairsFromCells(0, cells, 8, 1500, profiles)
+	require.NoError(t, err)
+	require.NotEmpty(t, pairs)
+
+	var selfPairs int
+	for _, p := range pairs {
+		if p.Origin == p.Dest {
+			selfPairs++
+		}
 	}
 
-	t.Run("covers the expected number of cells", func(t *testing.T) {
-		t.Parallel()
-
-		res, err := tessellate.Seed(area, []beeline.Profile{"car"})
-		require.NoError(t, err)
-
-		// GridDisk of radius k covers 3k^2 + 3k + 1 cells; k=2 → 19.
-		assert.Len(t, res.Cells, 19)
-	})
-
-	t.Run("pairs are clipped to the area and tagged with res and profile", func(t *testing.T) {
-		t.Parallel()
-
-		res, err := tessellate.Seed(area, []beeline.Profile{"car", "bike"})
-		require.NoError(t, err)
-		require.NotEmpty(t, res.Pairs)
-
-		inArea := make(map[beeline.H3Cell]struct{}, len(res.Cells))
-		for _, c := range res.Cells {
-			inArea[c] = struct{}{}
-		}
-
-		var selfPairs int
-		for _, p := range res.Pairs {
-			assert.Equal(t, 8, p.Res)
-			assert.Contains(t, []beeline.Profile{"car", "bike"}, p.Profile)
-			assert.Contains(t, inArea, p.Origin)
-			assert.Contains(t, inArea, p.Dest)
-			if p.Origin == p.Dest {
-				selfPairs++
-			}
-		}
-
-		// Every origin×profile has a self pair (used to exercise same-cell handling).
-		assert.Equal(t, len(res.Cells)*2, selfPairs)
-	})
-
-	t.Run("rejects an out-of-range resolution", func(t *testing.T) {
-		t.Parallel()
-
-		bad := area
-		bad.Resolution = 42
-		_, err := tessellate.Seed(bad, []beeline.Profile{"car"})
-		assert.Error(t, err)
-	})
+	// Every origin×profile has a self pair (used to exercise same-cell handling).
+	assert.Equal(t, len(cells)*len(profiles), selfPairs)
 }
 
 // resDisk returns the GridDisk of radius r around San Francisco at the given

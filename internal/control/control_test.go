@@ -2,6 +2,7 @@ package control_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -78,21 +79,77 @@ func diskCells(t *testing.T, r int) []beeline.H3Cell {
 	return cells
 }
 
-func createArea(t *testing.T, h *harness, cells []beeline.H3Cell) beeline.Area {
+// geoJSONForCells renders a cell set's exact outline as a GeoJSON MultiPolygon.
+// Polyfilling it back at the cells' resolution reproduces the set (every original
+// cell's center is inside the outline; every other cell's is outside), so tests can
+// reason about a GeoJSON-canonical area in terms of a known cell disk.
+func geoJSONForCells(t *testing.T, cells []beeline.H3Cell) []byte {
+	t.Helper()
+
+	polys, err := h3.CellsToMultiPolygon(cells)
+	require.NoError(t, err)
+	require.NotEmpty(t, polys)
+
+	ring := func(loop h3.GeoLoop) [][]float64 {
+		out := make([][]float64, 0, len(loop)+1)
+		for _, v := range loop {
+			out = append(out, []float64{v.Lng, v.Lat}) // GeoJSON is [lng,lat]
+		}
+
+		return append(out, out[0]) // close the ring
+	}
+
+	multi := make([][][][]float64, 0, len(polys))
+	for i := range polys {
+		poly := [][][]float64{ring(polys[i].GeoLoop)}
+		for _, hole := range polys[i].Holes {
+			poly = append(poly, ring(hole))
+		}
+		multi = append(multi, poly)
+	}
+
+	raw, err := json.Marshal(map[string]any{"type": "MultiPolygon", "coordinates": multi})
+	require.NoError(t, err)
+
+	return raw
+}
+
+// diskGeoJSON is the geometry whose res-8 polyfill is the r-ring SF disk.
+func diskGeoJSON(t *testing.T, r int) []byte {
+	t.Helper()
+
+	return geoJSONForCells(t, diskCells(t, r))
+}
+
+// layers1 is the common one-layer list at the test resolution.
+func layers1(maxRadius, coreRadius float64) []beeline.Layer {
+	return []beeline.Layer{{Resolution: testRes, MaxRadiusMeters: maxRadius, CoreRadiusMeters: coreRadius}}
+}
+
+// resolutions projects a layer list to its resolution order.
+func resolutions(layers []beeline.Layer) []int {
+	out := make([]int, 0, len(layers))
+	for i := range layers {
+		out = append(out, layers[i].Resolution)
+	}
+
+	return out
+}
+
+func createArea(t *testing.T, h *harness, diskRings int) beeline.Area {
 	t.Helper()
 
 	area, err := h.coord.Create(context.Background(), &control.CreateAreaInput{
-		Name:            "test",
-		Resolution:      testRes,
-		MaxRadiusMeters: 1500,
-		Cells:           cells,
+		Name:    "test",
+		GeoJSON: diskGeoJSON(t, diskRings),
+		Layers:  layers1(1500, 0),
 	})
 	require.NoError(t, err)
 
 	return area
 }
 
-// createAreaWith creates an area with an explicit warm strategy and bounds.
+// createAreaWith creates an area with an explicit warm strategy, layers, and bounds.
 func createAreaWith(t *testing.T, h *harness, in *control.CreateAreaInput) beeline.Area {
 	t.Helper()
 
@@ -109,8 +166,8 @@ func TestLazyAreaSeedsNothingButRoutes(t *testing.T) {
 	h := newHarness(t)
 
 	area := createAreaWith(t, h, &control.CreateAreaInput{
-		Name: "lazy", Resolution: testRes, MaxRadiusMeters: 3000,
-		WarmStrategy: beeline.WarmLazy, Cells: diskCells(t, 2),
+		Name: "lazy", GeoJSON: diskGeoJSON(t, 2), Layers: layers1(3000, 0),
+		WarmStrategy: beeline.WarmLazy,
 	})
 	_, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
@@ -123,7 +180,7 @@ func TestLazyAreaSeedsNothingButRoutes(t *testing.T) {
 	routed, ok := h.coord.Locate(beeline.LatLng{Lat: sfLat, Lng: sfLng})
 	require.True(t, ok)
 	assert.Equal(t, area.ID, routed.ID)
-	assert.InDelta(t, 3000, routed.MaxRadiusMeters, 1e-9)
+	assert.InDelta(t, 3000, routed.ReadLayer().MaxRadiusMeters, 1e-9)
 }
 
 func TestHybridSeedsCoreNotFullBound(t *testing.T) {
@@ -132,18 +189,18 @@ func TestHybridSeedsCoreNotFullBound(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	cells := diskCells(t, 5) // a roomy area so the radius, not the area, clips
+	geo := diskGeoJSON(t, 5) // a roomy area so the radius, not the area, clips
 
 	eager := createAreaWith(t, h, &control.CreateAreaInput{
-		Name: "eager", Resolution: testRes, MaxRadiusMeters: 6000,
-		WarmStrategy: beeline.WarmEager, Cells: cells,
+		Name: "eager", GeoJSON: geo, Layers: layers1(6000, 0),
+		WarmStrategy: beeline.WarmEager,
 	})
 	_, err := h.coord.Enable(ctx, eager.ID)
 	require.NoError(t, err)
 
 	hybrid := createAreaWith(t, h, &control.CreateAreaInput{
-		Name: "hybrid", Resolution: testRes, MaxRadiusMeters: 6000, CoreRadiusMeters: 1500,
-		WarmStrategy: beeline.WarmHybrid, Cells: cells,
+		Name: "hybrid", GeoJSON: geo, Layers: layers1(6000, 1500),
+		WarmStrategy: beeline.WarmHybrid,
 	})
 	_, err = h.coord.Enable(ctx, hybrid.ID)
 	require.NoError(t, err)
@@ -158,6 +215,55 @@ func TestHybridSeedsCoreNotFullBound(t *testing.T) {
 		"hybrid's core (1.5km) is a subset of eager's full bound (6km)")
 }
 
+func TestMultiLayerEnableSeedsEveryLayer(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	// Layers supplied coarsest-first on purpose: the coordinator must sort them
+	// finest→coarsest. The geometry is a ~9 km res-8 disk, roomy enough that its
+	// res-7 polyfill is non-empty too.
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name:    "multi",
+		GeoJSON: diskGeoJSON(t, 4),
+		Layers: []beeline.Layer{
+			{Resolution: 7, MinDistanceMeters: 2000, MaxRadiusMeters: 6000},
+			{Resolution: testRes, MinDistanceMeters: 0, MaxRadiusMeters: 3000},
+		},
+	})
+	assert.Equal(t, []int{8, 7}, resolutions(area.Layers), "layers are stored finest→coarsest")
+
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	// Both layers' origin cells are seeded, distinguishable by cell resolution.
+	states, err := h.index.CellStatesForArea(ctx, area.ID)
+	require.NoError(t, err)
+	seededRes := map[int]int{}
+	for _, s := range states {
+		seededRes[s.Origin.Resolution()]++
+	}
+	assert.Positive(t, seededRes[8], "the finest layer seeds origin cells")
+	assert.Positive(t, seededRes[7], "the coarse layer seeds origin cells too")
+
+	// Locate routes at the finest layer and carries the whole list, finest first.
+	routed, ok := h.coord.Locate(beeline.LatLng{Lat: sfLat, Lng: sfLng})
+	require.True(t, ok)
+	require.Len(t, routed.Layers, 2)
+	assert.Equal(t, 8, routed.Layers[0].Resolution)
+	assert.Equal(t, 7, routed.Layers[1].Resolution)
+	assert.InDelta(t, 2000, routed.Layers[1].MinDistanceMeters, 1e-9)
+	assert.Equal(t, 8, routed.ReadLayer().Resolution)
+
+	// Disable tears down every layer's pairs.
+	_, err = h.coord.Disable(ctx, area.ID)
+	require.NoError(t, err)
+	debt, err := h.index.DebtForArea(ctx, area.ID)
+	require.NoError(t, err)
+	assert.Zero(t, debt.WorkingSet, "disabling clears all layers")
+}
+
 func TestSweepExpiredEvictsColdDemandFromIndexAndStore(t *testing.T) {
 	t.Parallel()
 
@@ -166,8 +272,8 @@ func TestSweepExpiredEvictsColdDemandFromIndexAndStore(t *testing.T) {
 
 	cells := diskCells(t, 2)
 	area := createAreaWith(t, h, &control.CreateAreaInput{
-		Name: "lazy", Resolution: testRes, MaxRadiusMeters: 3000,
-		WarmStrategy: beeline.WarmLazy, DemandIdleTTL: time.Hour, Cells: cells,
+		Name: "lazy", GeoJSON: diskGeoJSON(t, 2), Layers: layers1(3000, 0),
+		WarmStrategy: beeline.WarmLazy, DemandIdleTTL: time.Hour,
 	})
 	_, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
@@ -209,11 +315,12 @@ func TestSweepExpiredSkipsDecayDisabledAndPinned(t *testing.T) {
 	h := newHarness(t)
 
 	cells := diskCells(t, 2)
+	geo := diskGeoJSON(t, 2)
 
 	// An eager area: its whole bound is pinned, so nothing ever decays.
 	eager := createAreaWith(t, h, &control.CreateAreaInput{
-		Name: "eager", Resolution: testRes, MaxRadiusMeters: 3000,
-		WarmStrategy: beeline.WarmEager, DemandIdleTTL: time.Hour, Cells: cells,
+		Name: "eager", GeoJSON: geo, Layers: layers1(3000, 0),
+		WarmStrategy: beeline.WarmEager, DemandIdleTTL: time.Hour,
 	})
 	_, err := h.coord.Enable(ctx, eager.ID)
 	require.NoError(t, err)
@@ -222,8 +329,8 @@ func TestSweepExpiredSkipsDecayDisabledAndPinned(t *testing.T) {
 
 	// A lazy area with decay disabled (TTL 0): demand pairs live until disable.
 	lazy := createAreaWith(t, h, &control.CreateAreaInput{
-		Name: "lazy", Resolution: testRes, MaxRadiusMeters: 3000,
-		WarmStrategy: beeline.WarmLazy, DemandIdleTTL: 0, Cells: cells,
+		Name: "lazy", GeoJSON: geo, Layers: layers1(3000, 0),
+		WarmStrategy: beeline.WarmLazy, DemandIdleTTL: 0,
 	})
 	_, err = h.coord.Enable(ctx, lazy.ID)
 	require.NoError(t, err)
@@ -244,51 +351,82 @@ func TestSweepExpiredSkipsDecayDisabledAndPinned(t *testing.T) {
 	assert.Equal(t, 1, lazyDebt.WorkingSet, "decay-disabled demand pair survives")
 }
 
-func TestValidationRejectsBadWarmConfig(t *testing.T) {
+func TestCreateRequiresGeoJSON(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t)
+
+	_, err := h.coord.Create(context.Background(), &control.CreateAreaInput{
+		Name: "no-geometry", Layers: layers1(1500, 0),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "geojson")
+}
+
+func TestLayerValidation(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	h := newHarness(t)
-	cells := diskCells(t, 1)
+	geo := diskGeoJSON(t, 1)
 
-	t.Run("full mesh must be eager", func(t *testing.T) {
-		t.Parallel()
-
-		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
-			Name: "fm", Resolution: testRes, MaxRadiusMeters: 0,
-			WarmStrategy: beeline.WarmLazy, Cells: cells,
-		})
-		assert.Error(t, err, "full-mesh (max 0) with a non-eager strategy is rejected")
-	})
-
-	t.Run("bounded radius below the neighbor floor is rejected", func(t *testing.T) {
-		t.Parallel()
-
+	cases := []struct {
+		name     string
+		strategy beeline.WarmStrategy
+		layers   []beeline.Layer
+	}{
+		{name: "no layers", layers: nil},
+		{name: "duplicate resolutions", layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: 1500},
+			{Resolution: testRes, MaxRadiusMeters: 3000},
+		}},
+		{name: "resolution out of range", layers: []beeline.Layer{
+			{Resolution: 16, MaxRadiusMeters: 1500},
+		}},
+		{name: "negative min distance", layers: []beeline.Layer{
+			{Resolution: testRes, MinDistanceMeters: -1, MaxRadiusMeters: 1500},
+		}},
+		{name: "finest layer with nonzero min distance", layers: []beeline.Layer{
+			{Resolution: testRes, MinDistanceMeters: 100, MaxRadiusMeters: 1500},
+		}},
+		{name: "min distance decreasing toward coarser", layers: []beeline.Layer{
+			{Resolution: 8, MinDistanceMeters: 0, MaxRadiusMeters: 1500},
+			{Resolution: 7, MinDistanceMeters: 5000, MaxRadiusMeters: 6000},
+			{Resolution: 6, MinDistanceMeters: 2000, MaxRadiusMeters: 12000},
+		}},
+		{name: "negative max radius", layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: -1},
+		}},
+		{name: "full-mesh layer with non-eager strategy", strategy: beeline.WarmLazy, layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: 0},
+		}},
+		{name: "core exceeds max", strategy: beeline.WarmHybrid, layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: 1000, CoreRadiusMeters: 5000},
+		}},
 		// 500m at res 8 reaches no neighbor cell (cells are ~900m apart), so every
 		// origin would pair only with itself — the degenerate case the floor forbids.
-		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
-			Name: "too-tight", Resolution: testRes, MaxRadiusMeters: 500,
-			WarmStrategy: beeline.WarmEager, Cells: cells,
-		})
-		assert.Error(t, err, "a max radius below the res-8 neighbor floor is rejected")
-	})
+		{name: "bounded radius below the neighbor floor", layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: 500},
+		}},
+	}
 
-	t.Run("core may not exceed max", func(t *testing.T) {
-		t.Parallel()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
-			Name: "big-core", Resolution: testRes, MaxRadiusMeters: 1000, CoreRadiusMeters: 5000,
-			WarmStrategy: beeline.WarmHybrid, Cells: cells,
+			_, err := h.coord.Create(ctx, &control.CreateAreaInput{
+				Name: "bad", GeoJSON: geo, Layers: tc.layers, WarmStrategy: tc.strategy,
+			})
+			assert.Error(t, err)
 		})
-		assert.Error(t, err, "core radius greater than max radius is rejected")
-	})
+	}
 
 	t.Run("unknown strategy is rejected", func(t *testing.T) {
 		t.Parallel()
 
 		_, err := h.coord.Create(ctx, &control.CreateAreaInput{
-			Name: "weird", Resolution: testRes, MaxRadiusMeters: 1000,
-			WarmStrategy: beeline.WarmStrategy("aggressive"), Cells: cells,
+			Name: "weird", GeoJSON: geo, Layers: layers1(1000, 0),
+			WarmStrategy: beeline.WarmStrategy("aggressive"),
 		})
 		assert.Error(t, err)
 	})
@@ -297,7 +435,7 @@ func TestValidationRejectsBadWarmConfig(t *testing.T) {
 		t.Parallel()
 
 		area, err := h.coord.Create(ctx, &control.CreateAreaInput{
-			Name: "default", Resolution: testRes, MaxRadiusMeters: 1000, Cells: cells,
+			Name: "default", GeoJSON: geo, Layers: layers1(1000, 0),
 		})
 		require.NoError(t, err)
 		assert.Equal(t, beeline.WarmEager, area.WarmStrategy)
@@ -310,7 +448,7 @@ func TestCreateIsDisabledAndNotSeeded(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	assert.False(t, area.Enabled, "new areas are disabled")
 
 	debt, err := h.index.Debt(ctx)
@@ -327,7 +465,7 @@ func TestEnableSeedsAndRoutes(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	enabled, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
 	assert.True(t, enabled.Enabled)
@@ -339,7 +477,7 @@ func TestEnableSeedsAndRoutes(t *testing.T) {
 	routed, ok := h.coord.Locate(beeline.LatLng{Lat: sfLat, Lng: sfLng})
 	require.True(t, ok, "an enabled area routes a contained point")
 	assert.Equal(t, area.ID, routed.ID)
-	assert.Equal(t, testRes, routed.Resolution)
+	assert.Equal(t, testRes, routed.ReadLayer().Resolution)
 }
 
 func TestDisableUnseedsAndClearsStore(t *testing.T) {
@@ -348,7 +486,7 @@ func TestDisableUnseedsAndClearsStore(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	_, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
 
@@ -370,36 +508,34 @@ func TestDisableUnseedsAndClearsStore(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestAddCellsConvergesEnabledArea(t *testing.T) {
+func TestSetGeoJSONConvergesEnabledArea(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	h := newHarness(t)
 
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	_, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
 
 	before, err := h.index.DebtForArea(ctx, area.ID)
 	require.NoError(t, err)
 
-	// Grow to a 2-ring; the outer ring adds cells (and pairs).
-	two := diskCells(t, 2)
-	updated, err := h.coord.AddCells(ctx, area.ID, two)
+	// Replace the geometry with the 2-ring disk; the outer ring adds cells (and pairs).
+	_, err = h.coord.SetGeoJSON(ctx, area.ID, diskGeoJSON(t, 2))
 	require.NoError(t, err)
-	assert.Len(t, updated.Cells, len(two))
 
 	after, err := h.index.DebtForArea(ctx, area.ID)
 	require.NoError(t, err)
-	assert.Greater(t, after.WorkingSet, before.WorkingSet, "added cells grow the working set")
+	assert.Greater(t, after.WorkingSet, before.WorkingSet, "the grown geometry grows the working set")
 
-	// A point in a newly added outer cell now routes into the area.
+	// A point in a newly covered outer cell now routes into the area.
 	oneSet := make(map[beeline.H3Cell]struct{})
 	for _, c := range diskCells(t, 1) {
 		oneSet[c] = struct{}{}
 	}
 	var outer beeline.H3Cell
-	for _, c := range two {
+	for _, c := range diskCells(t, 2) {
 		if _, ok := oneSet[c]; !ok {
 			outer = c
 			break
@@ -409,7 +545,7 @@ func TestAddCellsConvergesEnabledArea(t *testing.T) {
 	center, err := beeline.Center(outer)
 	require.NoError(t, err)
 	_, ok := h.coord.Locate(center)
-	assert.True(t, ok, "a newly added cell routes reads")
+	assert.True(t, ok, "a newly covered cell routes reads")
 }
 
 func TestDeleteRemovesEverything(t *testing.T) {
@@ -418,7 +554,7 @@ func TestDeleteRemovesEverything(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	_, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
 
@@ -441,13 +577,13 @@ func TestResumeEnabledSeedsOnlyEnabled(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	enabledArea := createArea(t, h, diskCells(t, 1))
+	enabledArea := createArea(t, h, 1)
 	_, err := h.coord.Enable(ctx, enabledArea.ID)
 	require.NoError(t, err)
 
 	// A second, disabled area sharing the same repo.
 	_, err = h.coord.Create(ctx, &control.CreateAreaInput{
-		Name: "disabled", Resolution: testRes, MaxRadiusMeters: 1500, Cells: diskCells(t, 1),
+		Name: "disabled", GeoJSON: diskGeoJSON(t, 1), Layers: layers1(1500, 0),
 	})
 	require.NoError(t, err)
 
@@ -474,29 +610,13 @@ func TestResumeEnabledSeedsOnlyEnabled(t *testing.T) {
 	assert.Positive(t, debt.WorkingSet)
 }
 
-func TestCreateRejectsMixedResolutionCells(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	h := newHarness(t)
-
-	// A res-9 cell supplied for a res-8 area must be rejected.
-	center9, err := beeline.CellAt(beeline.LatLng{Lat: sfLat, Lng: sfLng}, 9)
-	require.NoError(t, err)
-
-	_, err = h.coord.Create(ctx, &control.CreateAreaInput{
-		Name: "bad", Resolution: testRes, MaxRadiusMeters: 1500, Cells: []beeline.H3Cell{center9},
-	})
-	assert.Error(t, err)
-}
-
 func TestCreateDefaultsProviderToHaversine(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t)
 
 	// No RoutingProvider set → normalized and persisted as the built-in default.
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	assert.Equal(t, config.DefaultProviderName, area.RoutingProvider)
 
 	got, err := h.coord.Get(context.Background(), area.ID)
@@ -510,8 +630,8 @@ func TestCreateRejectsUnknownProvider(t *testing.T) {
 	h := newHarness(t)
 
 	_, err := h.coord.Create(context.Background(), &control.CreateAreaInput{
-		Name: "bad", Resolution: testRes, MaxRadiusMeters: 1500,
-		Cells: diskCells(t, 1), RoutingProvider: "nope",
+		Name: "bad", GeoJSON: diskGeoJSON(t, 1), Layers: layers1(1500, 0),
+		RoutingProvider: "nope",
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown routing provider")
@@ -525,15 +645,15 @@ func TestEngineForSelectsPerAreaProvider(t *testing.T) {
 
 	// An area on the named OSRM provider (max table size 10000, per newHarness).
 	osrmArea, err := h.coord.Create(ctx, &control.CreateAreaInput{
-		Name: "osrm", Resolution: testRes, MaxRadiusMeters: 1500,
-		Cells: diskCells(t, 1), RoutingProvider: testProvider,
+		Name: "osrm", GeoJSON: diskGeoJSON(t, 1), Layers: layers1(1500, 0),
+		RoutingProvider: testProvider,
 	})
 	require.NoError(t, err)
 	_, err = h.coord.Enable(ctx, osrmArea.ID)
 	require.NoError(t, err)
 
 	// A second area on the built-in default (unbounded table size).
-	defaultArea := createArea(t, h, diskCells(t, 1))
+	defaultArea := createArea(t, h, 1)
 	_, err = h.coord.Enable(ctx, defaultArea.ID)
 	require.NoError(t, err)
 
@@ -551,19 +671,45 @@ func TestUpdateChangesProvider(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 
-	area := createArea(t, h, diskCells(t, 1))
+	area := createArea(t, h, 1)
 	_, err := h.coord.Enable(ctx, area.ID)
 	require.NoError(t, err)
 	require.Equal(t, 0, h.coord.EngineFor(area.ID).Capabilities().MaxTableSize)
 
 	updated, err := h.coord.Update(ctx, area.ID, &control.UpdateAreaInput{
-		Name: area.Name, Resolution: area.Resolution, MaxRadiusMeters: area.MaxRadiusMeters,
+		Name: area.Name, Layers: area.Layers,
 		RoutingProvider: testProvider,
 	})
 	require.NoError(t, err)
 	assert.Equal(t, testProvider, updated.RoutingProvider)
 	assert.Equal(t, 10000, h.coord.EngineFor(area.ID).Capabilities().MaxTableSize,
 		"re-converging the enabled area picks up the new provider's engine")
+}
+
+func TestUpdateReplacesLayerList(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	area := createArea(t, h, 2) // one res-8 layer
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	// Grow to two layers; the enabled area re-converges and seeds both.
+	updated, err := h.coord.Update(ctx, area.ID, &control.UpdateAreaInput{
+		Name: area.Name,
+		Layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: 3000},
+			{Resolution: 7, MinDistanceMeters: 2500, MaxRadiusMeters: 6000},
+		},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{8, 7}, resolutions(updated.Layers))
+
+	routed, ok := h.coord.Locate(beeline.LatLng{Lat: sfLat, Lng: sfLng})
+	require.True(t, ok)
+	assert.Len(t, routed.Layers, 2, "the re-converged snapshot carries both layers")
 }
 
 func TestProviderNamesListsDefaultFirst(t *testing.T) {

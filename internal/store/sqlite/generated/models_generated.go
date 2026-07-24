@@ -4,18 +4,18 @@
 
 package generated
 
-type AreaCells struct {
-	AreaID int64
-	Cell   string
+type AreaLayers struct {
+	AreaID            int64
+	Resolution        int64
+	MinDistanceMeters float64
+	MaxRadiusMeters   float64
+	CoreRadiusMeters  float64
 }
 
 type Areas struct {
 	ID                   int64
 	Name                 string
-	Resolution           int64
-	RadiusMeters         float64
 	WarmStrategy         string
-	CoreRadiusMeters     float64
 	DemandIdleTtlSeconds int64
 	Geojson              *string
 	Enabled              int64

@@ -128,9 +128,10 @@ run:
 	go run $(CMD_PACKAGE) $(ARGS)
 
 # demo runs the server against a fresh, gitignored SQLite database
-# (artifacts/demo.db) and seeds one enabled service area, so the operator console
-# shows the cache loading right away. Ctrl-C stops it. Override the port with
-# `make demo PORT=9090`.
+# (artifacts/demo.db) and seeds three enabled Austin service areas (downtown at
+# res 9, the city at res 8, the metro at res 7), so the operator console shows a
+# realistic multi-area cache loading right away. Ctrl-C stops it. Override the
+# port with `make demo PORT=9090`.
 PORT ?= 8080
 .PHONY: demo
 demo: build

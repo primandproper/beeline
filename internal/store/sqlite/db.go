@@ -12,7 +12,7 @@ import (
 
 // Open opens the SQLite database at path, applies pending migrations, and returns a
 // ready *sql.DB. Pass ":memory:" for an ephemeral database (tests). Foreign keys are
-// enabled (the area_cells → areas cascade depends on them) and, for file databases,
+// enabled (the area_layers → areas cascade depends on them) and, for file databases,
 // WAL journaling is set for better read/write concurrency.
 //
 // The pool is capped at a single open connection: SQLite allows only one writer, and

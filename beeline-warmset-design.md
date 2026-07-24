@@ -1,7 +1,9 @@
 # Beeline Warm-Set Design: bounding, warm strategies, and decay
 
-**Status:** **Implemented** (Phases 1–3). Phase 4 (multi-resolution tiering) remains deferred —
-sketch only. See §7 for the decisions taken; the plan below is retained as the record of intent.
+**Status:** **Implemented** (Phases 1–4). Phase 4 landed as **layers** (`Area.Layers []Layer`,
+the sketch's "tiers" plus a per-layer `MinDistanceMeters` recorded for future distance-based
+selection); read-path fallthrough across layers is still deferred — reads key at the finest
+layer. See §7 for the decisions taken; the plan below is retained as the record of intent.
 **Audience:** an implementing agent starting fresh. This doc is self-contained; read
 `beeline-design.md` (esp. §3 freshness, §6 batching, §7 bounding, §9 read path) for the
 underlying model, and `CLAUDE.md` for build/test commands. Section refs (§) point into
@@ -224,33 +226,46 @@ default e.g. 1h). Persist + DTO + console as with the others.
 with no queries; a repeatedly-queried pair stays; eager-core pairs never leave. Unit-test the
 sweep with the injectable clock (`index.New(ttl, clock)`).
 
-### Phase 4 — Multi-resolution tiering (deferred; sketch only)
+### Phase 4 — Multi-resolution tiering (**implemented as "layers"**)
 
-Do **not** build this until Phases 1–3 are solid. Recorded so the earlier phases stay compatible.
+Landed after Phases 1–3, with the sketch's "tier" renamed **layer** and one addition:
+each layer records `MinDistanceMeters`, the trip distance from which that layer is meant
+to serve (the DoorDash-style distance-based selection input), unused on reads for now.
 
-- Area holds `Tiers []Tier{Resolution int; MaxRadiusMeters float64; CoreRadiusMeters float64}`
-  instead of a single resolution+radius. Single-res today is the one-tier case.
-- Tessellation produces the pair set per tier (each tier its own resolution + bound).
-  `PairKey.Res` already distinguishes tiers, so they coexist in one index/store partition.
-- Read path picks the **finest** tier whose bound covers the trip and has a hit; falls through to
-  coarser (§7/§9). `AreaRouter.Locate` must return the tier list (finest→coarsest) rather than one
-  resolution; `query.Estimate` iterates.
-- The bound/warm/decay machinery from Phases 1–3 applies **per tier** unchanged — that is the whole
-  reason to do tiering last.
-
-Compatibility guard for earlier phases: keep resolution/bound access funnelled through small
-helpers (e.g. don't scatter `routed.Resolution` reads across `query.go`) so swapping "one resolution"
-for "a tier list" is a localized change.
+- Area holds `Layers []Layer{Resolution int; MinDistanceMeters, MaxRadiusMeters,
+  CoreRadiusMeters float64}` (finest→coarsest) instead of a single resolution+radius.
+  Single-res is the one-layer case.
+- GeoJSON became the canonical, **required** geometry: every layer's cell set is derived by
+  polyfilling it at that layer's resolution at seed time (enable / boot resume / geometry
+  change). The persisted cell set and the manual hex-refinement surface (create-from-cells,
+  `POST …/cells`, console hex editing) were removed with it.
+- Tessellation produces the pair set per layer (each layer its own resolution + bound).
+  `PairKey.Res` distinguishes layers, so they coexist in one index/store partition, and the
+  bound/warm/decay machinery from Phases 1–3 applies per layer unchanged.
+- `AreaRouter.Locate` returns the layer list (finest→coarsest); containment is membership in
+  the finest layer's cell set.
+- **Still deferred:** the read path iterating layers (pick the finest layer whose bound covers
+  the trip and has a hit; fall through to coarser, §7/§9). Reads use `RoutedArea.ReadLayer()`
+  (the finest layer) only — the funnel to extend when fallthrough lands. Per-area freshness
+  accounting (`DebtForArea`, `/_ops_/cells`) blends layers; `/_ops_/cells` tags each cell with
+  its resolution so they can be told apart.
 
 ## 6. Final area config surface (target end state)
 
 ```jsonc
 {
   "name": "austin",
-  "resolution": 9,                 // Phase 4: becomes tiers[]
   "warmStrategy": "hybrid",        // eager | lazy | hybrid   (Phase 2)
-  "coreRadiusMeters": 3000,        // eagerly pinned fresh     (Phase 2)
-  "maxRadiusMeters": 15000,        // outer bound; 0 = full mesh (Phase 1); beyond = uncached
+  "layers": [                      // Phase 4: finest→coarsest precision layers
+    {
+      "resolution": 9,
+      "minDistanceMeters": 0,      // finest layer serves all reads today
+      "maxRadiusMeters": 15000,    // outer bound; 0 = full mesh (Phase 1); beyond = uncached
+      "coreRadiusMeters": 3000     // eagerly pinned fresh      (Phase 2)
+    },
+    { "resolution": 7, "minDistanceMeters": 10000, "maxRadiusMeters": 60000 }
+  ],
+  "geojson": { /* required — every layer polyfills from it */ },
   "demandIdleTTL": "1h"            // cold demand pairs evicted after this (Phase 3)
   // future: "maxTravelSeconds" per-profile time bound — NOT in scope
 }

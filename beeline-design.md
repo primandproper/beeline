@@ -106,7 +106,7 @@ flowchart TB
         q["Query handler<br/>tier fallthrough · same-cell correction"]
     end
 
-    geojson -->|"polyfill → (hand-refine) → seed pair set"| idx
+    geojson -->|"polyfill per layer → seed pair set"| idx
     idx -->|"Claim (SKIP LOCKED / Lua lease)"| w1
     w3 -->|Put| store
     w4 -->|MarkComputed| idx
@@ -252,15 +252,15 @@ compound because the matrix is quadratic.
   for the long tail, fine tiers for the dense near field.
 - **Road-aware tessellation.** Drop cells with no road network before building
   (spatial semi-join against OSM/Overture). Drop ~40% of cells → drop ~64% of
-  pairs. Biggest single build-cost lever. (The prototype no longer ships an
-  automated road mask — operators carve out roadless cells by hand from the
-  console; a real deploy could reintroduce an automated semi-join here.)
+  pairs. Biggest single build-cost lever. (The prototype ships no road mask —
+  every layer is a pure polyfill of the area's GeoJSON; a real deploy could
+  introduce an automated semi-join here.)
 - **Multi-resolution tiering.** Store each point at 3 resolutions; at query time
   select the highest (finest) available tier. Balances hit rate vs accuracy and
   handles both short and long trips. (DoorDash: res ~10 fine, mid, res ~6 coarse.)
 
-Ingestion is therefore: `polyfill(geojson, res)` → optional hand-refinement of the
-cell set → per resolution → seed FreshnessIndex with the resulting pair set.
+Ingestion is therefore: `polyfill(geojson, res)` per layer resolution → seed
+FreshnessIndex with the resulting per-layer pair sets.
 
 ## 8. Scaling & coordination
 
@@ -356,6 +356,6 @@ allocation proves insufficient.
    `SKIP LOCKED`.
 5. **Horizontal scale-out.** Co-located engine per worker; shared leased queue;
    demonstrate linear debt burn-down as nodes are added.
-6. **Bounding.** Travel-radius + hand-refined cell sets (automated road-aware
-   masking is a possible later optimization, not shipped).
+6. **Bounding.** Per-layer travel-radius bounds over pure polyfills (automated
+   road-aware masking is a possible later optimization, not shipped).
 7. **Sparse/demand lane.** Stale-while-revalidate, separate rate limit.

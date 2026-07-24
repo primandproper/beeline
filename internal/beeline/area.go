@@ -29,22 +29,43 @@ func (w WarmStrategy) Valid() bool {
 	}
 }
 
-// Area is a configured service area: a named set of H3 cells that the refresh loop
-// keeps fresh once the area is enabled. It is the persistent, operator-managed unit
-// that replaced the prototype's single config-file area — areas live in the store,
-// are disabled by default, and only enter the working set when enabled.
+// Layer is one precision level of a service area, in the DoorDash
+// fast-travel-estimates sense: the area's geometry is polyfilled to H3 cells at
+// Resolution and that cell set gets its own precomputed, cached pair set,
+// independent of the area's other layers (PairKey.Res keeps them apart in the
+// shared store/index).
 //
-// The canonical geometry is the explicit Cells set. An area may be seeded from an
-// uploaded GeoJSON polygon (polyfilled to cells) and then refined by adding or
-// removing individual cells, so after the first manual edit only Cells describes the
-// truth; GeoJSON is retained as provenance. Resolution fixes the H3 resolution of
-// every cell; MaxRadiusMeters is the per-origin travel-radius bound (§7), expressed
-// in meters, used to build the directed pair set from Cells. MaxRadiusMeters == 0 is
-// the full-mesh sentinel: every in-area cell is paired with every other.
+// MinDistanceMeters records the trip distance from which this layer is meant to
+// serve — future distance-based layer selection in the read path; today it is
+// stored and reported but never consulted (reads always use the finest layer).
 //
-// WarmStrategy and CoreRadiusMeters govern how much of that bound is kept fresh
-// eagerly. eager pins the whole bound; lazy pins nothing (demand only); hybrid pins
-// everything within CoreRadiusMeters and demand-fills the tail out to MaxRadiusMeters.
+// MaxRadiusMeters is this layer's per-origin travel-radius bound (§7), used to
+// build the directed pair set from the layer's cells; 0 is the full-mesh
+// sentinel: every in-layer cell is paired with every other. CoreRadiusMeters is
+// the near field the hybrid warm strategy pins eagerly within that bound.
+type Layer struct {
+	Resolution        int
+	MinDistanceMeters float64
+	MaxRadiusMeters   float64
+	CoreRadiusMeters  float64
+}
+
+// Area is a configured service area: a GeoJSON polygon plus the precision layers
+// it is precomputed at. It is the persistent, operator-managed unit — areas live
+// in the store, are disabled by default, and only enter the working set when
+// enabled.
+//
+// The canonical geometry is GeoJSON, required at creation. Cells are derived
+// data: each layer's cell set is re-polyfilled from the polygon at that layer's
+// resolution whenever the area is seeded (enable, boot resume, geometry change),
+// so nothing cell-shaped is persisted. Layers is ordered finest→coarsest
+// (descending resolution); the finest layer keys the read path and defines
+// containment.
+//
+// WarmStrategy governs how much of each layer's bound is kept fresh eagerly.
+// eager pins the whole bound; lazy pins nothing (demand only); hybrid pins
+// everything within the layer's CoreRadiusMeters and demand-fills the tail out
+// to its MaxRadiusMeters.
 //
 // DemandIdleTTL is how long a demand-filled (unpinned) pair survives without being
 // queried before the decay sweep evicts it; 0 disables decay (demand pairs live until
@@ -61,34 +82,63 @@ func (w WarmStrategy) Valid() bool {
 // means the built-in default (haversine), so areas created before providers existed
 // keep routing through the in-process engine unchanged.
 type Area struct {
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	Name             string
-	WarmStrategy     WarmStrategy
-	RoutingProvider  string
-	GeoJSON          []byte
-	Cells            []H3Cell
-	DemandIdleTTL    time.Duration
-	TargetTTL        time.Duration
-	LeaseDuration    time.Duration
-	SweepInterval    time.Duration
-	ID               AreaID
-	Resolution       int
-	MaxRadiusMeters  float64
-	CoreRadiusMeters float64
-	Enabled          bool
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	Name            string
+	WarmStrategy    WarmStrategy
+	RoutingProvider string
+	GeoJSON         []byte
+	Layers          []Layer
+	DemandIdleTTL   time.Duration
+	TargetTTL       time.Duration
+	LeaseDuration   time.Duration
+	SweepInterval   time.Duration
+	ID              AreaID
+	Enabled         bool
+}
+
+// Finest is the area's highest-resolution layer — Layers[0] under the
+// finest→coarsest ordering invariant. It keys the read path and defines area
+// containment. The zero Layer is returned for an (invalid) layerless area.
+func (a *Area) Finest() Layer {
+	if len(a.Layers) == 0 {
+		return Layer{}
+	}
+
+	return a.Layers[0]
+}
+
+// RoutedLayer is one precision layer of a routed area as the read path sees it:
+// the resolution to key lookups at, the travel bound that decides whether a
+// demand-fill may be cached (0 = unbounded full mesh), and the future selection
+// threshold. It mirrors Layer minus the warm-only CoreRadiusMeters.
+type RoutedLayer struct {
+	Resolution        int
+	MinDistanceMeters float64
+	MaxRadiusMeters   float64
 }
 
 // RoutedArea is the result of resolving a query coordinate to the enabled service
-// area that contains it: the area's id, the H3 resolution to key lookups at, and the
-// area's outer travel bound. The read path uses it to attribute cache hits and
-// demand-fills to the right area partition and to decide whether a demand-fill falls
-// within the bound (and may be cached) or beyond it (answered but never cached). See
-// the AreaRouter seam in package query. MaxRadiusMeters == 0 means unbounded (full
-// mesh): every in-area query is cacheable.
+// area that contains it: the area's id and its layers, finest→coarsest. The read
+// path uses it to attribute cache hits and demand-fills to the right area
+// partition and to decide whether a demand-fill falls within the bound (and may
+// be cached) or beyond it (answered but never cached). See the AreaRouter seam in
+// package query. Today reads use only ReadLayer(); the full list is carried so
+// distance-based layer fallthrough can land without changing this seam.
 type RoutedArea struct {
-	TargetTTL       time.Duration
-	ID              AreaID
-	Resolution      int
-	MaxRadiusMeters float64
+	Layers    []RoutedLayer
+	TargetTTL time.Duration
+	ID        AreaID
+}
+
+// ReadLayer is the layer the read path keys lookups at: the finest one
+// (Layers[0]). Distance-based selection across the rest of the list is
+// deliberately not implemented yet. The zero RoutedLayer is returned for an
+// (invalid) layerless routed area.
+func (r RoutedArea) ReadLayer() RoutedLayer {
+	if len(r.Layers) == 0 {
+		return RoutedLayer{}
+	}
+
+	return r.Layers[0]
 }

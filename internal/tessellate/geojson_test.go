@@ -116,6 +116,30 @@ func TestCellsFromGeoJSON(t *testing.T) {
 	})
 }
 
+func TestSamplePoint(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns the first outer-ring vertex", func(t *testing.T) {
+		t.Parallel()
+
+		raw := squarePolygon(-122.52, 37.70, -122.35, 37.83)
+		p, err := tessellate.SamplePoint([]byte(raw))
+		require.NoError(t, err)
+		assert.InDelta(t, 37.70, p.Lat, 1e-9)
+		assert.InDelta(t, -122.52, p.Lng, 1e-9)
+	})
+
+	t.Run("rejects non-areal and malformed geojson", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := tessellate.SamplePoint([]byte(`{"type":"Point","coordinates":[0,0]}`))
+		assert.Error(t, err)
+
+		_, err = tessellate.SamplePoint([]byte(`not json`))
+		assert.Error(t, err)
+	})
+}
+
 // TestPairsFromCells checks the area-tagged pair builder in isolation.
 func TestPairsFromCells(t *testing.T) {
 	t.Parallel()

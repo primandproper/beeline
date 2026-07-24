@@ -55,22 +55,25 @@ Then open **http://localhost:8080**.
 
 Started with plain `serve`, a fresh database has **no areas** — nothing refreshes
 until you configure one. In the
-console: click **+ New**, give it a name, upload a **GeoJSON polygon** (or leave it
-empty), and create it. The area starts **disabled**. Flip it **On** and the refresh
-loop begins filling it with H3 cells. Areas over open water stay **carved out**: cells
-with no roads are pruned when the polygon is polyfilled (design §7, "road-aware
-tessellation"). Refine the shape by clicking **Edit hexes** and toggling cells on the
-map. Multiple areas can be enabled at once; the progress overlay paints the selected
-one.
+console: click **+ New**, give it a name, upload a **GeoJSON polygon** (required —
+it is the area's canonical geometry), and create it. The area starts **disabled**.
+Flip it **On** and the refresh loop begins filling it with H3 cells. An area carries
+one or more **precision layers** (H3 resolutions, DoorDash-style); each layer's cell
+set is derived from the polygon and precomputed independently. The console creates
+one-layer areas; add more layers via the HTTP API. Multiple areas can be enabled at
+once; the progress overlay paints the selected one.
 
 Everything the console does is a plain HTTP call — drive it with curl too:
 
 ```bash
-# create an area from a GeoJSON polygon (starts disabled), then enable it.
-# maxRadiusMeters is the per-origin travel-radius bound (0 = full mesh); warmStrategy
-# is eager | lazy | hybrid; demandIdleTTL evicts cold demand-filled pairs (blank = never).
+# create an area from a GeoJSON polygon (starts disabled), then enable it. layers is
+# the ordered list of precision layers: per layer, maxRadiusMeters is the per-origin
+# travel-radius bound (0 = full mesh) and minDistanceMeters is recorded for future
+# distance-based layer selection; warmStrategy is eager | lazy | hybrid;
+# demandIdleTTL evicts cold demand-filled pairs (blank = never).
 curl -sX POST localhost:8080/_config_/areas -H content-type:application/json -d '{
-  "name":"downtown","resolution":8,"maxRadiusMeters":3000,"warmStrategy":"hybrid","coreRadiusMeters":1500,"demandIdleTTL":"1h",
+  "name":"downtown","warmStrategy":"hybrid","demandIdleTTL":"1h",
+  "layers":[{"resolution":8,"minDistanceMeters":0,"maxRadiusMeters":3000,"coreRadiusMeters":1500}],
   "geojson":{"type":"Polygon","coordinates":[[[-98.05,30.32],[-97.99,30.32],[-97.99,30.37],[-98.05,30.37],[-98.05,30.32]]]}}'
 curl -sX POST localhost:8080/_config_/areas/1/enable
 
@@ -82,9 +85,9 @@ curl -sX POST localhost:8080/_config_/areas/1/disable   # stop refreshing it; it
 
 Area definitions persist in the database (default `beeline.db`, override with
 `BEELINE_MATRIX_DATABASE_PATH`), so an enabled area re-seeds and re-warms on restart;
-a disabled one stays idle. An area's cell set is the polyfill of its uploaded polygon;
-refine it by hand from the console (click cells to add or remove) to carve out water,
-private land, or anywhere else you don't want covered.
+a disabled one stays idle. Cells are derived data: every layer's cell set is
+re-polyfilled from the area's GeoJSON at seed time, so replacing the polygon
+(PUT …/geojson) reshapes the whole area.
 
 ## What's included
 

@@ -128,34 +128,51 @@ build: $(ARTIFACTS_DIR)
 run:
 	go run $(CMD_PACKAGE) $(ARGS)
 
-# demo runs the server against a fresh, gitignored SQLite database
-# (artifacts/demo.db) and seeds three enabled Austin service areas (downtown at
-# res 9, the city at res 8, the metro at res 7), so the operator console shows a
-# realistic multi-area cache loading right away. Ctrl-C stops it. Override the
-# port with `make demo PORT=9090`.
+## DEMOS
+#
+# Three sizes of the same story, each seeding the same three Austin service areas
+# (scripts/seed_demo_areas.sh) so what changes between them is the deployment,
+# never the workload:
+#
+#   simpledemo  — one process, no dependencies, the in-process haversine engine.
+#   clusterdemo — one leader + 3 follower processes, the latency-simulated engine.
+#   fulldemo    — docker-compose: postgres + redis, 3 heads, 8 workers.
+#
+# All three share PORT (the first/only head).
 PORT ?= 8080
-.PHONY: demo
-demo: build
-	PORT=$(PORT) $(SCRIPTS_DIR)/demo.sh
 
-# demo-cluster runs the leader/follower split live: the same demo, but the leader
-# starts with zero local refresh workers (pure coordinator) and the areas route
-# through the simulated network-latency provider, so keeping them fresh genuinely
-# needs the three follower processes the script starts alongside. It tails the
-# leader's freshness contract so you can watch achieved throughput clear required.
-# Override the follower count with `make demo-cluster FOLLOWERS=5`.
+# simpledemo runs a single server against a fresh, gitignored SQLite database
+# (artifacts/demo.db) and seeds the three enabled Austin areas (downtown at res 9,
+# the city at res 8, the metro at res 7+6), so the operator console shows a
+# realistic multi-area cache loading right away. Everything — hot store, freshness
+# index, routing engine — is in-process, so it needs nothing but the binary.
+# Ctrl-C stops it. Override the port with `make simpledemo PORT=9090`.
+.PHONY: simpledemo
+simpledemo: build
+	PORT=$(PORT) $(SCRIPTS_DIR)/demo_simple.sh
+
+# clusterdemo runs the leader/follower split live: the same three areas, but the
+# leader starts with zero local refresh workers (pure coordinator) and the areas
+# route through the simulated network-latency provider, so keeping them fresh
+# genuinely needs the three follower processes the script starts alongside. It
+# tails the leader's freshness contract so you can watch achieved throughput clear
+# required. Override the follower count with `make clusterdemo FOLLOWERS=5`.
 FOLLOWERS ?= 3
-.PHONY: demo-cluster
-demo-cluster: build
+.PHONY: clusterdemo
+clusterdemo: build
 	PORT=$(PORT) FOLLOWERS=$(FOLLOWERS) $(SCRIPTS_DIR)/demo_cluster.sh
 
-# demo-multihead runs the distributed deployment live: two identical serve heads
-# over one shared (containerized) Postgres, followers split across both, one area
-# enabled through head A and served by both. Kill either head and the other keeps
-# the freshness contract. FOLLOWERS=n to scale; needs Docker.
-.PHONY: demo-multihead
-demo-multihead: build
-	PORT=$(PORT) FOLLOWERS=$(FOLLOWERS) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/demo_multihead.sh
+# fulldemo runs the distributed deployment as a docker-compose cluster: shared
+# Postgres (coordination state) and Redis (hot estimate store) wired into a pool
+# of three identical serve heads on :8080/:8090/:8100 and a pool of eight work
+# followers. Areas enabled through one head are served by all three; stop a head
+# and the survivors keep the freshness contract. Everything runs in containers —
+# no local binary needed — so it needs only Docker (Compose v2). WORKERS=n scales
+# the follower pool.
+WORKERS ?= 8
+.PHONY: fulldemo
+fulldemo:
+	PORT=$(PORT) WORKERS=$(WORKERS) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/demo_full.sh
 
 .PHONY: test
 test: $(ARTIFACTS_DIR)

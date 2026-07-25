@@ -39,13 +39,23 @@ over HTTP. The routing engine is a Haversine stand-in (great-circle distance ÷
 per-profile speed) behind the same interface a real engine (OSRM/Valhalla) would
 implement, so the whole pipeline runs with **no external routing dependency**.
 
-The fastest path is **`make demo`**: it runs the server against a fresh, gitignored
-SQLite database (`artifacts/demo.db`) and auto-seeds one **enabled** demo area
-(Southeast Austin), so the console shows the cache loading immediately. `Ctrl-C` stops
-it; re-running resets from scratch. Override the port with `make demo PORT=9090`.
+There are three demos, each seeding the **same three Austin service areas** (downtown
+at res 9, the city at res 8, the metro at res 7+6 — ~1.1M pairs), so what changes
+between them is the deployment, never the workload:
+
+| | what it runs | dependencies |
+|---|---|---|
+| `make simpledemo` | one process, in-process haversine engine | none |
+| `make clusterdemo` | 1 coordinator-only leader + 3 follower processes, latency-simulated engine | none |
+| `make fulldemo` | docker-compose: Postgres + Redis, 3 `serve` heads, 8 `work` followers | Docker |
+
+The fastest path is **`make simpledemo`**: it runs the server against a fresh, gitignored
+SQLite database (`artifacts/demo.db`) with the three areas **enabled**, so the console
+shows the cache loading immediately. `Ctrl-C` stops it; re-running resets from scratch.
+Override the port with `make simpledemo PORT=9090`.
 
 ```bash
-make demo                                             # fresh db + seeded demo area + serve
+make simpledemo                                       # fresh db + seeded demo areas + serve
 # …or start empty and configure areas yourself:
 make build
 make run ARGS="serve --config config/localdev.json"   # or ./artifacts/beeline serve --config config/localdev.json
@@ -62,12 +72,25 @@ smoothly (a leader started with `refreshWorkers: 0` does no computing of its own
 ./artifacts/beeline work --config config/localdev.json --leader http://localhost:8080
 ```
 
-**`make demo-cluster`** stages the whole story in one command: a coordinator-only leader
+**`make clusterdemo`** stages the whole story in one command: a coordinator-only leader
 (`refreshWorkers: 0`) seeds the demo areas against the simulated network-latency engine — a workload
 one follower cannot keep fresh — and three followers claim, compute, and submit until achieved
 throughput clears the freshness contract's requirement. The script tails `/_ops_/freshness` so you
-can watch it happen; try `make demo-cluster FOLLOWERS=1` to see the contract missed, or kill one
+can watch it happen; try `make clusterdemo FOLLOWERS=1` to see the contract missed, or kill one
 follower mid-run and watch the burn rate sag.
+
+**`make fulldemo`** goes the rest of the way: a docker-compose cluster of shared Postgres (the
+freshness index, operator config, and singleton election), Redis (the hot estimate store), a pool of
+**three identical `serve` heads** on `:8080`/`:8090`/`:8100`, and a pool of **eight `work`
+followers**. No head is special — the areas are enabled through head A and served by all three
+within a config-poll interval, and the script tails all three heads' freshness side by side so you
+can see them agree. Stop one and the survivors keep the contract:
+
+```bash
+make fulldemo                    # or WORKERS=16 make fulldemo
+docker compose -p beeline-fulldemo stop head-b                 # A and C keep burning debt
+curl 'localhost:8100/estimate?origin=30.27,-97.745&dest=30.275,-97.74'   # head C answers for head A's areas
+```
 
 Started with plain `serve`, a fresh database has **no areas** — nothing refreshes
 until you configure one. In the

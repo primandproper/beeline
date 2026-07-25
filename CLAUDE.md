@@ -114,8 +114,16 @@ HTTP endpoints (default `:8080`):
   `config/<env>.json` via `config.Render`. The checked-in JSON is a projection of these builders — edit
   the Go, never the JSON, then re-run `make configs`.
 - `config/` — generated per-environment config files (`localdev.json`, `cluster.json` — the
-  distributed-mode reference, used by `make demo-multihead` — and `production.json`); committed so
+  distributed-mode reference, used by `make fulldemo` — and `production.json`); committed so
   they stay reviewable, and loadable at runtime via `--config`.
+- `Dockerfile` + `docker-compose.yml` — the containerized deployment behind `make fulldemo`: one
+  cgo-enabled image (uber/h3-go wraps the C library) serving every role, and a compose cluster of
+  Postgres + Redis + 3 `serve` heads + 8 `work` followers. Only `head-a` carries the build block (four
+  services declaring one tag makes buildx race); the heads share a `heads` network alias so followers
+  spread across the pool. Backend wiring is env-only (`BEELINE_MATRIX_BACKEND_*` over
+  `config/cluster.json`).
+- `scripts/seed_demo_areas.sh` — the three canonical Austin demo areas (downtown res 9 full mesh,
+  city res 8 / 8 km, metro res 7+6), shared by all three demo scripts so the polygons live in one place.
 - `internal/cli/` — cobra root command, observability bootstrap + shutdown, subcommands
   (`version.go`, `serve.go`). `serve.go` wires the whole matrix pipeline from `application.cfg` +
   `application.pillars`.
@@ -257,12 +265,17 @@ make sqlc           # Regenerate both sqlc targets (sqlite + postgres generated/
 make build          # Compile all packages, then build artifacts/beeline with version metadata
 make run ARGS="version"   # go run the CLI with arguments
 make run ARGS="serve --config config/localdev.json"   # open area store + refresh + serve HTTP on :8080
-make demo           # fresh gitignored SQLite db (artifacts/demo.db) + auto-seed & enable a demo area, then serve
-make demo-cluster   # leader/follower live: coordinator-only leader (refreshWorkers=0) + 3 `work` followers
-                    # against the latency-simulated engine; tails /_ops_/freshness. FOLLOWERS=n to scale.
-make demo-multihead # distributed mode live: two identical serve heads over one containerized Postgres,
-                    # followers split across both, one area enabled via head A and served by both; kill a
-                    # head and the other keeps the contract. FOLLOWERS=n to scale; needs Docker.
+make simpledemo     # one process, no dependencies: fresh gitignored SQLite db (artifacts/demo.db),
+                    # the three Austin demo areas auto-seeded & enabled against the in-process
+                    # haversine engine, then serve. PORT=n to move it.
+make clusterdemo    # leader/follower live: coordinator-only leader (refreshWorkers=0) + 3 `work`
+                    # followers against the latency-simulated engine; tails /_ops_/freshness.
+                    # FOLLOWERS=n to scale.
+make fulldemo       # the whole distributed deployment as a docker-compose cluster: Postgres
+                    # (coordination) + Redis (hot store) wired into a pool of 3 serve heads
+                    # (:8080/:8090/:8100) and a pool of 8 `work` followers; seeds via head A and tails
+                    # all three heads. Stop a head and the survivors keep the contract. WORKERS=n to
+                    # scale the follower pool; needs Docker (Compose v2), no local binary.
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
 make test           # Run tests (race detector, shuffle, failfast); excludes cmd packages

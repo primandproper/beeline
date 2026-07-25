@@ -1,0 +1,141 @@
+# make fulldemo — the whole distributed deployment in containers: shared Postgres
+# (coordination state: freshness index, operator config, advisory-lock election),
+# Redis (the hot estimate store), a pool of three identical `serve` heads, and a
+# pool of eight `work` followers.
+#
+# Nothing here is a "leader" in the durable sense: every head is stateless and
+# disposable, an area enabled through one head is served by all three within a
+# config-poll interval, and a follower's leader URL just names whichever head it
+# happens to claim from. `docker compose stop head-b` and the cluster keeps its
+# freshness contract.
+#
+# The Postgres and Redis addresses are the only wiring: they reach every head via
+# BEELINE_MATRIX_BACKEND_* (the env overlay on top of config/cluster.json), which
+# is what puts the freshness index in Postgres and the estimate cache in Redis.
+#
+# Driven by scripts/demo_full.sh; `docker compose up` works standalone too.
+
+# One image, every role. Only head-a carries the build block: four services
+# declaring the same tag makes buildx build (and race to export) the same image
+# four times over. Compose finishes the build phase before it creates any
+# container, so the others just consume the tag — pull_policy pins that, since
+# beeline:demo exists nowhere but this machine.
+x-beeline-image: &beeline-image
+  image: beeline:demo
+  pull_policy: never
+
+# Every head runs identically: coordinator-only (config/cluster.json sets
+# refreshWorkers 0, so all compute is remote), Postgres for coordination, Redis
+# for the hot store. They differ only in which host port they publish.
+x-head: &head
+  <<: *beeline-image
+  command: ["serve", "--config", "config/cluster.json"]
+  environment:
+    BEELINE_MATRIX_BACKEND_MODE: postgres
+    BEELINE_MATRIX_BACKEND_POSTGRES_URL: postgres://beeline:beeline@postgres:5432/beeline?sslmode=disable
+    BEELINE_MATRIX_BACKEND_HOT_STORE: redis
+    BEELINE_MATRIX_BACKEND_REDIS_ADDR: redis:6379
+    BEELINE_MATRIX_SERVER_PORT: "8080"
+    BEELINE_LOG_LEVEL: ${LOG_LEVEL:-info}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    default:
+      # All three heads share the "heads" alias, so Docker's embedded DNS hands
+      # each follower a differently-ordered answer for http://heads:8080 and the
+      # worker pool spreads itself across the head pool.
+      aliases: [heads]
+  healthcheck:
+    test: ["CMD", "wget", "--quiet", "--output-document=-", "http://127.0.0.1:8080/_ops_/ready"]
+    interval: 3s
+    timeout: 3s
+    retries: 20
+    start_period: 10s
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_USER: beeline
+      POSTGRES_PASSWORD: beeline
+      POSTGRES_DB: beeline
+    ports:
+      # Published so you can psql into the shared state from the host.
+      - "${PG_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U beeline -d beeline"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      # The demo database is throwaway; keeping it off disk makes teardown total
+      # and the write-heavy freshness index quick.
+      - /var/lib/postgresql/data
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    ports:
+      - "${REDIS_PORT:-56379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  head-a:
+    <<: *head
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        COMMIT_HASH: ${COMMIT_HASH:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+        COMMIT_TIME: ${COMMIT_TIME:-unknown}
+    ports:
+      - "${PORT:-8080}:8080"
+
+  head-b:
+    <<: *head
+    ports:
+      - "${PORT_B:-8090}:8080"
+
+  head-c:
+    <<: *head
+    ports:
+      - "${PORT_C:-8100}:8080"
+
+  # The worker pool: eight follower replicas claiming from whichever head DNS
+  # gives them. Scale it live with `docker compose up -d --scale worker=12` to
+  # watch achieved throughput climb past required.
+  worker:
+    <<: *beeline-image
+    command: ["work", "--config", "config/cluster.json", "--leader", "http://heads:8080"]
+    environment:
+      BEELINE_MATRIX_FOLLOWER_WORKERS: ${FOLLOWER_WORKERS:-4}
+      BEELINE_LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      head-a:
+        condition: service_healthy
+      head-b:
+        condition: service_healthy
+      head-c:
+        condition: service_healthy
+    deploy:
+      replicas: ${WORKERS:-8}
+    # No published ports: eight replicas cannot share one host port, and the
+    # follower's health probe is only meaningful to the container runtime.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=-", "http://127.0.0.1:8081/_ops_/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+networks:
+  default:
+    name: beeline-fulldemo

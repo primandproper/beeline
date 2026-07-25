@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# make demo-cluster — the leader/follower split, live: one coordinator-only leader
+# make clusterdemo — the leader/follower split, live: one coordinator-only leader
 # plus FOLLOWERS follower processes, against a workload that actually needs them.
 #
-# The leader runs the regular demo (scripts/demo.sh: fresh SQLite db, three Austin
-# areas, ~1M pairs) but with BEELINE_MATRIX_REFRESH_WORKERS=0 — it seeds and serves
+# The leader runs the simple demo (scripts/demo_simple.sh: fresh SQLite db, three
+# Austin areas, ~1M pairs) but with BEELINE_MATRIX_REFRESH_WORKERS=0 — it seeds and serves
 # the work queue over /_work_/ and computes nothing itself. The areas route through
 # the "latent-haversine" provider (each 1×K table call pays a simulated 25–120 ms of
 # network latency, per config/localdev.json), so meeting the freshness contract
@@ -41,20 +41,20 @@ STATS_INTERVAL="${STATS_INTERVAL:-2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ ! -x "${BINARY}" ]]; then
-  echo "demo-cluster: ${BINARY} not found — run 'make build' first" >&2
+  echo "clusterdemo: ${BINARY} not found — run 'make build' first" >&2
   exit 1
 fi
 
 # A half-dead previous instance on the port makes the seeding requests land on the
 # wrong (draining) server with baffling errors — refuse to start over one.
 if curl -sf "${BASE}/_ops_/live" >/dev/null 2>&1; then
-  echo "demo-cluster: something is already serving on ${BASE} — stop it (or set PORT) first" >&2
+  echo "clusterdemo: something is already serving on ${BASE} — stop it (or set PORT) first" >&2
   exit 1
 fi
 
 PIDS=()
 cleanup() {
-  # Followers first, then the leader (demo.sh's own trap tears down its server).
+  # Followers first, then the leader (demo_simple.sh's own trap tears down its server).
   for ((i = ${#PIDS[@]} - 1; i >= 0; i--)); do
     kill "${PIDS[i]}" 2>/dev/null || true
   done
@@ -69,7 +69,7 @@ echo "▶ starting coordinator-only leader on ${BASE} (refreshWorkers=0, provide
 BEELINE_MATRIX_REFRESH_WORKERS=0 \
   DEMO_PROVIDER="${DEMO_PROVIDER:-latent-haversine}" \
   DEMO_LEASE="${DEMO_LEASE:-60s}" \
-  "${SCRIPT_DIR}/demo.sh" &
+  "${SCRIPT_DIR}/demo_simple.sh" &
 PIDS+=($!)
 
 # Wait until the leader is live and all three demo areas are enabled. Enable is
@@ -88,7 +88,7 @@ for _ in $(seq 1 300); do
   sleep 0.2
 done
 if [[ "${enabled:-0}" -lt 3 ]]; then
-  echo "demo-cluster: leader never seeded its three demo areas" >&2
+  echo "clusterdemo: leader never seeded its three demo areas" >&2
   exit 1
 fi
 working_set="$(curl -sf "${BASE}/_ops_/freshness" | sed -n 's/.*"workingSet":\([0-9]*\).*/\1/p' || true)"

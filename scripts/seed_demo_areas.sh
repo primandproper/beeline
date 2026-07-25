@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# make demo — run beeline against a fresh, gitignored SQLite database and seed three
-# enabled Austin service areas so the operator console shows a realistic multi-area
-# cache loading right away:
+# seed_demo_areas.sh — create and enable the three canonical demo service areas
+# against a running beeline instance. Shared by every `make *demo` target so the
+# polygons live in exactly one place:
 #
 #   1. Downtown Austin  — one res-9 layer, full mesh (maxRadiusMeters 0): small, dense.
 #   2. Austin proper    — one res-8 layer, 8 km radius bound: city-scale trips.
@@ -11,52 +11,22 @@
 #                         to 80 km recorded to serve trips beyond 20 km once
 #                         distance-based layer selection lands.
 #
-# All three route through the DEMO_PROVIDER routing provider (default: the raw
-# "haversine" in-process engine; demo_cluster.sh sets "latent-haversine" to model a
-# network-bound engine) with a 5-minute target TTL and a DEMO_LEASE claim lease.
 # Creation order matters: the read path resolves an overlapping point to the enabled
 # area with the LOWEST id, so the most specific area (downtown) is created first and
 # the coarsest (metro) last. The server polyfills every layer of each polygon into
-# its cell set (design §7). Ctrl-C stops the server.
+# its cell set (design §7).
 #
-# Overridable via environment: BINARY, CONFIG, DEMO_DB, PORT, DEMO_PROVIDER, DEMO_LEASE.
+# Usage: seed_demo_areas.sh <base-url> [provider] [lease]
+#
+# Progress goes to stderr; the three created area ids are printed to stdout,
+# space-separated, so a caller can capture them:
+#
+#   read -r downtown austin metro <<<"$(seed_demo_areas.sh http://localhost:8080)"
 set -euo pipefail
 
-BINARY="${BINARY:-artifacts/beeline}"
-CONFIG="${CONFIG:-config/localdev.json}"
-DEMO_DB="${DEMO_DB:-artifacts/demo.db}"
-PORT="${PORT:-8080}"
-BASE="http://localhost:${PORT}"
-DEMO_PROVIDER="${DEMO_PROVIDER:-haversine}"
-DEMO_LEASE="${DEMO_LEASE:-15s}"
-
-if [[ ! -x "${BINARY}" ]]; then
-  echo "demo: ${BINARY} not found — run 'make build' first" >&2
-  exit 1
-fi
-
-# Start from scratch: drop any previous demo database (and its WAL sidecars).
-rm -f "${DEMO_DB}" "${DEMO_DB}-wal" "${DEMO_DB}-shm"
-mkdir -p "$(dirname "${DEMO_DB}")"
-
-echo "▶ starting beeline on ${BASE} (database: ${DEMO_DB})"
-BEELINE_MATRIX_DATABASE_PATH="${DEMO_DB}" BEELINE_MATRIX_SERVER_PORT="${PORT}" \
-  "${BINARY}" serve --config "${CONFIG}" &
-SERVER_PID=$!
-
-cleanup() {
-  kill "${SERVER_PID}" 2>/dev/null || true
-  wait "${SERVER_PID}" 2>/dev/null || true
-}
-trap cleanup INT TERM EXIT
-
-echo "▶ waiting for the server…"
-for _ in $(seq 1 50); do
-  if curl -sf "${BASE}/_ops_/live" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.2
-done
+BASE="${1:?usage: seed_demo_areas.sh <base-url> [provider] [lease]}"
+PROVIDER="${2:-haversine}"
+LEASE="${3:-15s}"
 
 # create_area POSTs the area body on stdin, enables the new area, and prints its id.
 create_area() {
@@ -67,23 +37,23 @@ create_area() {
     --data-binary @-)"
   area_id="$(printf '%s' "${response}" | grep -o '"id":[0-9]\{1,\}' | head -1 | grep -o '[0-9]\{1,\}')"
   if [[ -z "${area_id}" ]]; then
-    echo "demo: failed to create area '${name}': ${response}" >&2
+    echo "seed_demo_areas: failed to create area '${name}': ${response}" >&2
     exit 1
   fi
   curl -sf -X POST "${BASE}/_config_/areas/${area_id}/enable" >/dev/null
   echo "${area_id}"
 }
 
-echo "▶ creating + enabling Downtown Austin (res 9, full mesh)"
+echo "▶ creating + enabling Downtown Austin (res 9, full mesh)" >&2
 downtown_id="$(create_area "Downtown Austin" <<JSON
 {
   "name": "Downtown Austin",
   "layers": [
     { "resolution": 9, "minDistanceMeters": 0, "maxRadiusMeters": 0 }
   ],
-  "routingProvider": "${DEMO_PROVIDER}",
+  "routingProvider": "${PROVIDER}",
   "targetTTL": "5m",
-  "leaseDuration": "${DEMO_LEASE}",
+  "leaseDuration": "${LEASE}",
   "geojson": {
     "type": "Polygon",
     "coordinates": [[
@@ -98,16 +68,16 @@ downtown_id="$(create_area "Downtown Austin" <<JSON
 JSON
 )"
 
-echo "▶ creating + enabling Austin proper (res 8, 8 km bound)"
+echo "▶ creating + enabling Austin proper (res 8, 8 km bound)" >&2
 austin_id="$(create_area "Austin" <<JSON
 {
   "name": "Austin",
   "layers": [
     { "resolution": 8, "minDistanceMeters": 0, "maxRadiusMeters": 8000 }
   ],
-  "routingProvider": "${DEMO_PROVIDER}",
+  "routingProvider": "${PROVIDER}",
   "targetTTL": "5m",
-  "leaseDuration": "${DEMO_LEASE}",
+  "leaseDuration": "${LEASE}",
   "geojson": {
     "type": "Polygon",
     "coordinates": [[
@@ -126,7 +96,7 @@ austin_id="$(create_area "Austin" <<JSON
 JSON
 )"
 
-echo "▶ creating + enabling Austin metro (layers: res 7 / 40 km + res 6 / 80 km)"
+echo "▶ creating + enabling Austin metro (layers: res 7 / 40 km + res 6 / 80 km)" >&2
 metro_id="$(create_area "Austin Metro" <<JSON
 {
   "name": "Austin Metro",
@@ -134,9 +104,9 @@ metro_id="$(create_area "Austin Metro" <<JSON
     { "resolution": 7, "minDistanceMeters": 0, "maxRadiusMeters": 40000 },
     { "resolution": 6, "minDistanceMeters": 20000, "maxRadiusMeters": 80000 }
   ],
-  "routingProvider": "${DEMO_PROVIDER}",
+  "routingProvider": "${PROVIDER}",
   "targetTTL": "5m",
-  "leaseDuration": "${DEMO_LEASE}",
+  "leaseDuration": "${LEASE}",
   "geojson": {
     "type": "Polygon",
     "coordinates": [[
@@ -155,13 +125,4 @@ metro_id="$(create_area "Austin Metro" <<JSON
 JSON
 )"
 
-echo
-echo "✔ demo ready — open ${BASE}"
-echo "  three areas are enabled and loading:"
-echo "    #${downtown_id} Downtown Austin (res 9)   curl '${BASE}/_ops_/freshness?area=${downtown_id}'"
-echo "    #${austin_id} Austin proper   (res 8)   curl '${BASE}/_ops_/freshness?area=${austin_id}'"
-echo "    #${metro_id} Austin metro    (res 7+6) curl '${BASE}/_ops_/freshness?area=${metro_id}'"
-echo "  Ctrl-C to stop (the gitignored ${DEMO_DB} is left in place; re-run to reset)."
-echo
-
-wait "${SERVER_PID}"
+echo "${downtown_id} ${austin_id} ${metro_id}"

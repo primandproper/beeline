@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
@@ -86,38 +87,38 @@ func (f *failingStore) Put(context.Context, []beeline.Entry) error {
 func TestLocalSourceSubmitStoreErrorLeavesLease(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
+	// Bubble time so the lease can be expired without really sleeping.
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
 
-	// Injectable clock so the lease can be expired without sleeping.
-	now := time.Unix(1_700_000_000, 0)
-	clock := func() time.Time { return now }
-	index := memindex.New(time.Minute, clock)
-	source := refresh.NewLocalSource(index, &failingStore{})
+		index := memindex.New(time.Minute, nil)
+		source := refresh.NewLocalSource(index, &failingStore{})
 
-	pairs := testPairs(t, 1)
-	require.NoError(t, index.Seed(ctx, pairs))
+		pairs := testPairs(t, 1)
+		require.NoError(t, index.Seed(ctx, pairs))
 
-	claimed, err := source.Claim(ctx, 10, time.Second)
-	require.NoError(t, err)
-	require.Len(t, claimed, 1)
+		claimed, err := source.Claim(ctx, 10, time.Second)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
 
-	entries := []beeline.Entry{{
-		Key:    claimed[0],
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1}, ComputedAt: now},
-	}}
-	require.Error(t, source.Submit(ctx, entries), "the store failure surfaces")
+		entries := []beeline.Entry{{
+			Key:    claimed[0],
+			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1}, ComputedAt: time.Now()},
+		}}
+		require.Error(t, source.Submit(ctx, entries), "the store failure surfaces")
 
-	// While the lease holds, the pair is not claimable again.
-	reclaimed, err := source.Claim(ctx, 10, time.Second)
-	require.NoError(t, err)
-	assert.Empty(t, reclaimed, "the lease is still held")
+		// While the lease holds, the pair is not claimable again.
+		reclaimed, err := source.Claim(ctx, 10, time.Second)
+		require.NoError(t, err)
+		assert.Empty(t, reclaimed, "the lease is still held")
 
-	// Once the lease expires it comes back — never marked computed.
-	now = now.Add(2 * time.Second)
-	reclaimed, err = source.Claim(ctx, 10, time.Second)
-	require.NoError(t, err)
-	require.Len(t, reclaimed, 1)
-	assert.Equal(t, claimed[0], reclaimed[0])
+		// Once the lease expires it comes back — never marked computed.
+		time.Sleep(2 * time.Second)
+		reclaimed, err = source.Claim(ctx, 10, time.Second)
+		require.NoError(t, err)
+		require.Len(t, reclaimed, 1)
+		assert.Equal(t, claimed[0], reclaimed[0])
+	})
 }
 
 func TestLocalSourceSubmitEmptyIsNoop(t *testing.T) {

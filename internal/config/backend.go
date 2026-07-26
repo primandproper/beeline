@@ -44,11 +44,51 @@ type BackendConfig struct {
 // PostgresConfig is the shared-state database. URL is a pgx-compatible DSN or
 // URL (postgres://user:pass@host:5432/beeline). Conn bounds map onto pgxpool;
 // zero values use the pool's defaults.
+//
+// It satisfies platform-go's database.ClientConfig, so the shared pool is built
+// by database/postgres rather than by hand. Beeline runs one pool against one
+// URL, so the read side is deliberately empty: an empty read connection string
+// makes the platform client alias its read handles to the write ones instead of
+// opening a second pool.
 type PostgresConfig struct {
 	URL      string `env:"URL"       json:"url,omitempty"`
 	MaxConns int32  `env:"MAX_CONNS" json:"maxConns,omitempty"`
-	MinConns int32  `env:"MIN_CONNS" json:"minConns,omitempty"`
 }
+
+// pingAttempts and pingWaitPeriod bound the client's readiness ping. The profile
+// is deliberately fast: IsReady backs the /_ops_/ready database check, whose
+// per-checker budget is 5s, so a down database must fail well inside it.
+const (
+	pingAttempts   = 3
+	pingWaitPeriod = 500 * time.Millisecond
+)
+
+// databaseSQLIdleConns bounds the database/sql handle derived from the pgx pool.
+// That handle only serves migrations and advisory-lock transactions — everything
+// else in beeline speaks pgx natively — and each idle connection there still
+// pins one pool connection, so it stays small.
+const databaseSQLIdleConns = 2
+
+// GetReadConnectionString is empty by design: see PostgresConfig.
+func (p *PostgresConfig) GetReadConnectionString() string { return "" }
+
+// GetWriteConnectionString returns the configured DSN.
+func (p *PostgresConfig) GetWriteConnectionString() string { return p.URL }
+
+// GetMaxOpenConns bounds the pool; zero keeps pgxpool's default.
+func (p *PostgresConfig) GetMaxOpenConns() int { return int(p.MaxConns) }
+
+// GetMaxIdleConns bounds the derived database/sql handle.
+func (p *PostgresConfig) GetMaxIdleConns() int { return databaseSQLIdleConns }
+
+// GetConnMaxLifetime keeps pgxpool's parsed default (1h).
+func (p *PostgresConfig) GetConnMaxLifetime() time.Duration { return 0 }
+
+// GetMaxPingAttempts bounds the readiness ping retry loop.
+func (p *PostgresConfig) GetMaxPingAttempts() uint64 { return pingAttempts }
+
+// GetPingWaitPeriod paces the readiness ping retry loop.
+func (p *PostgresConfig) GetPingWaitPeriod() time.Duration { return pingWaitPeriod }
 
 // RedisConfig is the optional hot-store cache. Zero PoolSize uses go-redis's
 // default (10 per CPU).
@@ -102,11 +142,8 @@ func (b *BackendConfig) validate() error {
 	if b.EffectiveHotStore() == HotStoreRedis && b.Redis.Addr == "" {
 		return fmt.Errorf("backend redis addr is required when hot store is %q", HotStoreRedis)
 	}
-	if b.Postgres.MaxConns < 0 || b.Postgres.MinConns < 0 {
-		return fmt.Errorf("backend postgres conn bounds must be >= 0")
-	}
-	if b.Postgres.MaxConns > 0 && b.Postgres.MinConns > b.Postgres.MaxConns {
-		return fmt.Errorf("backend postgres min conns %d must be <= max conns %d", b.Postgres.MinConns, b.Postgres.MaxConns)
+	if b.Postgres.MaxConns < 0 {
+		return fmt.Errorf("backend postgres max conns %d must be >= 0", b.Postgres.MaxConns)
 	}
 	if b.Redis.DB < 0 || b.Redis.PoolSize < 0 {
 		return fmt.Errorf("backend redis db and pool size must be >= 0")

@@ -9,100 +9,117 @@ package postgres
 import (
 	"context"
 	"embed"
-	"errors"
 	"fmt"
-	"hash/fnv"
 	"io/fs"
+	"time"
 
 	"github.com/primandproper/beeline/internal/config"
 
+	"github.com/primandproper/platform-go/v7/database"
+	"github.com/primandproper/platform-go/v7/database/migrate"
+	pgclient "github.com/primandproper/platform-go/v7/database/postgres"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/metrics"
+	"github.com/primandproper/platform-go/v7/observability/tracing"
+
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/pressly/goose/v3"
-	"github.com/pressly/goose/v3/lock"
 )
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
-// migrationLockID hashes the connection's schema into the advisory lock ID
-// migrations serialize on (empty search_path = the default schema).
-func migrationLockID(searchPath string) int64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte("beeline-migrations:" + searchPath))
+// Migration lock cadence: the probe is tightened from goose's 5s default so a
+// waiting head notices the winner promptly.
+const (
+	migrationLockProbe     = time.Second
+	migrationLockTimeout   = time.Minute
+	migrationUnlockTimeout = 30 * time.Second
+)
 
-	return int64(h.Sum64())
-}
-
-// Open connects a pgx pool to the configured database, applies pending
-// migrations, and returns the ready pool. Migration runs on every open and is
-// idempotent; concurrent heads booting at once serialize on goose's session
-// advisory lock, so racing opens are safe.
-func Open(ctx context.Context, cfg *config.PostgresConfig) (*pgxpool.Pool, error) {
-	pc, err := pgxpool.ParseConfig(cfg.URL)
+// Open connects the shared database client, fails fast if it is unreachable,
+// applies pending migrations, and returns the ready client. Migration runs on
+// every open and is idempotent; concurrent heads booting at once serialize on
+// goose's session advisory lock, so racing opens are safe.
+//
+// The returned client exposes the underlying pgx pool through Pool: the store,
+// freshness index, and sqlc-generated queries all speak pgx natively, while the
+// derived database/sql handle carries migrations and advisory-lock work.
+func Open(
+	ctx context.Context,
+	cfg *config.PostgresConfig,
+	logger logging.Logger,
+	tracerProvider tracing.TracerProvider,
+	metricsProvider metrics.Provider,
+) (database.Client, error) {
+	client, err := pgclient.NewDatabaseClient(ctx, logger, tracerProvider, cfg, metricsProvider)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: parsing URL: %w", err)
-	}
-	if cfg.MaxConns > 0 {
-		pc.MaxConns = cfg.MaxConns
-	}
-	if cfg.MinConns > 0 {
-		pc.MinConns = cfg.MinConns
+		return nil, fmt.Errorf("postgres: building database client: %w", err)
 	}
 
-	pool, err := pgxpool.NewWithConfig(ctx, pc)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: building pool: %w", err)
+	// NewDatabaseClient does not ping, so boot would otherwise defer the failure
+	// to the first query. Fail here instead, as the hand-rolled pool used to.
+	if ready, ok := client.(interface{ IsReady(context.Context) bool }); ok && !ready.IsReady(ctx) {
+		return nil, fmt.Errorf("postgres: database is not ready: %w", database.ErrDatabaseNotReady)
 	}
-	if err = pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("postgres: pinging %q: %w", pc.ConnConfig.Host, err)
-	}
-	if err = migrate(ctx, pool); err != nil {
-		pool.Close()
+
+	if err = applyMigrations(ctx, client, logger, tracerProvider, metricsProvider); err != nil {
 		return nil, err
 	}
 
-	return pool, nil
+	return client, nil
 }
 
-// migrate applies the embedded goose migrations through a temporary
-// database/sql handle over the pool's config (goose speaks database/sql, the
-// rest of the package speaks pgx). Instance-based Provider for the same reason
-// as the sqlite package: no shared goose state across parallel tests.
-func migrate(ctx context.Context, pool *pgxpool.Pool) (err error) {
+// Pool returns the pgx pool backing a client opened by Open. Every pgx-native
+// caller in the package funnels through here rather than type-asserting inline.
+func Pool(client database.Client) (*pgxpool.Pool, error) {
+	access, ok := client.(pgclient.PgxAccess)
+	if !ok {
+		return nil, fmt.Errorf("postgres: database client does not expose a pgx pool")
+	}
+
+	return access.WritePool(), nil
+}
+
+// applyMigrations runs the embedded goose migrations over the client's
+// database/sql handle (goose speaks database/sql, the rest of the package
+// speaks pgx). The lock key is derived from the connection's search_path:
+// deployments (default schema) share one lock, while schema-isolated parallel
+// tests migrate concurrently instead of queueing on a global key.
+func applyMigrations(
+	ctx context.Context,
+	client database.Client,
+	logger logging.Logger,
+	tracerProvider tracing.TracerProvider,
+	metricsProvider metrics.Provider,
+) error {
 	sub, err := fs.Sub(migrationFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("postgres: locating migrations: %w", err)
 	}
 
-	// The handle only borrows the pool's connections; closing it releases them
-	// without touching the pool itself.
-	db := stdlib.OpenDBFromPool(pool)
-	defer func() {
-		err = errors.Join(err, db.Close())
-	}()
+	pool, err := Pool(client)
+	if err != nil {
+		return err
+	}
 
-	// A session-level advisory lock serializes concurrent heads booting against
-	// one database, so racing migrations wait instead of erroring. The lock ID
-	// is derived from the connection's search_path: deployments (default
-	// schema) share one lock, while schema-isolated parallel tests migrate
-	// concurrently instead of queueing on a global ID. The probe is tightened
-	// from goose's 5s default so a waiting head notices the winner promptly.
-	locker, err := lock.NewPostgresSessionLocker(
-		lock.WithLockID(migrationLockID(pool.Config().ConnConfig.RuntimeParams["search_path"])),
-		lock.WithLockTimeout(1, 60),   // probe every second, give up after a minute
-		lock.WithUnlockTimeout(1, 30), //nolint:mnd // same cadence for release
+	raw, ok := client.(database.RawAccess)
+	if !ok {
+		return fmt.Errorf("postgres: database client does not expose a database/sql handle for migrations")
+	}
+
+	migrator, err := migrate.New(migrate.DialectPostgres, sub,
+		migrate.WithLockKey("beeline-migrations:"+pool.Config().ConnConfig.RuntimeParams["search_path"]),
+		migrate.WithLockTimeout(migrationLockProbe, migrationLockTimeout),
+		migrate.WithUnlockTimeout(migrationLockProbe, migrationUnlockTimeout),
+		migrate.WithLogger(logger),
+		migrate.WithTracerProvider(tracerProvider),
+		migrate.WithMetricsProvider(metricsProvider),
 	)
 	if err != nil {
-		return fmt.Errorf("postgres: building migration locker: %w", err)
+		return fmt.Errorf("postgres: building migrator: %w", err)
 	}
 
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, sub, goose.WithSessionLocker(locker))
-	if err != nil {
-		return fmt.Errorf("postgres: building migration provider: %w", err)
-	}
-	if _, err = provider.Up(ctx); err != nil {
+	if err = migrator.Migrate(ctx, raw.WriteDB()); err != nil {
 		return fmt.Errorf("postgres: applying migrations: %w", err)
 	}
 

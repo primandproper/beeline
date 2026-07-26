@@ -9,6 +9,7 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 
 	"github.com/primandproper/platform-go/v7/httpclient"
+	"github.com/primandproper/platform-go/v7/retry"
 	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 )
 
@@ -70,6 +71,10 @@ type FollowerConfig struct {
 	LeaderURL string `env:"LEADER_URL" json:"leaderURL,omitempty"`
 	// HTTP tunes the outbound client used for claim/submit calls.
 	HTTP httpclient.Config `envPrefix:"HTTP_" json:"http,omitzero"`
+	// Retry governs re-attempts of a failed claim/submit round trip. A leader
+	// that is restarting or briefly unreachable costs a short backoff instead of
+	// a wasted claim cycle; a rejected request (4xx) is never retried.
+	Retry retry.Config `envPrefix:"RETRY_" json:"retry,omitzero"`
 	// Lease is the visibility timeout requested per claim; 0 uses LeaseDuration.
 	Lease time.Duration `env:"LEASE" json:"lease,omitempty"`
 	// IdleBackoff is how long a worker sleeps when the leader has no due work or
@@ -109,6 +114,9 @@ func (f *FollowerConfig) validate() error {
 	if f.IdleBackoff < 0 {
 		return fmt.Errorf("follower idle backoff %v must be >= 0", f.IdleBackoff)
 	}
+	// Retry is deliberately not validated: the policy constructor clamps every
+	// field through EnsureDefaults, so an omitted or partial block is a valid
+	// request for the defaults rather than an error.
 
 	return nil
 }
@@ -319,6 +327,16 @@ func defaultMatrixConfig() MatrixConfig {
 			Workers:     4,
 			IdleBackoff: time.Second,
 			HTTP:        httpclient.Config{Timeout: 10 * time.Second},
+			// The ceiling stays well under a claim cycle: a retried claim should
+			// ride out a leader restart, not stall a worker that could be idling
+			// and re-claiming instead.
+			Retry: retry.Config{
+				MaxAttempts:  3,
+				InitialDelay: 100 * time.Millisecond,
+				MaxDelay:     2 * time.Second,
+				Multiplier:   2,
+				UseJitter:    true,
+			},
 		},
 	}
 }

@@ -40,7 +40,7 @@ func (r *Repository) UpsertProvider(ctx context.Context, spec *beeline.ProviderS
 		return fmt.Errorf("postgres: encoding profiles for provider %q: %w", spec.Name, err)
 	}
 
-	now := timestamptz(r.now().UTC())
+	now := timestamptz(r.clock.Now().UTC())
 
 	return r.inTx(ctx, func(tx pgx.Tx) error {
 		if upErr := r.queries.UpsertProvider(ctx, tx, &generated.UpsertProviderParams{

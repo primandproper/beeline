@@ -9,6 +9,7 @@ import (
 	"github.com/primandproper/platform-go/v7/observability"
 	"github.com/primandproper/platform-go/v7/observability/logging"
 	loggingcfg "github.com/primandproper/platform-go/v7/observability/logging/config"
+	"github.com/primandproper/platform-go/v7/retry"
 	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 )
 
@@ -103,6 +104,15 @@ func buildLocalDevConfig() *config.Config {
 				Workers:     4,
 				IdleBackoff: time.Second,
 				HTTP:        httpclient.Config{Timeout: 10 * time.Second},
+				// A leader restart costs a short backoff instead of a wasted
+				// claim cycle; a 4xx is never retried.
+				Retry: retry.Config{
+					MaxAttempts:  3,
+					InitialDelay: 100 * time.Millisecond,
+					MaxDelay:     2 * time.Second,
+					Multiplier:   2,
+					UseJitter:    true,
+				},
 			},
 			TargetTTL:           30 * time.Second,
 			LeaseDuration:       15 * time.Second,
@@ -159,6 +169,15 @@ func buildClusterConfig() *config.Config {
 				Workers:     4,
 				IdleBackoff: time.Second,
 				HTTP:        httpclient.Config{Timeout: 10 * time.Second},
+				// A leader restart costs a short backoff instead of a wasted
+				// claim cycle; a 4xx is never retried.
+				Retry: retry.Config{
+					MaxAttempts:  3,
+					InitialDelay: 100 * time.Millisecond,
+					MaxDelay:     2 * time.Second,
+					Multiplier:   2,
+					UseJitter:    true,
+				},
 			},
 			TargetTTL:           30 * time.Second,
 			LeaseDuration:       15 * time.Second,

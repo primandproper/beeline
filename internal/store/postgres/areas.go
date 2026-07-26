@@ -9,6 +9,8 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/store/postgres/generated"
 
+	"github.com/primandproper/platform-go/v7/clock"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,25 +38,25 @@ const (
 type Repository struct {
 	pool    *pgxpool.Pool
 	queries generated.Querier
-	now     func() time.Time
+	clock   clock.Clock
 }
 
-// NewRepository builds a Repository over an opened pool. The clock is
-// injectable for tests; pass nil for the wall clock. (Config timestamps are
-// display metadata — coordination timestamps come from the database clock.)
-func NewRepository(pool *pgxpool.Pool, clock func() time.Time) *Repository {
-	if clock == nil {
-		clock = time.Now
+// NewRepository builds a Repository over an opened pool. Pass nil for the wall
+// clock. (Config timestamps are display metadata — coordination timestamps come
+// from the database clock.)
+func NewRepository(pool *pgxpool.Pool, clk clock.Clock) *Repository {
+	if clk == nil {
+		clk = clock.NewClock()
 	}
 
-	return &Repository{pool: pool, queries: generated.New(), now: clock}
+	return &Repository{pool: pool, queries: generated.New(), clock: clk}
 }
 
 // Create inserts an area and its layers in one transaction and bumps the areas
 // generation. The caller controls the Enabled flag (areas are created
 // disabled).
 func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area, error) {
-	now := r.now().UTC()
+	now := r.clock.Now().UTC()
 	a.CreatedAt = now
 	a.UpdatedAt = now
 
@@ -131,7 +133,7 @@ func (r *Repository) List(ctx context.Context) ([]beeline.Area, error) {
 // Update rewrites an area's mutable fields and replaces its layer list in one
 // transaction, bumping updated_at and the areas generation.
 func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
-	now := r.now().UTC()
+	now := r.clock.Now().UTC()
 
 	return r.inTx(ctx, func(tx pgx.Tx) error {
 		if updErr := r.queries.UpdateArea(ctx, tx, &generated.UpdateAreaParams{
@@ -178,7 +180,7 @@ func (r *Repository) SetEnabled(ctx context.Context, id beeline.AreaID, enabled 
 		if err := r.queries.SetAreaEnabled(ctx, tx, &generated.SetAreaEnabledParams{
 			ID:        int64(id),
 			Enabled:   enabled,
-			UpdatedAt: timestamptz(r.now().UTC()),
+			UpdatedAt: timestamptz(r.clock.Now().UTC()),
 		}); err != nil {
 			return fmt.Errorf("postgres: setting enabled for area %d: %w", id, err)
 		}

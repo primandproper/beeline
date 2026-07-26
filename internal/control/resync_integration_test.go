@@ -13,7 +13,8 @@ import (
 	pgstore "github.com/primandproper/beeline/internal/store/postgres"
 	"github.com/primandproper/beeline/internal/store/postgres/pgtest"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/primandproper/platform-go/v7/database"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,21 +33,28 @@ var downtownPoint = beeline.LatLng{Lat: 30.27, Lng: -97.745}
 // newPgCoordinator wires a full Coordinator over the shared pool — the same
 // composition serve.go builds in distributed mode. Two of these over one pool
 // model two heads.
-func newPgCoordinator(t *testing.T, pool *pgxpool.Pool) *control.Coordinator {
+func newPgCoordinator(t *testing.T, db database.Client) *control.Coordinator {
 	t.Helper()
 
-	c, _ := newPgHead(t, pool)
+	c, _ := newPgHead(t, db)
 
 	return c
 }
 
 // newPgHead is newPgCoordinator plus the head's index handle, for tests that
 // drive claims/marks directly.
-func newPgHead(t *testing.T, pool *pgxpool.Pool) (*control.Coordinator, *pgfresh.Index) {
+func newPgHead(t *testing.T, db database.Client) (*control.Coordinator, *pgfresh.Index) {
 	t.Helper()
 
+	pool, err := pgstore.Pool(db)
+	require.NoError(t, err)
+
+	locker, err := pgstore.NewAdvisoryLocker(db, nil, nil, nil)
+	require.NoError(t, err)
+
 	speeds := map[string]float64{"car": 13.9}
-	idx := pgfresh.New(pool, pgfresh.Config{TargetTTL: time.Minute}, nil)
+	idx, err := pgfresh.New(pool, &pgfresh.Config{TargetTTL: time.Minute}, nil)
+	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, idx.Close(context.Background())) })
 
 	c, err := control.New(&control.Config{
@@ -54,7 +62,7 @@ func newPgHead(t *testing.T, pool *pgxpool.Pool) (*control.Coordinator, *pgfresh
 		Providers: pgstore.NewRepository(pool, nil),
 		Index:     idx,
 		Store:     pgstore.NewEstimateStore(pool),
-		Locker:    pgstore.NewAdvisoryLocker(pool),
+		Locker:    locker,
 		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
 			return registry.BuildEngine(spec, map[beeline.Profile]float64{"car": 13.9})
 		},
@@ -82,8 +90,8 @@ func TestBootPreservesSharedStateAcrossHeadRestarts(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	pool := pgtest.Open(t)
-	headA, idxA := newPgHead(t, pool)
+	db := pgtest.OpenClient(t)
+	headA, idxA := newPgHead(t, db)
 
 	area, err := headA.Create(ctx, &control.CreateAreaInput{
 		Name:    "downtown",
@@ -103,8 +111,8 @@ func TestBootPreservesSharedStateAcrossHeadRestarts(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, before.AchievedThroughput, "work landed against the enable-time baseline")
 
-	headB := newPgCoordinator(t, pool)
-	headC := newPgCoordinator(t, pool)
+	headB := newPgCoordinator(t, db)
+	headC := newPgCoordinator(t, db)
 
 	var wg sync.WaitGroup
 	for _, head := range []*control.Coordinator{headB, headC} {
@@ -134,9 +142,9 @@ func TestTwoHeadsConvergeOnAreaLifecycle(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	pool := pgtest.Open(t)
-	headA := newPgCoordinator(t, pool)
-	headB := newPgCoordinator(t, pool)
+	db := pgtest.OpenClient(t)
+	headA := newPgCoordinator(t, db)
+	headB := newPgCoordinator(t, db)
 
 	area, err := headA.Create(ctx, &control.CreateAreaInput{
 		Name:    "downtown",
@@ -183,9 +191,9 @@ func TestTwoHeadsConvergeOnProviders(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	pool := pgtest.Open(t)
-	headA := newPgCoordinator(t, pool)
-	headB := newPgCoordinator(t, pool)
+	db := pgtest.OpenClient(t)
+	headA := newPgCoordinator(t, db)
+	headB := newPgCoordinator(t, db)
 
 	require.Equal(t, headA.ProvidersHash(), headB.ProvidersHash(), "fresh heads agree on the built-in catalog")
 
@@ -211,8 +219,11 @@ func TestConfigGenerationsMoveOnMutation(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	pool := pgtest.Open(t)
-	head := newPgCoordinator(t, pool)
+	db := pgtest.OpenClient(t)
+	head := newPgCoordinator(t, db)
+
+	pool, err := pgstore.Pool(db)
+	require.NoError(t, err)
 	repo := pgstore.NewRepository(pool, nil)
 
 	before, err := repo.ConfigGenerations(ctx)

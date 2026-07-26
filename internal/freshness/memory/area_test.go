@@ -3,6 +3,7 @@ package memory_test
 import (
 	"context"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
@@ -53,111 +54,115 @@ func TestIndexUnseedRemovesOnlyOneArea(t *testing.T) {
 func TestIndexDebtForAreaBaselineIsPerArea(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	clk := &clock{t: time.Unix(1_700_000_000, 0)}
-	idx := memory.New(time.Minute, clk.now)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		idx := memory.New(time.Minute, nil)
 
-	require.NoError(t, idx.Seed(ctx, areaKeys(1)))
-	require.NoError(t, idx.Seed(ctx, areaKeys(2)))
+		require.NoError(t, idx.Seed(ctx, areaKeys(1)))
+		require.NoError(t, idx.Seed(ctx, areaKeys(2)))
 
-	// Compute all of area 1's pairs; leave area 2 untouched.
-	require.NoError(t, idx.MarkComputed(ctx, areaKeys(1), clk.now()))
-	clk.advance(3 * time.Second)
+		// Compute all of area 1's pairs; leave area 2 untouched.
+		require.NoError(t, idx.MarkComputed(ctx, areaKeys(1), time.Now()))
+		time.Sleep(3 * time.Second)
 
-	one, err := idx.DebtForArea(ctx, 1)
-	require.NoError(t, err)
-	assert.Equal(t, 0, one.Debt, "area 1 fully computed")
-	assert.InDelta(t, 1.0, one.AchievedThroughput, 1e-9, "3 refreshes over 3s = 1/s")
+		one, err := idx.DebtForArea(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 0, one.Debt, "area 1 fully computed")
+		assert.InDelta(t, 1.0, one.AchievedThroughput, 1e-9, "3 refreshes over 3s = 1/s")
 
-	two, err := idx.DebtForArea(ctx, 2)
-	require.NoError(t, err)
-	assert.Equal(t, 3, two.Debt, "area 2 never computed")
-	assert.Equal(t, 0.0, two.AchievedThroughput, "area 2 has its own baseline at zero")
+		two, err := idx.DebtForArea(ctx, 2)
+		require.NoError(t, err)
+		assert.Equal(t, 3, two.Debt, "area 2 never computed")
+		assert.Equal(t, 0.0, two.AchievedThroughput, "area 2 has its own baseline at zero")
+	})
 }
 
 func TestIndexReseedingAreaResetsBaseline(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	clk := &clock{t: time.Unix(1_700_000_000, 0)}
-	idx := memory.New(time.Minute, clk.now)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		idx := memory.New(time.Minute, nil)
 
-	require.NoError(t, idx.Seed(ctx, areaKeys(1)))
-	require.NoError(t, idx.MarkComputed(ctx, areaKeys(1), clk.now()))
-	clk.advance(time.Second)
+		require.NoError(t, idx.Seed(ctx, areaKeys(1)))
+		require.NoError(t, idx.MarkComputed(ctx, areaKeys(1), time.Now()))
+		time.Sleep(time.Second)
 
-	// Converge the area: unseed then re-seed. Progress must read from zero again.
-	require.NoError(t, idx.Unseed(ctx, 1))
-	require.NoError(t, idx.Seed(ctx, areaKeys(1)))
+		// Converge the area: unseed then re-seed. Progress must read from zero again.
+		require.NoError(t, idx.Unseed(ctx, 1))
+		require.NoError(t, idx.Seed(ctx, areaKeys(1)))
 
-	stats, err := idx.DebtForArea(ctx, 1)
-	require.NoError(t, err)
-	assert.Equal(t, 3, stats.Debt, "re-seeded pairs are never-computed")
-	assert.Equal(t, 0.0, stats.AchievedThroughput, "baseline reset on re-seed")
+		stats, err := idx.DebtForArea(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 3, stats.Debt, "re-seeded pairs are never-computed")
+		assert.Equal(t, 0.0, stats.AchievedThroughput, "baseline reset on re-seed")
+	})
 }
 
 func TestIndexSweepAreaEvictsColdDemandPairs(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	clk := &clock{t: time.Unix(1_700_000_000, 0)}
-	idx := memory.New(time.Minute, clk.now)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		idx := memory.New(time.Minute, nil)
 
-	pinned := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
-	demand := beeline.PairKey{Area: 1, Origin: 1, Dest: 3, Profile: "car", Res: 8}
-	otherArea := beeline.PairKey{Area: 2, Origin: 1, Dest: 3, Profile: "car", Res: 8}
+		pinned := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
+		demand := beeline.PairKey{Area: 1, Origin: 1, Dest: 3, Profile: "car", Res: 8}
+		otherArea := beeline.PairKey{Area: 2, Origin: 1, Dest: 3, Profile: "car", Res: 8}
 
-	require.NoError(t, idx.Seed(ctx, []beeline.PairKey{pinned}))    // eager core: pinned
-	require.NoError(t, idx.Access(ctx, []beeline.PairKey{demand}))  // demand: unpinned, accessed now
-	require.NoError(t, idx.Seed(ctx, []beeline.PairKey{otherArea})) // a different area
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{pinned}))    // eager core: pinned
+		require.NoError(t, idx.Access(ctx, []beeline.PairKey{demand}))  // demand: unpinned, accessed now
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{otherArea})) // a different area
 
-	// Two hours pass; the cutoff is one hour ago, so the demand pair (accessed 2h ago)
-	// is cold while nothing recent would be.
-	clk.advance(2 * time.Hour)
-	cutoff := clk.now().Add(-time.Hour)
+		// Two hours pass; the cutoff is one hour ago, so the demand pair (accessed 2h ago)
+		// is cold while nothing recent would be.
+		time.Sleep(2 * time.Hour)
+		cutoff := time.Now().Add(-time.Hour)
 
-	removed, err := idx.SweepArea(ctx, 1, cutoff)
-	require.NoError(t, err)
-	assert.Equal(t, []beeline.PairKey{demand}, removed, "only the cold unpinned pair is swept")
+		removed, err := idx.SweepArea(ctx, 1, cutoff)
+		require.NoError(t, err)
+		assert.Equal(t, []beeline.PairKey{demand}, removed, "only the cold unpinned pair is swept")
 
-	one, err := idx.DebtForArea(ctx, 1)
-	require.NoError(t, err)
-	assert.Equal(t, 1, one.WorkingSet, "the pinned eager-core pair survives")
+		one, err := idx.DebtForArea(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 1, one.WorkingSet, "the pinned eager-core pair survives")
 
-	two, err := idx.DebtForArea(ctx, 2)
-	require.NoError(t, err)
-	assert.Equal(t, 1, two.WorkingSet, "another area is untouched")
+		two, err := idx.DebtForArea(ctx, 2)
+		require.NoError(t, err)
+		assert.Equal(t, 1, two.WorkingSet, "another area is untouched")
+	})
 }
 
 func TestIndexSweepAreaKeepsActiveAndLeasedPairs(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	clk := &clock{t: time.Unix(1_700_000_000, 0)}
-	idx := memory.New(time.Minute, clk.now)
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		idx := memory.New(time.Minute, nil)
 
-	active := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
-	leased := beeline.PairKey{Area: 1, Origin: 1, Dest: 3, Profile: "car", Res: 8}
+		active := beeline.PairKey{Area: 1, Origin: 1, Dest: 2, Profile: "car", Res: 8}
+		leased := beeline.PairKey{Area: 1, Origin: 1, Dest: 3, Profile: "car", Res: 8}
 
-	// Both accessed long ago (cold by lastAccess).
-	require.NoError(t, idx.Access(ctx, []beeline.PairKey{active, leased}))
+		// Both accessed long ago (cold by lastAccess).
+		require.NoError(t, idx.Access(ctx, []beeline.PairKey{active, leased}))
 
-	// The leased pair is claimed by a worker: it holds a lease that outlives the sweep.
-	claimed, err := idx.Claim(ctx, 10, 3*time.Hour)
-	require.NoError(t, err)
-	require.Contains(t, claimed, leased)
+		// The leased pair is claimed by a worker: it holds a lease that outlives the sweep.
+		claimed, err := idx.Claim(ctx, 10, 3*time.Hour)
+		require.NoError(t, err)
+		require.Contains(t, claimed, leased)
 
-	// The active pair is queried again right before the sweep, refreshing its access.
-	clk.advance(2 * time.Hour)
-	require.NoError(t, idx.Access(ctx, []beeline.PairKey{active}))
+		// The active pair is queried again right before the sweep, refreshing its access.
+		time.Sleep(2 * time.Hour)
+		require.NoError(t, idx.Access(ctx, []beeline.PairKey{active}))
 
-	removed, err := idx.SweepArea(ctx, 1, clk.now().Add(-time.Hour))
-	require.NoError(t, err)
-	assert.Empty(t, removed, "a recently-accessed pair and a leased pair both survive")
+		removed, err := idx.SweepArea(ctx, 1, time.Now().Add(-time.Hour))
+		require.NoError(t, err)
+		assert.Empty(t, removed, "a recently-accessed pair and a leased pair both survive")
 
-	stats, err := idx.DebtForArea(ctx, 1)
-	require.NoError(t, err)
-	assert.Equal(t, 2, stats.WorkingSet)
+		stats, err := idx.DebtForArea(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, 2, stats.WorkingSet)
+	})
 }
 
 func TestIndexCellStatesForAreaScopes(t *testing.T) {

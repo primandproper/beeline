@@ -19,6 +19,8 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/store/postgres"
 
+	"github.com/primandproper/platform-go/v7/database"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
@@ -36,6 +38,17 @@ const openTimeout = 30 * time.Second
 func Open(tb testing.TB) *pgxpool.Pool {
 	tb.Helper()
 
+	pool, err := postgres.Pool(OpenClient(tb))
+	require.NoError(tb, err, "reaching the pgx pool behind the test client")
+
+	return pool
+}
+
+// OpenClient is Open for callers that need the platform database client itself
+// (the advisory locker, database health checks) rather than the pgx pool.
+func OpenClient(tb testing.TB) database.Client {
+	tb.Helper()
+
 	dsn := os.Getenv(EnvDSN)
 	if dsn == "" {
 		tb.Skipf("%s not set; skipping Postgres integration test", EnvDSN)
@@ -51,11 +64,11 @@ func Open(tb testing.TB) *pgxpool.Pool {
 	_, err = admin.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s", schema))
 	require.NoError(tb, err, "creating test schema")
 
-	pool, err := postgres.Open(ctx, &config.PostgresConfig{URL: withSearchPath(tb, dsn, schema)})
-	require.NoError(tb, err, "opening migrated pool")
+	client, err := postgres.Open(ctx, &config.PostgresConfig{URL: withSearchPath(tb, dsn, schema)}, nil, nil, nil)
+	require.NoError(tb, err, "opening migrated client")
 
 	tb.Cleanup(func() {
-		pool.Close()
+		require.NoError(tb, client.Close(), "closing test client")
 		dropCtx, dropCancel := context.WithTimeout(context.Background(), openTimeout)
 		defer dropCancel()
 		_, dropErr := admin.Exec(dropCtx, fmt.Sprintf("DROP SCHEMA %s CASCADE", schema))
@@ -63,7 +76,7 @@ func Open(tb testing.TB) *pgxpool.Pool {
 		admin.Close()
 	})
 
-	return pool
+	return client
 }
 
 // randomSchema returns a collision-proof, identifier-safe schema name.

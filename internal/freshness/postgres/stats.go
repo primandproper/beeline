@@ -3,42 +3,104 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"sync"
+	"strconv"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+
+	"github.com/primandproper/platform-go/v7/cache"
+	cachememory "github.com/primandproper/platform-go/v7/cache/memory"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/metrics"
+	"github.com/primandproper/platform-go/v7/observability/tracing"
 )
 
 // statsCache memoizes the aggregate observability reads per head: the console
 // polls /_ops_/freshness and /_ops_/cells twice a second, and each poll is an
 // aggregate scan of the shared table. A short TTL makes the cost per head
 // constant; the staleness is invisible at poll cadence and head-independent
-// (every head reads the same table). TTL <= 0 disables caching entirely.
+// (every head reads the same table). A nil statsCache disables caching entirely
+// — the TTL <= 0 case tests rely on for uncached reads.
+//
+// Lazy eviction is fine here: the key space is bounded by the enabled-area
+// count plus the one aggregate key.
 type statsCache struct {
-	debt    map[beeline.AreaID]debtMemo
-	cells   map[beeline.AreaID]cellsMemo
-	debtAll debtMemo
-	ttl     time.Duration
-	mu      sync.Mutex
-	hasAll  bool
+	debt  cache.Cache[beeline.DebtStats]
+	cells cache.Cache[[]beeline.CellState]
 }
 
-type debtMemo struct {
-	at    time.Time
-	stats beeline.DebtStats
+// debtAllKey names the aggregate (all-areas) debt entry; per-area entries are
+// keyed by id, which can never collide with it.
+const debtAllKey = "all"
+
+// areaKey names one area's entry in either cache.
+func areaKey(area beeline.AreaID) string {
+	return strconv.FormatInt(int64(area), 10)
 }
 
-type cellsMemo struct {
-	at     time.Time
-	states []beeline.CellState
-}
-
-func newStatsCache(ttl time.Duration) *statsCache {
-	return &statsCache{
-		ttl:   ttl,
-		debt:  make(map[beeline.AreaID]debtMemo),
-		cells: make(map[beeline.AreaID]cellsMemo),
+// newStatsCache builds the memo caches, or returns nil when caching is off.
+func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider tracing.TracerProvider, metricsProvider metrics.Provider) (*statsCache, error) {
+	if ttl <= 0 {
+		return nil, nil //nolint:nilnil // a nil cache IS the "caching disabled" value
 	}
+
+	debt, err := cachememory.NewInMemoryCache[beeline.DebtStats](ttl, logger, tracerProvider, metricsProvider)
+	if err != nil {
+		return nil, fmt.Errorf("freshness: building debt stats cache: %w", err)
+	}
+
+	cells, err := cachememory.NewInMemoryCache[[]beeline.CellState](ttl, logger, tracerProvider, metricsProvider)
+	if err != nil {
+		return nil, fmt.Errorf("freshness: building cell states cache: %w", err)
+	}
+
+	return &statsCache{debt: debt, cells: cells}, nil
+}
+
+// cachedDebt returns a memoized DebtStats, if one is live.
+func (c *statsCache) cachedDebt(ctx context.Context, key string) (beeline.DebtStats, bool) {
+	if c == nil {
+		return beeline.DebtStats{}, false
+	}
+
+	stats, err := c.debt.Get(ctx, key)
+	if err != nil || stats == nil {
+		return beeline.DebtStats{}, false
+	}
+
+	return *stats, true
+}
+
+// putDebt memoizes a DebtStats. A cache write failure only costs a future scan.
+func (c *statsCache) putDebt(ctx context.Context, key string, stats beeline.DebtStats) {
+	if c == nil {
+		return
+	}
+
+	_ = c.debt.Set(ctx, key, &stats) //nolint:errcheck // memoization is best-effort
+}
+
+// cachedCells returns memoized cell states, if any are live.
+func (c *statsCache) cachedCells(ctx context.Context, key string) ([]beeline.CellState, bool) {
+	if c == nil {
+		return nil, false
+	}
+
+	states, err := c.cells.Get(ctx, key)
+	if err != nil || states == nil {
+		return nil, false
+	}
+
+	return *states, true
+}
+
+// putCells memoizes cell states.
+func (c *statsCache) putCells(ctx context.Context, key string, states []beeline.CellState) {
+	if c == nil {
+		return
+	}
+
+	_ = c.cells.Set(ctx, key, &states) //nolint:errcheck // memoization is best-effort
 }
 
 // Debt reports the aggregate freshness contract: working set, stale count
@@ -46,13 +108,9 @@ func newStatsCache(ttl time.Duration) *statsCache {
 // throughput. Required sums each area's workingSet/TTL; achieved comes from
 // the shared global counter, so every head reports the same number.
 func (i *Index) Debt(ctx context.Context) (beeline.DebtStats, error) {
-	i.stats.mu.Lock()
-	if i.stats.hasAll && i.stats.ttl > 0 && time.Since(i.stats.debtAll.at) < i.stats.ttl {
-		stats := i.stats.debtAll.stats
-		i.stats.mu.Unlock()
+	if stats, ok := i.stats.cachedDebt(ctx, debtAllKey); ok {
 		return stats, nil
 	}
-	i.stats.mu.Unlock()
 
 	start := time.Now()
 	defer func() {
@@ -92,10 +150,7 @@ func (i *Index) Debt(ctx context.Context) (beeline.DebtStats, error) {
 		return beeline.DebtStats{}, fmt.Errorf("freshness: reading debt: %w", err)
 	}
 
-	i.stats.mu.Lock()
-	i.stats.debtAll = debtMemo{at: time.Now(), stats: stats}
-	i.stats.hasAll = true
-	i.stats.mu.Unlock()
+	i.stats.putDebt(ctx, debtAllKey, stats)
 
 	return stats, nil
 }
@@ -104,12 +159,9 @@ func (i *Index) Debt(ctx context.Context) (beeline.DebtStats, error) {
 // from the area's own baseline (reset when it was last seeded), so a freshly
 // enabled area's progress reads from zero.
 func (i *Index) DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.DebtStats, error) {
-	i.stats.mu.Lock()
-	if memo, ok := i.stats.debt[area]; ok && i.stats.ttl > 0 && time.Since(memo.at) < i.stats.ttl {
-		i.stats.mu.Unlock()
-		return memo.stats, nil
+	if stats, ok := i.stats.cachedDebt(ctx, areaKey(area)); ok {
+		return stats, nil
 	}
-	i.stats.mu.Unlock()
 
 	var stats beeline.DebtStats
 	var ttlSeconds float64
@@ -141,9 +193,7 @@ func (i *Index) DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.D
 		stats.RequiredThroughput = float64(stats.WorkingSet) / ttlSeconds
 	}
 
-	i.stats.mu.Lock()
-	i.stats.debt[area] = debtMemo{at: time.Now(), stats: stats}
-	i.stats.mu.Unlock()
+	i.stats.putDebt(ctx, areaKey(area), stats)
 
 	return stats, nil
 }
@@ -152,12 +202,9 @@ func (i *Index) DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.D
 // console's progress map: total outgoing pairs, currently-fresh pairs, and the
 // oldest computed age. The result is unordered.
 func (i *Index) CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error) {
-	i.stats.mu.Lock()
-	if memo, ok := i.stats.cells[area]; ok && i.stats.ttl > 0 && time.Since(memo.at) < i.stats.ttl {
-		i.stats.mu.Unlock()
-		return memo.states, nil
+	if states, ok := i.stats.cachedCells(ctx, areaKey(area)); ok {
+		return states, nil
 	}
-	i.stats.mu.Unlock()
 
 	rows, err := i.pool.Query(ctx, `
 		SELECT origin,
@@ -186,9 +233,7 @@ func (i *Index) CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]b
 		return nil, fmt.Errorf("freshness: reading cell states: %w", err)
 	}
 
-	i.stats.mu.Lock()
-	i.stats.cells[area] = cellsMemo{at: time.Now(), states: states}
-	i.stats.mu.Unlock()
+	i.stats.putCells(ctx, areaKey(area), states)
 
 	return states, nil
 }

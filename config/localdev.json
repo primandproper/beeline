@@ -58,6 +58,13 @@
 				"maxIdleConnsPerHost": 0,
 				"enableTracing": false
 			},
+			"retry": {
+				"maxAttempts": 3,
+				"initialDelay": 100000000,
+				"maxDelay": 2000000000,
+				"multiplier": 2,
+				"useJitter": true
+			},
 			"idleBackoff": 1000000000,
 			"port": 8081,
 			"workers": 4

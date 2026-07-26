@@ -34,7 +34,7 @@ func testFallback() beeline.RoutingEngine {
 func newFollowerWith(t *testing.T, leaderURL string, fallback beeline.RoutingEngine) *follower.Follower {
 	t.Helper()
 
-	f, err := follower.New(follower.Config{
+	f, err := follower.New(&follower.Config{
 		LeaderURL:    leaderURL,
 		Fallback:     fallback,
 		BuildEngines: registry.BuildAll,
@@ -53,13 +53,13 @@ func newFollower(t *testing.T, leaderURL string) *follower.Follower {
 func TestNewValidates(t *testing.T) {
 	t.Parallel()
 
-	_, err := follower.New(follower.Config{Fallback: testFallback(), BuildEngines: registry.BuildAll}, nil)
+	_, err := follower.New(&follower.Config{Fallback: testFallback(), BuildEngines: registry.BuildAll}, nil)
 	require.Error(t, err, "a leader URL is required")
 
-	_, err = follower.New(follower.Config{LeaderURL: "http://localhost:1", BuildEngines: registry.BuildAll}, nil)
+	_, err = follower.New(&follower.Config{LeaderURL: "http://localhost:1", BuildEngines: registry.BuildAll}, nil)
 	require.Error(t, err, "a fallback engine is required")
 
-	_, err = follower.New(follower.Config{LeaderURL: "http://localhost:1", Fallback: testFallback()}, nil)
+	_, err = follower.New(&follower.Config{LeaderURL: "http://localhost:1", Fallback: testFallback()}, nil)
 	require.Error(t, err, "an engines builder is required")
 }
 

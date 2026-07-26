@@ -20,6 +20,9 @@ import (
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+
+	"github.com/primandproper/platform-go/v7/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v7/circuitbreaking/config"
 )
 
 // defaultTimeout bounds a single /table request so a hung OSRM server cannot stall a
@@ -30,7 +33,8 @@ const defaultTimeout = 10 * time.Second
 // the graph, so this is purely a request builder and response parser behind the
 // RoutingEngine interface.
 type Engine struct {
-	client *http.Client
+	client  *http.Client
+	breaker circuitbreaking.CircuitBreaker
 	// profiles maps a beeline profile to the OSRM profile path segment (the mode the
 	// server was built with, e.g. "car"→"driving"). A profile absent from the map is
 	// passed through unchanged, so an identity mapping needs no configuration.
@@ -65,6 +69,14 @@ func WithProfiles(m map[beeline.Profile]string) Option {
 	}
 }
 
+// WithCircuitBreaker sheds load when the OSRM server stops answering: once tripped,
+// Table fails immediately instead of paying the client timeout per call. A refresh
+// worker's lease then expires and the pairs return to the queue; a read-path miss
+// surfaces as the usual engine error. The default is a no-op breaker.
+func WithCircuitBreaker(cb circuitbreaking.CircuitBreaker) Option {
+	return func(e *Engine) { e.breaker = cb }
+}
+
 // WithMaxTableSize sets the matrix-size bound Capabilities reports and Table enforces,
 // matching the server's own max-table-size limit (0 = unbounded, the default).
 func WithMaxTableSize(n int) Option {
@@ -81,6 +93,7 @@ func New(baseURL string, opts ...Option) *Engine {
 	for _, opt := range opts {
 		opt(e)
 	}
+	e.breaker = circuitbreakingcfg.EnsureCircuitBreaker(e.breaker)
 
 	return e
 }
@@ -107,6 +120,10 @@ func (e *Engine) Table(ctx context.Context, req beeline.TableRequest) (beeline.T
 		return beeline.TableResponse{}, fmt.Errorf("osrm: table size %d exceeds max %d", n, e.maxTableSize)
 	}
 
+	if e.breaker.CannotProceed() {
+		return beeline.TableResponse{}, fmt.Errorf("osrm: table: %w", circuitbreaking.ErrCircuitBroken)
+	}
+
 	wantDist := req.Want.Has(beeline.AnnotateDistance)
 	wantDur := req.Want == 0 || req.Want.Has(beeline.AnnotateDuration)
 
@@ -121,17 +138,33 @@ func (e *Engine) Table(ctx context.Context, req beeline.TableRequest) (beeline.T
 	// path/query structure, not from end-user input, so it is not an SSRF vector.
 	httpResp, err := e.client.Do(httpReq) //nolint:gosec // G704: baseURL is trusted operator configuration.
 	if err != nil {
+		e.breaker.Failed()
+
 		return beeline.TableResponse{}, fmt.Errorf("osrm: table request: %w", err)
 	}
 
 	body, err := io.ReadAll(httpResp.Body)
 	closeErr := httpResp.Body.Close()
 	if err != nil {
+		e.breaker.Failed()
+
 		return beeline.TableResponse{}, fmt.Errorf("osrm: reading table response: %w", err)
 	}
 	if closeErr != nil {
+		e.breaker.Failed()
+
 		return beeline.TableResponse{}, fmt.Errorf("osrm: closing table response: %w", closeErr)
 	}
+	if httpResp.StatusCode >= http.StatusInternalServerError {
+		e.breaker.Failed()
+
+		return beeline.TableResponse{}, fmt.Errorf("osrm: table returned status %d: %s", httpResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// The server answered. A 4xx or a non-Ok code is this request's problem, not
+	// the server's health, so those count as successes for the breaker.
+	e.breaker.Succeeded()
+
 	if httpResp.StatusCode != http.StatusOK {
 		return beeline.TableResponse{}, fmt.Errorf("osrm: table returned status %d: %s", httpResp.StatusCode, strings.TrimSpace(string(body)))
 	}

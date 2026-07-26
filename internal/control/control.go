@@ -22,6 +22,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/tessellate"
+
+	"github.com/primandproper/platform-go/v7/distributedlock"
+	"github.com/primandproper/platform-go/v7/distributedlock/noop"
 )
 
 // AreasRepository persists service-area definitions. The SQLite store satisfies it;
@@ -84,12 +87,23 @@ type Locker interface {
 	WithAreaLock(ctx context.Context, id beeline.AreaID, fn func(ctx context.Context) error) error
 }
 
-// noopLocker is the single-node default.
-type noopLocker struct{}
-
-func (noopLocker) WithAreaLock(ctx context.Context, _ beeline.AreaID, fn func(ctx context.Context) error) error {
-	return fn(ctx)
+// noopLocker is the single-node default: it delegates to platform-go's no-op
+// scoped locker, which runs fn unguarded. The area id is irrelevant to it, so
+// the key is a constant.
+type noopLocker struct {
+	scoped distributedlock.ScopedLocker
 }
+
+func newNoopLocker() noopLocker {
+	return noopLocker{scoped: noop.NewScopedLocker()}
+}
+
+func (l noopLocker) WithAreaLock(ctx context.Context, _ beeline.AreaID, fn func(ctx context.Context) error) error {
+	return l.scoped.WithLock(ctx, lockNameSingleNode, fn)
+}
+
+// lockNameSingleNode is the key the no-op locker records; nothing contends on it.
+const lockNameSingleNode = "beeline:single-node"
 
 // BootSeedLocker is the optional Locker extension for multi-head boot:
 // ResumeEnabled runs under this lock when the locker provides it, so heads
@@ -222,7 +236,7 @@ func New(cfg *Config) (*Coordinator, error) {
 
 	locker := cfg.Locker
 	if locker == nil {
-		locker = noopLocker{}
+		locker = newNoopLocker()
 	}
 
 	c := &Coordinator{

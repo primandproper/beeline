@@ -77,13 +77,13 @@ func TestBackendConfigValidate(t *testing.T) {
 		require.ErrorContains(t, (&BackendConfig{HotStore: "dynamo"}).validate(), "hot store")
 	})
 
-	t.Run("conn bounds must be coherent", func(t *testing.T) {
+	t.Run("conn bounds must be non-negative", func(t *testing.T) {
 		t.Parallel()
 
 		b := BackendConfig{
 			Mode:     BackendModePostgres,
-			Postgres: PostgresConfig{URL: "postgres://localhost/beeline", MaxConns: 4, MinConns: 8},
+			Postgres: PostgresConfig{URL: "postgres://localhost/beeline", MaxConns: -1},
 		}
-		require.ErrorContains(t, b.validate(), "min conns")
+		require.ErrorContains(t, b.validate(), "max conns")
 	})
 }

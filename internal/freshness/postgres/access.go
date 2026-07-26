@@ -8,6 +8,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
+	"github.com/primandproper/platform-go/v7/clock"
+
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -24,6 +26,7 @@ const drainTimeout = 5 * time.Second
 // minutes-scale sweep cutoffs.
 type accessBuffer struct {
 	index   *Index
+	clock   clock.Clock
 	pending map[beeline.PairKey]struct{}
 	wake    chan struct{}
 	stop    chan struct{}
@@ -35,9 +38,10 @@ type accessBuffer struct {
 	mu sync.Mutex
 }
 
-func newAccessBuffer(index *Index, interval time.Duration, limit int) *accessBuffer {
+func newAccessBuffer(index *Index, clk clock.Clock, interval time.Duration, limit int) *accessBuffer {
 	b := &accessBuffer{
 		index:    index,
+		clock:    clk,
 		pending:  make(map[beeline.PairKey]struct{}),
 		wake:     make(chan struct{}, 1),
 		stop:     make(chan struct{}),
@@ -123,14 +127,14 @@ func (b *accessBuffer) swap() []beeline.PairKey {
 func (b *accessBuffer) run() {
 	defer close(b.done)
 
-	ticker := time.NewTicker(b.interval)
+	ticker := b.clock.NewTicker(b.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-b.stop:
 			return
-		case <-ticker.C:
+		case <-ticker.Chan():
 		case <-b.wake:
 		}
 

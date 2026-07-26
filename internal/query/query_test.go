@@ -563,7 +563,7 @@ type captureRecorder struct {
 	mu     sync.Mutex
 }
 
-func (c *captureRecorder) RecordFetch(ev *telemetry.FetchEvent) {
+func (c *captureRecorder) Record(ev *telemetry.FetchEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, *ev)

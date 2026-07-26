@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
@@ -13,6 +14,9 @@ import (
 	pgstore "github.com/primandproper/beeline/internal/store/postgres"
 	redisstore "github.com/primandproper/beeline/internal/store/redis"
 	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
+
+	"github.com/primandproper/platform-go/v7/database"
+	"github.com/primandproper/platform-go/v7/healthcheck"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -48,6 +52,10 @@ type freshnessIndex interface {
 // pool when the mode needs one, and a close that releases everything in the
 // right order (index first — its access-buffer drain still writes to the pool).
 type backendHandles struct {
+	// db is the platform database client in distributed mode; pool is the pgx
+	// pool behind it, which every pgx-native package (store, index, sqlc) uses
+	// directly.
+	db           database.Client
 	pool         *pgxpool.Pool
 	store        hotStore
 	index        freshnessIndex
@@ -58,7 +66,10 @@ type backendHandles struct {
 	// sweepGate elects the single head that runs a janitor tick (nil = no
 	// election needed, always run — the single-node mode).
 	sweepGate func(ctx context.Context, fn func(ctx context.Context) error) (bool, error)
-	close     func()
+	// health carries the readiness checkers for whatever this backend actually
+	// depends on, so /_ops_/ready reports the dependencies rather than a constant.
+	health healthcheck.Registry
+	close  func()
 }
 
 // buildBackend opens the configured backend: the zero-dependency in-memory
@@ -67,15 +78,30 @@ type backendHandles struct {
 // handles.close().
 func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfig) (*backendHandles, error) {
 	bcfg := &mcfg.Backend
-	handles := &backendHandles{close: func() {}}
+	handles := &backendHandles{close: func() {}, health: healthcheck.NewRegistry()}
 
 	if bcfg.Distributed() || bcfg.EffectiveHotStore() == config.HotStorePostgres {
-		pool, err := pgstore.Open(ctx, &bcfg.Postgres)
+		db, err := pgstore.Open(ctx, &bcfg.Postgres, a.logger, a.pillars.TracerProvider, a.pillars.MetricsProvider)
 		if err != nil {
 			return nil, err
 		}
+
+		pool, err := pgstore.Pool(db)
+		if err != nil {
+			_ = db.Close() //nolint:errcheck // already failing; the close error adds nothing
+			return nil, err
+		}
+
+		handles.db = db
 		handles.pool = pool
-		handles.close = pool.Close
+		if ready, ok := db.(healthcheck.DatabaseReadyChecker); ok {
+			handles.health.Register(healthcheck.NewDatabaseChecker("postgres", ready))
+		}
+		handles.close = func() {
+			if closeErr := db.Close(); closeErr != nil {
+				a.log().Error("closing postgres client", closeErr)
+			}
+		}
 	}
 
 	// The index and control plane: shared Postgres in distributed mode (every
@@ -83,10 +109,17 @@ func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfi
 	// head converges on one area/provider registry), in-process memory + local
 	// SQLite otherwise. In distributed mode the SQLite DatabasePath is ignored.
 	if bcfg.Distributed() {
-		index := pgfresh.New(handles.pool, pgfresh.Config{
-			TargetTTL:     mcfg.TargetTTL,
-			StatsCacheTTL: statsCacheTTL,
+		index, err := pgfresh.New(handles.pool, &pgfresh.Config{
+			TargetTTL:       mcfg.TargetTTL,
+			StatsCacheTTL:   statsCacheTTL,
+			Clock:           a.clock,
+			TracerProvider:  a.pillars.TracerProvider,
+			MetricsProvider: a.pillars.MetricsProvider,
 		}, a.logger)
+		if err != nil {
+			handles.close()
+			return nil, err
+		}
 		closePool := handles.close
 		handles.close = func() {
 			drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), indexDrainTimeout)
@@ -102,7 +135,11 @@ func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfi
 		handles.areas = repo
 		handles.providers = repo
 		handles.configSource = repo
-		locker := pgstore.NewAdvisoryLocker(handles.pool)
+		locker, lockErr := pgstore.NewAdvisoryLocker(handles.db, a.logger, a.pillars.TracerProvider, a.pillars.MetricsProvider)
+		if lockErr != nil {
+			handles.close()
+			return nil, lockErr
+		}
 		handles.locker = locker
 		handles.sweepGate = locker.TryJanitorLock
 	} else {
@@ -116,6 +153,7 @@ func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfi
 		repo := areasqlite.NewRepository(db, nil)
 		handles.areas = repo
 		handles.providers = repo
+		handles.health.Register(sqliteChecker{db: db})
 		closeRest := handles.close
 		handles.close = func() {
 			if closeErr := db.Close(); closeErr != nil {
@@ -135,6 +173,7 @@ func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfi
 			return nil, err
 		}
 		handles.store = store
+		handles.health.Register(healthcheck.NewCacheChecker("redis", store))
 		closePool := handles.close
 		handles.close = func() {
 			if closeErr := store.Close(); closeErr != nil {
@@ -148,3 +187,16 @@ func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfi
 
 	return handles, nil
 }
+
+// sqliteChecker reports whether the single-node area database is reachable. The
+// pool is capped at one connection, so a ping can wait behind a writer for up to
+// the busy timeout — well inside the health registry's per-checker budget.
+type sqliteChecker struct {
+	db *sql.DB
+}
+
+// Name identifies the component in the /_ops_/ready payload.
+func (c sqliteChecker) Name() string { return "sqlite" }
+
+// Check pings the database.
+func (c sqliteChecker) Check(ctx context.Context) error { return c.db.PingContext(ctx) }

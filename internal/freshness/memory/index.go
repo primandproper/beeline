@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
+
+	"github.com/primandproper/platform-go/v7/clock"
 )
 
 // entry is the per-pair scheduling state.
@@ -44,7 +46,7 @@ type areaFreshness struct {
 // due pairs to workers under a lease.
 type Index struct {
 	started       time.Time
-	now           func() time.Time
+	clock         clock.Clock
 	entries       map[beeline.PairKey]*entry
 	baselines     map[beeline.AreaID]*baseline
 	areaFresh     map[beeline.AreaID]areaFreshness
@@ -53,20 +55,20 @@ type Index struct {
 	mu            sync.Mutex
 }
 
-// New builds an index with the given target TTL. The clock is injectable so tests
-// can advance time deterministically; pass nil to use the wall clock.
-func New(targetTTL time.Duration, clock func() time.Time) *Index {
-	if clock == nil {
-		clock = time.Now
+// New builds an index with the given target TTL. Pass nil for the wall clock;
+// tests run it under testing/synctest, where the wall clock reads bubble time.
+func New(targetTTL time.Duration, clk clock.Clock) *Index {
+	if clk == nil {
+		clk = clock.NewClock()
 	}
 
 	return &Index{
-		now:       clock,
+		clock:     clk,
 		entries:   make(map[beeline.PairKey]*entry),
 		baselines: make(map[beeline.AreaID]*baseline),
 		areaFresh: make(map[beeline.AreaID]areaFreshness),
 		targetTTL: targetTTL,
-		started:   clock(),
+		started:   clk.Now(),
 	}
 }
 
@@ -113,7 +115,7 @@ func (i *Index) Seed(_ context.Context, keys []beeline.PairKey) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 	for pos := range keys {
 		if _, ok := i.entries[keys[pos]]; !ok {
 			i.entries[keys[pos]] = &entry{pinned: true}
@@ -134,7 +136,7 @@ func (i *Index) Access(_ context.Context, keys []beeline.PairKey) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 	for pos := range keys {
 		e, ok := i.entries[keys[pos]]
 		if !ok {
@@ -174,7 +176,7 @@ func (i *Index) SweepArea(_ context.Context, area beeline.AreaID, cutoff time.Ti
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 
 	var removed []beeline.PairKey
 	for k, e := range i.entries {
@@ -201,7 +203,7 @@ func (i *Index) CellStates(_ context.Context) ([]beeline.CellState, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 
 	type rollup struct {
 		total     int
@@ -251,7 +253,7 @@ func (i *Index) CellStatesForArea(_ context.Context, area beeline.AreaID) ([]bee
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 
 	type rollup struct {
 		total     int
@@ -355,7 +357,7 @@ func (i *Index) Claim(_ context.Context, limit int, lease time.Duration) ([]beel
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 
 	// top holds the best `limit` candidates seen so far as a binary heap whose
 	// root is the WORST of them, so each further candidate is one comparison
@@ -436,7 +438,7 @@ func (i *Index) MarkComputed(_ context.Context, keys []beeline.PairKey, at time.
 		// accounting starts here rather than staying blank forever.
 		b, has := i.baselines[keys[pos].Area]
 		if !has {
-			b = &baseline{started: i.now()}
+			b = &baseline{started: i.clock.Now()}
 			i.baselines[keys[pos].Area] = b
 		}
 		b.computedTotal++
@@ -454,7 +456,7 @@ func (i *Index) Bump(_ context.Context, keys []beeline.PairKey) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 	for pos := range keys {
 		e, ok := i.entries[keys[pos]]
 		if !ok {
@@ -490,7 +492,7 @@ func (i *Index) Debt(_ context.Context) (beeline.DebtStats, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 
 	var (
 		debt      int
@@ -542,7 +544,7 @@ func (i *Index) DebtForArea(_ context.Context, area beeline.AreaID) (beeline.Deb
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	now := i.now()
+	now := i.clock.Now()
 
 	var (
 		debt       int

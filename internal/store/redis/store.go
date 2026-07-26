@@ -55,6 +55,10 @@ func New(ctx context.Context, cfg *config.RedisConfig) (*Store, error) {
 // Close releases the client's connections.
 func (s *Store) Close() error { return s.client.Close() }
 
+// Ping reports whether the server is reachable, satisfying
+// healthcheck.CacheReadyChecker so the hot store can back /_ops_/ready.
+func (s *Store) Ping(ctx context.Context) error { return s.client.Ping(ctx).Err() }
+
 // key renders one pair key. Hex cells keep keys short and the area prefix makes
 // DeleteArea's scan pattern (`est:{area}:*`) cheap to express.
 func key(k beeline.PairKey) string {

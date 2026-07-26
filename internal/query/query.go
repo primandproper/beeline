@@ -29,7 +29,7 @@ type AreaRouter interface {
 // are the only location the telemetry may carry); refresh recomputes never pass
 // through here at all, so the record matches the queries-only access signal.
 type FetchRecorder interface {
-	RecordFetch(ev *telemetry.FetchEvent)
+	Record(ev *telemetry.FetchEvent)
 }
 
 // Source describes how an estimate was produced, for observability on the read path.
@@ -114,7 +114,7 @@ func (h *Handler) record(key beeline.PairKey, source Source, stale bool) {
 		return
 	}
 
-	h.recorder.RecordFetch(&telemetry.FetchEvent{
+	h.recorder.Record(&telemetry.FetchEvent{
 		At:     time.Now(),
 		Key:    key,
 		Source: string(source),

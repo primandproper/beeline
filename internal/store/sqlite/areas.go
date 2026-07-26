@@ -9,6 +9,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/store/sqlite/generated"
+
+	"github.com/primandproper/platform-go/v7/clock"
 )
 
 // ErrNotFound is returned when an area id does not exist.
@@ -23,24 +25,24 @@ const timeFormat = time.RFC3339Nano
 type Repository struct {
 	db      *sql.DB
 	queries generated.Querier
-	now     func() time.Time
+	clock   clock.Clock
 }
 
 // NewRepository builds a Repository over an already-open, migrated database (see
-// Open). The clock is injectable for tests; pass nil for the wall clock.
-func NewRepository(db *sql.DB, clock func() time.Time) *Repository {
-	if clock == nil {
-		clock = time.Now
+// Open). Pass nil for the wall clock.
+func NewRepository(db *sql.DB, clk clock.Clock) *Repository {
+	if clk == nil {
+		clk = clock.NewClock()
 	}
 
-	return &Repository{db: db, queries: generated.New(), now: clock}
+	return &Repository{db: db, queries: generated.New(), clock: clk}
 }
 
 // Create inserts an area and its layers in one transaction, stamping created/updated
 // times, and returns the stored area with its assigned ID. The caller controls the
 // Enabled flag (the control plane creates areas disabled).
 func (r *Repository) Create(ctx context.Context, a *beeline.Area) (beeline.Area, error) {
-	now := r.now().UTC()
+	now := r.clock.Now().UTC()
 	a.CreatedAt = now
 	a.UpdatedAt = now
 
@@ -118,7 +120,7 @@ func (r *Repository) List(ctx context.Context) ([]beeline.Area, error) {
 // Update rewrites an area's mutable fields and replaces its layer list, in one
 // transaction. It bumps updated_at.
 func (r *Repository) Update(ctx context.Context, a *beeline.Area) error {
-	now := r.now().UTC()
+	now := r.clock.Now().UTC()
 
 	return r.inTx(ctx, func(tx *sql.Tx) error {
 		if updErr := r.queries.UpdateArea(ctx, tx, &generated.UpdateAreaParams{
@@ -158,7 +160,7 @@ func (r *Repository) SetEnabled(ctx context.Context, id beeline.AreaID, enabled 
 	if err := r.queries.SetAreaEnabled(ctx, r.db, &generated.SetAreaEnabledParams{
 		ID:        int64(id),
 		Enabled:   boolToInt(enabled),
-		UpdatedAt: r.now().UTC().Format(timeFormat),
+		UpdatedAt: r.clock.Now().UTC().Format(timeFormat),
 	}); err != nil {
 		return fmt.Errorf("sqlite: setting enabled for area %d: %w", id, err)
 	}

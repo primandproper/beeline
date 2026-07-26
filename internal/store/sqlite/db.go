@@ -29,7 +29,7 @@ func Open(path string) (*sql.DB, error) {
 	db.SetConnMaxIdleTime(0)
 	db.SetConnMaxLifetime(0)
 
-	if err = migrate(db); err != nil {
+	if err = runMigrations(db); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 

@@ -8,6 +8,7 @@
 package registry
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
@@ -16,6 +17,11 @@ import (
 	haversineengine "github.com/primandproper/beeline/internal/engine/haversine"
 	latencyengine "github.com/primandproper/beeline/internal/engine/latency"
 	osrmengine "github.com/primandproper/beeline/internal/engine/osrm"
+
+	"github.com/primandproper/platform-go/v7/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v7/circuitbreaking/config"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/metrics"
 )
 
 // BuiltinSpecs returns the specs of the always-synthesized providers: the raw
@@ -41,14 +47,35 @@ func BuiltinSpecs(latencyEnabled bool, latencyMin, latencyMax time.Duration) []b
 	return specs
 }
 
+// Builder constructs engines with per-provider observability wiring. The
+// zero Builder behaves exactly like the package-level BuildEngine/BuildAll
+// functions (no breakers), so callers that do not care — tests, the follower's
+// bootstrap fallback — keep using those.
+type Builder struct {
+	// Ctx bounds the lifetime of each breaker's event-logging goroutine.
+	Ctx context.Context //nolint:containedctx // the breaker's event loop outlives any single call
+	// Logger and Metrics instrument the breakers.
+	Logger  logging.Logger
+	Metrics metrics.Provider
+	// Breakers gives every network-backed provider its own circuit breaker, so a
+	// dead OSRM server sheds load instead of paying a client timeout per call.
+	Breakers bool
+}
+
 // BuildAll constructs the name→engine map for a set of specs. speeds is the
 // profile speed map haversine-type engines divide by. Specs are validated as they
 // are built, so a catalog from an untrusted-but-authoritative source (the leader)
 // fails loudly instead of registering a nil engine.
 func BuildAll(specs []beeline.ProviderSpec, speeds map[beeline.Profile]float64) (map[string]beeline.RoutingEngine, error) {
+	return Builder{}.BuildAll(specs, speeds)
+}
+
+// BuildAll is Builder's namesake: the same construction with this Builder's
+// observability wiring applied to every spec.
+func (b Builder) BuildAll(specs []beeline.ProviderSpec, speeds map[beeline.Profile]float64) (map[string]beeline.RoutingEngine, error) {
 	out := make(map[string]beeline.RoutingEngine, len(specs))
 	for i := range specs {
-		eng, err := BuildEngine(&specs[i], speeds)
+		eng, err := b.BuildEngine(&specs[i], speeds)
 		if err != nil {
 			return nil, err
 		}
@@ -60,6 +87,36 @@ func BuildAll(specs []beeline.ProviderSpec, speeds map[beeline.Profile]float64) 
 
 // BuildEngine constructs a single provider's engine from its spec.
 func BuildEngine(spec *beeline.ProviderSpec, speeds map[beeline.Profile]float64) (beeline.RoutingEngine, error) {
+	return Builder{}.BuildEngine(spec, speeds)
+}
+
+// breakerFor returns the circuit breaker for one network-backed provider, or nil
+// when this Builder does not install them. A breaker that cannot be constructed
+// is not fatal: the engine simply runs unguarded, as it did before breakers
+// existed.
+func (b Builder) breakerFor(name string) circuitbreaking.CircuitBreaker {
+	if !b.Breakers {
+		return nil
+	}
+
+	ctx := b.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	cb, err := circuitbreakingcfg.NewCircuitBreaker(ctx,
+		&circuitbreakingcfg.Config{Name: "osrm_" + name}, b.Logger, b.Metrics)
+	if err != nil {
+		logging.EnsureLogger(b.Logger).Error("building circuit breaker for routing provider", err)
+
+		return nil
+	}
+
+	return cb
+}
+
+// BuildEngine constructs a single provider's engine from its spec.
+func (b Builder) BuildEngine(spec *beeline.ProviderSpec, speeds map[beeline.Profile]float64) (beeline.RoutingEngine, error) {
 	if err := spec.Validate(); err != nil {
 		return nil, fmt.Errorf("registry: %w", err)
 	}
@@ -81,6 +138,9 @@ func BuildEngine(spec *beeline.ProviderSpec, speeds map[beeline.Profile]float64)
 		}
 		if timeout := spec.Timeout(); timeout > 0 {
 			opts = append(opts, osrmengine.WithHTTPClient(&http.Client{Timeout: timeout}))
+		}
+		if cb := b.breakerFor(spec.Name); cb != nil {
+			opts = append(opts, osrmengine.WithCircuitBreaker(cb))
 		}
 
 		return osrmengine.New(spec.BaseURL, opts...), nil

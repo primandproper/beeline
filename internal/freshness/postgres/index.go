@@ -17,7 +17,10 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
+	"github.com/primandproper/platform-go/v7/clock"
 	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/metrics"
+	"github.com/primandproper/platform-go/v7/observability/tracing"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,7 +29,14 @@ import (
 // Config tunes the index. TargetTTL is the index-wide freshness default an
 // area's override falls back to (the memory index's New parameter).
 type Config struct {
-	TargetTTL time.Duration
+	// Clock drives the access flusher's ticker only; every scheduling timestamp
+	// still comes from the database's now(). Nil takes the wall clock.
+	Clock clock.Clock
+	// TracerProvider and MetricsProvider instrument the stats memo caches. Nil
+	// values become noops.
+	TracerProvider  tracing.TracerProvider
+	MetricsProvider metrics.Provider
+	TargetTTL       time.Duration
 	// StatsCacheTTL memoizes Debt/DebtForArea/CellStatesForArea per head — the
 	// console polls twice a second and these are aggregate scans. 0 disables
 	// (tests want uncached reads).
@@ -59,23 +69,33 @@ type Index struct {
 }
 
 // New builds the index and starts its access-flush goroutine.
-func New(pool *pgxpool.Pool, cfg Config, log logging.Logger) *Index {
+func New(pool *pgxpool.Pool, cfg *Config, log logging.Logger) (*Index, error) {
 	if cfg.AccessFlushInterval <= 0 {
 		cfg.AccessFlushInterval = defaultAccessFlushInterval
 	}
 	if cfg.AccessFlushLimit <= 0 {
 		cfg.AccessFlushLimit = defaultAccessFlushLimit
 	}
+	if cfg.Clock == nil {
+		cfg.Clock = clock.NewClock()
+	}
+
+	log = logging.EnsureLogger(log)
+
+	stats, err := newStatsCache(cfg.StatsCacheTTL, log, cfg.TracerProvider, cfg.MetricsProvider)
+	if err != nil {
+		return nil, err
+	}
 
 	i := &Index{
 		pool:  pool,
-		log:   logging.EnsureLogger(log),
-		cfg:   cfg,
-		stats: newStatsCache(cfg.StatsCacheTTL),
+		log:   log,
+		cfg:   *cfg,
+		stats: stats,
 	}
-	i.access = newAccessBuffer(i, cfg.AccessFlushInterval, cfg.AccessFlushLimit)
+	i.access = newAccessBuffer(i, cfg.Clock, cfg.AccessFlushInterval, cfg.AccessFlushLimit)
 
-	return i
+	return i, nil
 }
 
 // Close stops the access flusher and drains anything still buffered.

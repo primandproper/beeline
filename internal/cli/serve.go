@@ -15,7 +15,7 @@ import (
 	"github.com/primandproper/beeline/internal/telemetry"
 	"github.com/primandproper/beeline/internal/webui"
 
-	"github.com/primandproper/platform-go/v7/healthcheck"
+	"github.com/primandproper/platform-go/v7/eventcapture/jsonl"
 	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
 	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 
@@ -75,6 +75,11 @@ func (a *application) serve(ctx context.Context) error {
 	// configured matrix.backend moves the hot store — and, in distributed mode,
 	// the coordination state — into shared Postgres/Redis so multiple heads can
 	// serve one working set.
+	// Engine construction for this process: every network-backed provider gets
+	// its own circuit breaker, so a dead OSRM server sheds load instead of
+	// paying a client timeout on every refresh and read-path miss.
+	engines := registry.Builder{Ctx: ctx, Logger: a.logger, Metrics: a.pillars.MetricsProvider, Breakers: true}
+
 	backend, err := a.buildBackend(ctx, &mcfg)
 	if err != nil {
 		return err
@@ -97,7 +102,7 @@ func (a *application) serve(ctx context.Context) error {
 		Index:     index,
 		Store:     store,
 		BuildEngine: func(spec *beeline.ProviderSpec) (beeline.RoutingEngine, error) {
-			return registry.BuildEngine(spec, speeds)
+			return engines.BuildEngine(spec, speeds)
 		},
 		Speeds:          mcfg.Profiles,
 		Builtins:        builtins,
@@ -133,18 +138,25 @@ func (a *application) serve(ctx context.Context) error {
 	var recorder *telemetry.Recorder
 	var fetchRecorder query.FetchRecorder
 	if tcfg := mcfg.Telemetry; tcfg.Enabled() {
-		sink, sinkErr := telemetry.NewJSONLSink(tcfg.Path, tcfg.MaxFileBytes, tcfg.MaxFiles)
+		sink, sinkErr := jsonl.NewSink(&jsonl.Config{
+			Path:     tcfg.Path,
+			MaxBytes: tcfg.MaxFileBytes,
+			MaxFiles: tcfg.MaxFiles,
+		}, jsonl.WithLogger(a.logger))
 		if sinkErr != nil {
 			return sinkErr
 		}
-		recorder = telemetry.NewRecorder(sink, telemetry.Config{
+		recorder, err = telemetry.NewRecorder(sink, telemetry.Config{
 			BufferSize:       tcfg.BufferSize,
 			FlushInterval:    tcfg.FlushInterval,
 			RawEnabled:       tcfg.RawEnabled,
 			AggregateEnabled: tcfg.AggregateEnabled,
 			AggregateBucket:  tcfg.AggregateBucket,
 			AggregateMaxKeys: tcfg.AggregateMaxKeys,
-		}, a.logger)
+		}, a.logger, a.pillars.MetricsProvider)
+		if err != nil {
+			return err
+		}
 		// Assigned only when non-nil so the interface itself stays nil when telemetry
 		// is off (a typed-nil *Recorder would defeat the handler's nil check).
 		fetchRecorder = recorder
@@ -192,7 +204,7 @@ func (a *application) serve(ctx context.Context) error {
 		Index:          index,
 		Store:          store,
 		Coordinator:    coordinator,
-		Health:         healthcheck.NewRegistry(),
+		Health:         backend.health,
 		Logger:         a.logger,
 		DefaultProfile: beeline.Profile(mcfg.DefaultProfile),
 		RefreshBatch:   mcfg.RefreshBatch,
@@ -301,7 +313,7 @@ func (a *application) runConfigWatcher(ctx context.Context, coordinator *control
 	if interval <= 0 {
 		interval = defaultConfigPollInterval
 	}
-	ticker := time.NewTicker(interval)
+	ticker := a.clock.NewTicker(interval)
 	defer ticker.Stop()
 
 	var last map[string]int64
@@ -309,7 +321,7 @@ func (a *application) runConfigWatcher(ctx context.Context, coordinator *control
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.Chan():
 		}
 
 		generations, err := source.ConfigGenerations(ctx)
@@ -348,11 +360,11 @@ func (a *application) runSweeper(
 	coordinator *control.Coordinator,
 	gate func(ctx context.Context, fn func(ctx context.Context) error) (bool, error),
 ) {
-	ticker := time.NewTicker(sweepBaseTick)
+	ticker := a.clock.NewTicker(sweepBaseTick)
 	defer ticker.Stop()
 
 	sweep := func(ctx context.Context) error {
-		swept, err := coordinator.SweepDue(ctx, time.Now())
+		swept, err := coordinator.SweepDue(ctx, a.clock.Now())
 		if err != nil {
 			return err
 		}
@@ -367,7 +379,7 @@ func (a *application) runSweeper(
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticker.Chan():
 			var err error
 			if gate != nil {
 				_, err = gate(ctx, sweep) // not winning is normal: another head swept

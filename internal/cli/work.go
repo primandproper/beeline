@@ -12,6 +12,8 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/refresh"
 
+	circuitbreakingcfg "github.com/primandproper/platform-go/v7/circuitbreaking/config"
+	"github.com/primandproper/platform-go/v7/retry"
 	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
 	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 
@@ -72,19 +74,33 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 	for name, speed := range mcfg.Profiles {
 		speeds[beeline.Profile(name)] = speed
 	}
+	engines := registry.Builder{Ctx: ctx, Logger: a.logger, Metrics: a.pillars.MetricsProvider, Breakers: true}
+
 	fallbackSpec := beeline.ProviderSpec{Name: config.DefaultProviderName, Type: config.ProviderTypeHaversine}
-	fallback, err := registry.BuildEngine(&fallbackSpec, speeds)
+	fallback, err := engines.BuildEngine(&fallbackSpec, speeds)
 	if err != nil {
 		return err
 	}
 
 	httpCfg := fcfg.HTTP
 	httpCfg.EnsureDefaults()
-	f, err := follower.New(follower.Config{
+
+	// A breaker on the leader client: once the leader stops answering, claims
+	// fail immediately and every worker falls back to its idle backoff rather
+	// than spending a full retry budget each cycle against a sick leader.
+	breaker, err := circuitbreakingcfg.NewCircuitBreaker(ctx,
+		&circuitbreakingcfg.Config{Name: "follower_leader"}, a.logger, a.pillars.MetricsProvider)
+	if err != nil {
+		return err
+	}
+
+	f, err := follower.New(&follower.Config{
 		LeaderURL:    leaderURL,
 		Client:       httpCfg.BuildClient(),
+		Retry:        retry.NewExponentialBackoffPolicy(fcfg.Retry),
+		Breaker:      breaker,
 		Fallback:     fallback,
-		BuildEngines: registry.BuildAll,
+		BuildEngines: engines.BuildAll,
 	}, a.logger)
 	if err != nil {
 		return err

@@ -20,11 +20,12 @@ import (
 func newIndex(tb testing.TB, targetTTL time.Duration) *pgfresh.Index {
 	tb.Helper()
 
-	idx := pgfresh.New(pgtest.Open(tb), pgfresh.Config{
+	idx, err := pgfresh.New(pgtest.Open(tb), &pgfresh.Config{
 		TargetTTL:           targetTTL,
 		StatsCacheTTL:       0,
 		AccessFlushInterval: 50 * time.Millisecond,
 	}, nil)
+	require.NoError(tb, err)
 	tb.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -91,10 +92,11 @@ func TestStatsCacheServesWithinTTL(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	idx := pgfresh.New(pgtest.Open(t), pgfresh.Config{
+	idx, err := pgfresh.New(pgtest.Open(t), &pgfresh.Config{
 		TargetTTL:     time.Hour,
 		StatsCacheTTL: time.Minute,
 	}, nil)
+	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, idx.Close(context.Background())) })
 
 	require.NoError(t, idx.Seed(ctx, []beeline.PairKey{{Profile: "car", Area: 201, Origin: 1, Dest: 2, Res: 8}}))

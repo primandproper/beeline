@@ -37,7 +37,7 @@ func (r *Repository) UpsertProvider(ctx context.Context, spec *beeline.ProviderS
 		return fmt.Errorf("sqlite: encoding profiles for provider %q: %w", spec.Name, err)
 	}
 
-	now := r.now().UTC().Format(timeFormat)
+	now := r.clock.Now().UTC().Format(timeFormat)
 	if err = r.queries.UpsertProvider(ctx, r.db, &generated.UpsertProviderParams{
 		Name:         spec.Name,
 		Type:         spec.Type,

@@ -11,9 +11,14 @@ import (
 // the compute loop (claim → group → table → unpack) and whoever owns the freshness
 // index and hot store: a leader wires the pool to its own index/store via
 // LocalSource, while a follower's implementation claims from and submits to a
-// leader over HTTP. Submit is all-or-nothing from the pool's point of view — on
-// error the batch is dropped and the claims' leases expire, so the pairs are
-// reclaimed and recomputed (wasted work, never corruption).
+// leader over HTTP.
+//
+// One claim may produce several Submit calls, each carrying a disjoint slice of
+// the batch's results (see Config.SubmitChunk), so an implementation must be safe
+// to invoke repeatedly. Each call is all-or-nothing from the pool's point of view:
+// on error the pool drops that flush and abandons the rest of the claim, leaving
+// those pairs' leases to expire so they are reclaimed and recomputed (wasted work,
+// never corruption). Results from earlier flushes stay durable.
 type WorkSource interface {
 	Claim(ctx context.Context, limit int, lease time.Duration) ([]beeline.PairKey, error)
 	Submit(ctx context.Context, entries []beeline.Entry) error
@@ -38,7 +43,8 @@ func (s *LocalSource) Claim(ctx context.Context, limit int, lease time.Duration)
 
 // Submit writes the computed entries and marks them fresh. A store failure returns
 // before marking, leaving the leases to expire and the pairs to be reclaimed. The
-// pool stamps one ComputedAt per batch, so any entry's timestamp is the batch's.
+// pool stamps one ComputedAt per claimed batch — not per flush — so any entry's
+// timestamp is the batch's, and using entries[0]'s for the whole call is exact.
 func (s *LocalSource) Submit(ctx context.Context, entries []beeline.Entry) error {
 	if len(entries) == 0 {
 		return nil

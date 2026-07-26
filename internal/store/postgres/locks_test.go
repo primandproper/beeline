@@ -20,7 +20,8 @@ func TestTryJanitorLockElectsOneWinnerAndFailsOver(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	locker := postgres.NewAdvisoryLocker(pgtest.Open(t))
+	locker, lockErr := postgres.NewAdvisoryLocker(pgtest.OpenClient(t), nil, nil, nil)
+	require.NoError(t, lockErr)
 
 	holding := make(chan struct{})
 	release := make(chan struct{})
@@ -58,7 +59,8 @@ func TestWithAreaLockSerializesAcrossCallers(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	locker := postgres.NewAdvisoryLocker(pgtest.Open(t))
+	locker, lockErr := postgres.NewAdvisoryLocker(pgtest.OpenClient(t), nil, nil, nil)
+	require.NoError(t, lockErr)
 
 	var order []string
 	var mu sync.Mutex

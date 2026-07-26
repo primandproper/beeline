@@ -27,7 +27,10 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
+	"github.com/primandproper/platform-go/v7/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v7/circuitbreaking/config"
 	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/retry"
 
 	"github.com/uber/h3-go/v4"
 )
@@ -46,7 +49,15 @@ type Config struct {
 	Fallback     beeline.RoutingEngine
 	Client       *http.Client
 	BuildEngines EnginesBuilder
-	LeaderURL    string
+	// Retry governs how a failed claim/submit round trip is re-attempted. Nil
+	// means a single attempt — the behavior before retries existed, and what
+	// tests asserting one call per operation want.
+	Retry retry.Policy
+	// Breaker sheds load when the leader stops answering: once tripped, claims
+	// fail immediately and the pool idles on its backoff instead of hammering a
+	// sick leader with the full retry budget per worker. Nil means no breaker.
+	Breaker   circuitbreaking.CircuitBreaker
+	LeaderURL string
 }
 
 // Follower claims work from and submits results to one leader. It satisfies
@@ -55,6 +66,8 @@ type Config struct {
 // index/store.
 type Follower struct {
 	client          *http.Client
+	retry           retry.Policy
+	breaker         circuitbreaking.CircuitBreaker
 	buildEngines    EnginesBuilder
 	fallback        beeline.RoutingEngine
 	providers       map[string]beeline.RoutingEngine
@@ -69,7 +82,7 @@ type Follower struct {
 // New builds a Follower. Its provider registry starts as just the fallback engine
 // under the default name and is replaced wholesale by the first catalog sync — a
 // follower is configured by its leader, not by local provider config.
-func New(cfg Config, logger logging.Logger) (*Follower, error) {
+func New(cfg *Config, logger logging.Logger) (*Follower, error) {
 	if cfg.LeaderURL == "" {
 		return nil, errors.New("follower: leader URL is required")
 	}
@@ -85,9 +98,16 @@ func New(cfg Config, logger logging.Logger) (*Follower, error) {
 		client = &http.Client{Timeout: defaultTimeout}
 	}
 
+	policy := cfg.Retry
+	if policy == nil {
+		policy = retry.NewExponentialBackoffPolicy(retry.Config{MaxAttempts: 1})
+	}
+
 	return &Follower{
 		baseURL:         strings.TrimRight(cfg.LeaderURL, "/"),
 		client:          client,
+		retry:           policy,
+		breaker:         circuitbreakingcfg.EnsureCircuitBreaker(cfg.Breaker),
 		buildEngines:    cfg.BuildEngines,
 		fallback:        cfg.Fallback,
 		providers:       map[string]beeline.RoutingEngine{beeline.DefaultProviderName: cfg.Fallback},
@@ -145,7 +165,30 @@ type submitRequest struct {
 // the leader no longer intends (the leased pairs simply expire back into the
 // queue). A cell the leader hands out is parsed strictly — a bad one fails the
 // whole claim, since it can only mean protocol drift, not recoverable input.
+//
+// The whole claim, catalog sync included, shares one retry budget. Retrying is
+// safe even when the leader actually granted the lost attempt: those pairs stay
+// leased until they expire back into the queue.
 func (f *Follower) Claim(ctx context.Context, limit int, lease time.Duration) ([]beeline.PairKey, error) {
+	var keys []beeline.PairKey
+	err := f.retry.Execute(ctx, func(ctx context.Context) error {
+		claimed, err := f.claimOnce(ctx, limit, lease)
+		if err != nil {
+			return classify(err)
+		}
+		keys = claimed
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return keys, nil
+}
+
+// claimOnce is one claim attempt.
+func (f *Follower) claimOnce(ctx context.Context, limit int, lease time.Duration) ([]beeline.PairKey, error) {
 	var resp claimResponse
 	err := f.post(ctx, "/_work_/claim", claimRequest{
 		BatchSize:    limit,
@@ -204,7 +247,11 @@ func (f *Follower) Submit(ctx context.Context, entries []beeline.Entry) error {
 		})
 	}
 
-	return f.post(ctx, "/_work_/submit", req, nil)
+	// Duplicate submits are idempotent by construction (Put + MarkComputed), so a
+	// retry after an ambiguous failure is waste at worst, never corruption.
+	return f.retry.Execute(ctx, func(ctx context.Context) error {
+		return classify(f.post(ctx, "/_work_/submit", req, nil))
+	})
 }
 
 // EngineFor resolves the routing engine for an area from the provider name the
@@ -338,23 +385,46 @@ func (f *Follower) get(ctx context.Context, path string, out any) error {
 // (left untouched when nil). A non-200 status is an error carrying the (truncated)
 // body.
 func (f *Follower) roundTrip(httpReq *http.Request, path string, out any) error {
+	// A tripped breaker is terminal for this attempt: spending the retry budget
+	// sleeping between calls we already know will be rejected only delays the
+	// worker's return to its idle backoff.
+	if f.breaker.CannotProceed() {
+		return retry.Unretryable(fmt.Errorf("follower: %s: %w", path, circuitbreaking.ErrCircuitBroken))
+	}
+
 	// The URL is the operator-configured leader base plus a fixed path, never
 	// end-user input, so it is not an SSRF vector.
 	httpResp, err := f.client.Do(httpReq) //nolint:gosec // G704: leader URL is trusted operator configuration.
 	if err != nil {
+		f.breaker.Failed()
+
 		return fmt.Errorf("follower: %s request: %w", path, err)
 	}
 
 	raw, err := io.ReadAll(httpResp.Body)
 	closeErr := httpResp.Body.Close()
 	if err != nil {
+		f.breaker.Failed()
+
 		return fmt.Errorf("follower: reading %s response: %w", path, err)
 	}
 	if closeErr != nil {
+		f.breaker.Failed()
+
 		return fmt.Errorf("follower: closing %s response: %w", path, closeErr)
 	}
+	if httpResp.StatusCode >= http.StatusInternalServerError {
+		f.breaker.Failed()
+
+		return &statusError{code: httpResp.StatusCode, path: path, body: truncate(raw)}
+	}
+
+	// Anything the leader actually answered — 2xx and 4xx alike — proves it is
+	// healthy. A rejected request is this follower's problem, not the leader's.
+	f.breaker.Succeeded()
+
 	if httpResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("follower: %s returned status %d: %s", path, httpResp.StatusCode, truncate(raw))
+		return &statusError{code: httpResp.StatusCode, path: path, body: truncate(raw)}
 	}
 
 	if out == nil {
@@ -402,6 +472,37 @@ func (f *Follower) warnUnknownProvider(name string, area beeline.AreaID) {
 			"fallback": beeline.DefaultProviderName,
 		}).Info("leader area uses a routing provider this follower does not have; falling back to the default engine")
 	}
+}
+
+// statusError is a non-200 response from the leader. It renders exactly as the
+// flat error this package has always produced, but carries the status code so
+// retries can tell a leader that is struggling (5xx, worth another attempt)
+// from one that has rejected the request outright (4xx, terminal).
+type statusError struct {
+	path string
+	body string
+	code int
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("follower: %s returned status %d: %s", e.path, e.code, e.body)
+}
+
+// terminal reports whether retrying could only repeat the same rejection.
+func (e *statusError) terminal() bool {
+	return e.code >= http.StatusBadRequest && e.code < http.StatusInternalServerError
+}
+
+// classify marks an error unretryable when another attempt cannot change the
+// outcome. Everything else — 5xx, transport failures, malformed responses — is
+// worth retrying: the leader may be restarting or briefly unreachable.
+func classify(err error) error {
+	var status *statusError
+	if errors.As(err, &status) && status.terminal() {
+		return retry.Unretryable(err)
+	}
+
+	return err
 }
 
 // truncate bounds an error body so a huge response can't flood the logs.

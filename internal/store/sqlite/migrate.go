@@ -13,28 +13,30 @@ import (
 	"fmt"
 	"io/fs"
 
-	"github.com/pressly/goose/v3"
+	"github.com/primandproper/platform-go/v7/database/migrate"
 )
 
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
-// migrate applies all pending schema migrations to db over the embedded migration
-// files. It uses goose's instance-based Provider (not the package-global Up/SetDialect
-// functions) so concurrent opens — e.g. parallel tests, each with its own database —
-// don't race on shared goose state. It is idempotent: applied migrations are skipped.
-func migrate(db *sql.DB) error {
+// runMigrations applies all pending schema migrations to db over the embedded
+// migration files. The platform migrator is instance-based (not goose's
+// package-global state), so concurrent opens — e.g. parallel tests, each with its
+// own database — don't race. No lock is taken: the SQLite dialect has no advisory
+// locking, and each database here has exactly one opener. It is idempotent:
+// applied migrations are skipped.
+func runMigrations(db *sql.DB) error {
 	sub, err := fs.Sub(migrationFS, "migrations")
 	if err != nil {
 		return fmt.Errorf("sqlite: locating migrations: %w", err)
 	}
 
-	provider, err := goose.NewProvider(goose.DialectSQLite3, db, sub)
+	migrator, err := migrate.New(migrate.DialectSQLite, sub)
 	if err != nil {
-		return fmt.Errorf("sqlite: building migration provider: %w", err)
+		return fmt.Errorf("sqlite: building migrator: %w", err)
 	}
 
-	if _, err = provider.Up(context.Background()); err != nil {
+	if err = migrator.Migrate(context.Background(), db); err != nil {
 		return fmt.Errorf("sqlite: applying migrations: %w", err)
 	}
 

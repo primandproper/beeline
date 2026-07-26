@@ -174,21 +174,27 @@ WORKERS ?= 8
 fulldemo:
 	PORT=$(PORT) WORKERS=$(WORKERS) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/demo_full.sh
 
+# test runs the whole suite against real Postgres and Redis. The suite
+# provisions its own containers, so nothing silently skips; this target starts
+# one server of each kind up front so the four container-backed package binaries
+# share them instead of starting one apiece. Needs Docker, like lint and sqlc.
+# FAILFAST=false reports every failing package instead of stopping at the first.
 .PHONY: test
 test: $(ARTIFACTS_DIR)
-	$(SCRIPTS_DIR)/test.sh
+	CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/test.sh
 
-# test-integration runs the same suite with real Postgres + Redis containers, so
-# the env-gated integration tests (internal/store/postgres, internal/store/redis)
-# execute instead of skipping. Needs Docker, like lint and sqlc.
-.PHONY: test-integration
-test-integration: $(ARTIFACTS_DIR)
-	CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/test_integration.sh
+# test-short is the Docker-free fast loop: -short makes the container-backed
+# tests skip explicitly. It leaves the Postgres and Redis backends untested, so
+# run `make test` before pushing.
+.PHONY: test-short
+test-short: $(ARTIFACTS_DIR)
+	$(SCRIPTS_DIR)/test_short.sh
 
 # bench-store runs the hot-store benchmark gate: 300k-key BatchGet p50/p95 for
 # the in-memory baseline, Postgres, and Redis. The numbers decide the blessed
 # distributed-mode hot store (postgres p95 < 1s keeps the single-dependency
-# default). Needs Docker.
+# default). The benchmarks provision their own containers, so this needs Docker
+# unless BEELINE_TEST_POSTGRES_DSN / BEELINE_TEST_REDIS_ADDR are exported.
 .PHONY: bench-store
 bench-store:
-	CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/bench_store.sh
+	$(SCRIPTS_DIR)/bench_store.sh

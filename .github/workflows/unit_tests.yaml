@@ -36,5 +36,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
+      # No services: blocks needed. make test starts one Postgres and one Redis
+      # itself, and the suite's own pgtest/redistest helpers provision containers
+      # for anything invoked outside it — so the real backends are exercised here
+      # rather than silently skipped, which is how they previously reached zero
+      # coverage. GitHub runners ship Docker, so this needs no extra setup.
       - name: run unit tests
         run: make test

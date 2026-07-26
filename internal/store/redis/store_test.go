@@ -2,52 +2,15 @@ package redis_test
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
-	"github.com/primandproper/beeline/internal/config"
-	redisstore "github.com/primandproper/beeline/internal/store/redis"
+	"github.com/primandproper/beeline/internal/store/redis/redistest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// envAddr gates the Redis integration tests, like pgtest's DSN for Postgres.
-const envAddr = "BEELINE_TEST_REDIS_ADDR"
-
-// open connects to the test Redis or skips. Isolation between parallel tests
-// comes from random area IDs (every key embeds its area), not databases —
-// tests only ever touch their own areas' keys.
-func open(tb testing.TB) *redisstore.Store {
-	tb.Helper()
-
-	addr := os.Getenv(envAddr)
-	if addr == "" {
-		tb.Skipf("%s not set; skipping Redis integration test", envAddr)
-	}
-
-	store, err := redisstore.New(context.Background(), &config.RedisConfig{Addr: addr})
-	require.NoError(tb, err)
-	tb.Cleanup(func() { require.NoError(tb, store.Close()) })
-
-	return store
-}
-
-// randomArea returns a random positive area ID so parallel tests sharing one
-// Redis never collide.
-func randomArea(tb testing.TB) beeline.AreaID {
-	tb.Helper()
-
-	buf := make([]byte, 8)
-	_, err := rand.Read(buf)
-	require.NoError(tb, err)
-
-	return beeline.AreaID(binary.LittleEndian.Uint64(buf) >> 1)
-}
 
 func testKey(area beeline.AreaID, origin, dest beeline.H3Cell) beeline.PairKey {
 	return beeline.PairKey{Area: area, Origin: origin, Dest: dest, Profile: "car", Res: 8}
@@ -57,8 +20,8 @@ func TestStoreRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store := open(t)
-	area := randomArea(t)
+	store := redistest.Open(t)
+	area := redistest.RandomArea(t)
 
 	key := testKey(area, 10, 11)
 	miss := testKey(area, 20, 21)
@@ -84,8 +47,8 @@ func TestStoreDelete(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store := open(t)
-	area := randomArea(t)
+	store := redistest.Open(t)
+	area := redistest.RandomArea(t)
 
 	keep := testKey(area, 10, 11)
 	drop := testKey(area, 20, 21)
@@ -107,8 +70,8 @@ func TestStoreDeleteArea(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store := open(t)
-	area, other := randomArea(t), randomArea(t)
+	store := redistest.Open(t)
+	area, other := redistest.RandomArea(t), redistest.RandomArea(t)
 
 	require.NoError(t, store.Put(ctx, []beeline.Entry{
 		{Key: testKey(area, 10, 11), Stored: beeline.Stored{ComputedAt: time.Now(), Estimate: beeline.Estimate{Duration: 1, Distance: 1}}},
@@ -129,8 +92,8 @@ func TestStoreBatchGetAlignmentAcrossChunks(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store := open(t)
-	area := randomArea(t)
+	store := redistest.Open(t)
+	area := redistest.RandomArea(t)
 
 	// Spans multiple 5k pipeline chunks with periodic misses, so a chunk-offset
 	// bug in reassembly would surface immediately.

@@ -10,7 +10,10 @@ import (
 
 // The benchmark gate: Postgres p95 under 1s for a 300k-key BatchGet keeps the
 // distributed deployment single-dependency; otherwise Redis carries the hot
-// store. Skips (like every pgtest caller) without BEELINE_TEST_POSTGRES_DSN.
+// store. Self-provisions a container (like every pgtest caller) unless
+// BEELINE_TEST_POSTGRES_DSN points at a running server; skips only under -short.
+// Note the container starts lazily, so a plain `go test` that compiles these
+// benchmarks without running them starts nothing.
 
 func BenchmarkBatchGet300k(b *testing.B) {
 	store := postgres.NewEstimateStore(pgtest.Open(b))

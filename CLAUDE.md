@@ -204,10 +204,18 @@ HTTP endpoints (default `:8080`):
   `AdvisoryLocker` (beeline's names for per-area mutation locks, janitor try-lock and boot-seed lock
   over platform-go's `distributedlock` transaction-scoped Postgres `ScopedLocker`), and `pgtest/`
   (test helper: one random schema per test — `Open` for the pool, `OpenClient` for the
-  `database.Client` — gated on `BEELINE_TEST_POSTGRES_DSN`).
+  `database.Client`). `pgtest` **self-provisions**: it uses `BEELINE_TEST_POSTGRES_DSN` when set,
+  skips under `go test -short`, and otherwise starts one `testcontainers` Postgres per test binary
+  (via platform-go's `testutils/containers`, reaped by Ryuk at process exit). A missing Docker daemon
+  is a hard failure, never a silent skip — that asymmetry is deliberate and is why the distributed
+  backend can no longer reach zero CI coverage unnoticed. Note this departs from platform-go's
+  `RUN_CONTAINER_TESTS` convention, which defaults to skipping.
 - `internal/store/redis/` — the optional Redis hot `Store` (go-redis/v9): pipelined MGET/MSET over
-  fixed 24-byte binary values; only cached scalars live here, never coordination state. Gated tests
-  on `BEELINE_TEST_REDIS_ADDR`.
+  fixed 24-byte binary values; only cached scalars live here, never coordination state. Its
+  `redistest/` helper mirrors `pgtest`'s resolution order (`BEELINE_TEST_REDIS_ADDR` → `-short` skip
+  → container) and wraps platform-go's `testutils/containers/redistest` rather than driving
+  testcontainers directly. Isolation is by random area ID, not database, so one server serves every
+  parallel test.
 - `internal/store/storebench/` — the shared 300k-key BatchGet benchmark harness behind `make
   bench-store` (the hot-store decision gate; p50/p95 reported per backend).
 - `internal/store/sqlite/` — the persistent **area store** (`modernc.org/sqlite`, pure-Go): a
@@ -317,16 +325,30 @@ make fulldemo       # the whole distributed deployment as a docker-compose clust
                     # scale the follower pool; needs Docker (Compose v2), no local binary.
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
-make test           # Run tests (race detector, shuffle, failfast); excludes cmd packages
-make test-integration  # Same suite with real Postgres+Redis containers, so the env-gated
-                       # integration tests execute instead of skipping. Needs Docker.
+make test           # Run tests (race detector, shuffle, failfast) against real Postgres + Redis;
+                    # excludes cmd packages. Nothing silently skips: the suite provisions its own
+                    # containers, and this target starts one server of each kind up front so the
+                    # four container-backed package binaries share them. Needs Docker.
+                    # FAILFAST=false reports every failing package instead of stopping at the first.
+make test-short     # The Docker-free fast loop: -short makes the container-backed tests skip
+                    # explicitly. Leaves Postgres/Redis untested — run `make test` before pushing.
 make bench-store    # The hot-store benchmark gate: 300k-key BatchGet p50/p95 for memory,
-                    # Postgres, and Redis (decides the blessed distributed default). Needs Docker.
+                    # Postgres, and Redis (decides the blessed distributed default). The benchmarks
+                    # provision their own containers, so it needs Docker unless
+                    # BEELINE_TEST_POSTGRES_DSN / BEELINE_TEST_REDIS_ADDR are exported.
 ```
 
 Run a single test:
 ```bash
 go test -run TestName ./internal/config/...
+```
+
+Bare `go test ./internal/...` also works and starts a container per package binary — slower than
+`make test`, but it means an editor-driven or habitual `go test` run exercises the real backends
+instead of skipping them. Add `-short` for the Docker-free path. To triage a conformance suite that
+is expected to surface several failures at once:
+```bash
+FAILFAST=false scripts/test.sh -run TestConformance
 ```
 
 Linting runs in Docker (`golangci/golangci-lint` image). Formatting runs locally via `go tool` with
@@ -353,7 +375,16 @@ because `format_imports.sh` runs `dirname` on it to derive the org-level prefix.
 - Tests use `stretchr/testify` (assert, require).
 - Tests call `t.Parallel()` by default.
 - `make test` excludes `cmd` packages, so keep testable logic in `internal/` and `version/`.
-- Test command: `CGO_ENABLED=1 go test -shuffle=on -race -vet=all -failfast`.
+- Test command: `CGO_ENABLED=1 go test -shuffle=on -race -vet=all -failfast` (drop `-failfast` with
+  `FAILFAST=false`).
+- **Tests never skip silently.** Container-backed tests resolve their dependency in one explicit
+  order — env var, then `-short` skip, then start a container — so a green run cannot mean "the real
+  backend was never exercised." Adding a new dependency-backed test means adding it to a
+  `pgtest`/`redistest`-style helper, not a bare `t.Skip` on a missing env var.
+- Behavioral contracts with more than one implementation get a **shared conformance suite** rather
+  than per-implementation test files: `internal/freshness/freshnesstest/` is the template (one
+  `Run(t, factory)` both the memory and Postgres indexes call). In-memory implementations used as
+  test doubles are expected to be pinned to the real backend this way.
 
 ## Conventions worth knowing
 

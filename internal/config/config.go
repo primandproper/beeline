@@ -26,13 +26,13 @@ import (
 	"log/slog"
 	"strings"
 
-	platformconfig "github.com/primandproper/platform-go/v4/config"
-	"github.com/primandproper/platform-go/v4/observability"
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v4/observability/logging/config"
-	metricsnoop "github.com/primandproper/platform-go/v4/observability/metrics/noop"
-	profilingnoop "github.com/primandproper/platform-go/v4/observability/profiling/noop"
-	tracingnoop "github.com/primandproper/platform-go/v4/observability/tracing/noop"
+	platformconfig "github.com/primandproper/platform-go/v7/config"
+	"github.com/primandproper/platform-go/v7/observability"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	loggingcfg "github.com/primandproper/platform-go/v7/observability/logging/config"
+	metricsnoop "github.com/primandproper/platform-go/v7/observability/metrics/noop"
+	profilingnoop "github.com/primandproper/platform-go/v7/observability/profiling/noop"
+	tracingnoop "github.com/primandproper/platform-go/v7/observability/tracing/noop"
 )
 
 // DefaultServiceName is the service name reported by the observability suite

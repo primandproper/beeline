@@ -5,10 +5,20 @@ document is that audit: how thoroughly beeline uses platform today, where it han
 platform already provides, where platform's offering exists but doesn't fit, and which packages
 platform doesn't have yet that beeline now articulates a concrete use case for.
 
-**Version caveat up front:** beeline pins `platform-go/v4 v4.1.0` (`go.mod:8`); the platform repo
-is at `/v7`. This audit evaluates against the current `/v7` checkout, so some "should adopt" items
-may require the v4→v7 upgrade first. The upgrade itself is arguably finding #0 — a proving-ground
-repo three major versions behind the platform it's proving isn't exercising much.
+**Version caveat up front:** beeline now pins `platform-go/v7 v7.0.0` (`go.mod:8`), upgraded from
+`v4.1.0` — finding #0 is closed. The upgrade adopted the typed router fully (every route is a
+`routing.Handler[In, Out]`, generating `/openapi.json` + `/docs`), and surfaced a new gap in the
+process:
+
+**New gap (v7 routing): the error envelope is rigid.** A typed handler's returned error is always
+serialized as the platform APIError envelope by `(*Router).writeError`, with the status derived
+from a fixed code→status map — there is no per-router or per-route hook to change the body shape,
+the map has no 409 Conflict, and `ToAPIError` launders unknown error messages. A service with an
+established error wire format (beeline's flat `{"error": "<msg>"}`, 409 on in-use provider delete)
+cannot express it through the error-return path at all. Beeline works around this with a
+committable-ResponseWriter middleware (`internal/httpapi/wire.go`): handlers write legacy error
+bytes themselves and return nil. A platform-level fix would be an error-encoding seam on the
+Router (mirroring the `ServerEncoderDecoder` seam that already exists for success bodies).
 
 ---
 

@@ -8,8 +8,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v4/httpclient"
-	serverhttp "github.com/primandproper/platform-go/v4/server/http"
+	"github.com/primandproper/platform-go/v7/httpclient"
+	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 )
 
 // MatrixConfig is the configuration for the travel-time/distance matrix service

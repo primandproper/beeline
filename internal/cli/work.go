@@ -9,10 +9,11 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/engine/registry"
 	"github.com/primandproper/beeline/internal/follower"
+	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/refresh"
 
-	chirouter "github.com/primandproper/platform-go/v4/routing/chi"
-	serverhttp "github.com/primandproper/platform-go/v4/server/http"
+	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
+	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 
 	"github.com/spf13/cobra"
 )
@@ -114,17 +115,21 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 	})
 
 	// The follower's only HTTP surface: liveness + leader-reachability readiness.
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		a.logger,
 		a.pillars.TracerProvider,
 		a.pillars.MetricsProvider,
-		&chirouter.Config{
+		&chibackend.Config{
 			ServiceName:            a.cfg.Observability.Logging.ServiceName,
 			EnableCORSForLocalhost: true,
 			SilenceRouteLogging:    mcfg.SilenceRouteLogging,
 		},
 	)
 	follower.RegisterHealth(router, f, a.logger)
+
+	if err = router.Err(); err != nil {
+		return err
+	}
 
 	srv, err := serverhttp.NewHTTPServer(
 		serverhttp.Config{Port: fcfg.Port, StartupDeadline: 5 * time.Second},

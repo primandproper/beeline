@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	"github.com/primandproper/platform-go/v4/routing"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/routing"
 )
 
 // readyProbeTimeout bounds the leader liveness probe behind /_ops_/ready, so a
@@ -17,14 +17,16 @@ const readyProbeTimeout = 2 * time.Second
 // RegisterHealth mounts the follower's only HTTP surface: /_ops_/live (process
 // up) and /_ops_/ready (leader reachable — one live probe per request, so an
 // orchestrator's readiness gate tracks actual connectivity, not a cached flag).
-func RegisterHealth(router routing.Router, f *Follower, logger logging.Logger) {
+// Both are raw mounts: a follower serves no OpenAPI spec, and the ready probe's
+// dynamic 200/503 doesn't fit the typed model.
+func RegisterHealth(router *routing.Router, f *Follower, logger logging.Logger) {
 	logger = logging.EnsureLogger(logger)
 
-	router.Get("/_ops_/live", func(w http.ResponseWriter, _ *http.Request) {
+	router.Handle(http.MethodGet, "/_ops_/live", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		writeStatus(w, logger, http.StatusOK, "up")
-	})
+	}))
 
-	router.Get("/_ops_/ready", func(w http.ResponseWriter, r *http.Request) {
+	router.Handle(http.MethodGet, "/_ops_/ready", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), readyProbeTimeout)
 		defer cancel()
 
@@ -35,7 +37,7 @@ func RegisterHealth(router routing.Router, f *Follower, logger logging.Logger) {
 		}
 
 		writeStatus(w, logger, http.StatusOK, "up")
-	})
+	}))
 }
 
 func writeStatus(w http.ResponseWriter, logger logging.Logger, status int, state string) {

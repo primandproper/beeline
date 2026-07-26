@@ -18,10 +18,10 @@ import (
 	"github.com/primandproper/beeline/internal/refresh"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v4/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v4/observability/tracing/noop"
-	chirouter "github.com/primandproper/platform-go/v4/routing/chi"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	metricsnoop "github.com/primandproper/platform-go/v7/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v7/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -261,11 +261,11 @@ func TestHealthEndpoints(t *testing.T) {
 
 	f := newFollower(t, leader.URL)
 
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		logging.EnsureLogger(nil),
 		tracingnoop.NewTracerProvider(),
 		metricsnoop.NewMetricsProvider(),
-		&chirouter.Config{ServiceName: "test"},
+		&chibackend.Config{ServiceName: "test"},
 	)
 	follower.RegisterHealth(router, f, nil)
 	h := router.Handler()
@@ -297,11 +297,11 @@ func TestEndToEndFollowerDrainsLeaderQueue(t *testing.T) {
 	index := memindex.New(time.Minute, nil)
 	store := memstore.New()
 
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		logging.EnsureLogger(nil),
 		tracingnoop.NewTracerProvider(),
 		metricsnoop.NewMetricsProvider(),
-		&chirouter.Config{ServiceName: "leader"},
+		&chibackend.Config{ServiceName: "leader"},
 	)
 	httpapi.Register(router, &httpapi.Deps{
 		Index:          index,

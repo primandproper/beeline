@@ -129,7 +129,7 @@ HTTP endpoints (default `:8080`):
   `application.pillars`.
 - `internal/config/` — assembles `observability.Config` and builds the pillars (slog logging + noop
   tracing/metrics/profiling by default). See `Config.NewPillars` for the upgrade path to real telemetry.
-  Two loaders use `platform-go/v4/config`: `Load` overlays `BEELINE_`-prefixed environment
+  Two loaders use `platform-go/v7/config`: `Load` overlays `BEELINE_`-prefixed environment
   variables on the flag/default-seeded config, and `LoadFromFile` decodes a complete JSON config file
   and then overlays the same environment variables. `Render` goes the other way: it validates typed
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
@@ -245,8 +245,16 @@ HTTP endpoints (default `:8080`):
   also implements `query.AreaRouter` (`Locate` — containment is the finest layer's cell set; the
   returned `RoutedArea` carries the full layer list finest→coarsest). `serve.go` calls
   `ResumeEnabled` at boot.
-- `internal/httpapi/` — HTTP routes registered on the platform-go chi router (read path, freshness,
-  cells, the `/_config_/areas` registry, health). `{areaID}` params via the router's param manager.
+- `internal/httpapi/` — HTTP routes on platform-go's typed OpenAPI router over the chi backend
+  (read path, freshness, cells, the `/_config_/areas` registry, health). Handlers are typed
+  (`routing.Handler[In, Out]`; path/query params bind from struct tags), which generates
+  `/openapi.json` + a `/docs` browser UI for free — note `/docs` loads Stoplight Elements from a
+  CDN, unlike the fully-embedded operator console. The wire format predates the typed router and
+  is preserved exactly: `router.go` builds the router with enveloping off over `encoder.go`'s
+  lenient JSON codec, and error paths bypass the framework's APIError envelope through `wire.go`'s
+  committable-writer escape hatch (`fail`/`commitJSON`), keeping flat `{"error": …}` bodies and
+  statuses the platform can't produce (409). Handlers therefore return nil errors on purpose
+  (nilerr is excluded for this package).
 - `internal/webui/` — the embedded single-page operator console (`go:embed static`): Leaflet + h3-js
   (vendored under `static/assets/vendor/`, no CDN or build step). List/enable/disable areas, create a
   one-layer area from an uploaded GeoJSON polygon (client-side polyfill preview; multi-layer areas are

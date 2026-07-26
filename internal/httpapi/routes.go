@@ -7,6 +7,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,10 +21,9 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	"github.com/primandproper/beeline/internal/tessellate"
 
-	"github.com/primandproper/platform-go/v4/healthcheck"
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	"github.com/primandproper/platform-go/v4/routing"
-	chirouter "github.com/primandproper/platform-go/v4/routing/chi"
+	"github.com/primandproper/platform-go/v7/healthcheck"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/routing"
 
 	"github.com/uber/h3-go/v4"
 )
@@ -53,38 +53,51 @@ type Deps struct {
 	LeaseDuration time.Duration
 }
 
-// Register attaches all routes to the router.
-func Register(router routing.Router, deps *Deps) {
+// Register attaches all routes to the router. Every route is typed — the input
+// structs below double as the generated OpenAPI request schemas — but handlers
+// report failures through the wire escape hatch (see wire.go), never by
+// returning an error, so error bodies keep this API's flat {"error": …} shape.
+// POST routes that answer 200 say so explicitly: the router's POST default is 201.
+func Register(router *routing.Router, deps *Deps) {
 	logger := logging.EnsureLogger(deps.Logger)
-	params := chirouter.NewRouteParamManager()
-	areaID := params.BuildRouteParamIDFetcher(logger, "areaID", "area")
-	providerName := params.BuildRouteParamStringIDFetcher("providerName")
+	ok := routing.WithResponseStatus(http.StatusOK)
 
-	router.Get("/estimate", estimateHandler(deps, logger))
-	router.Post("/table", tableHandler(deps, logger))
+	routing.Get(router, "/estimate", estimateHandler(deps, logger), routing.WithTags("read"))
+	routing.Post(router, "/table", tableHandler(deps, logger), routing.WithTags("read"), ok)
 
-	router.Get("/_ops_/freshness", freshnessHandler(deps, logger))
-	router.Get("/_ops_/cells", cellsHandler(deps, logger))
-	router.Post("/_ops_/pairs", pairsHandler(deps, logger))
-	router.Post("/_ops_/warm", warmHandler(deps, logger))
-	router.Get("/_ops_/live", liveHandler(logger))
-	router.Get("/_ops_/ready", readyHandler(deps.Health, logger))
+	routing.Get(router, "/_ops_/freshness", freshnessHandler(deps, logger), routing.WithTags("ops"))
+	routing.Get(router, "/_ops_/cells", cellsHandler(deps, logger), routing.WithTags("ops"))
+	routing.Post(router, "/_ops_/pairs", pairsHandler(deps, logger), routing.WithTags("ops"), ok)
+	routing.Post(router, "/_ops_/warm", warmHandler(deps, logger), routing.WithTags("ops"), ok)
+	routing.Get(router, "/_ops_/live", liveHandler(), routing.WithTags("ops"))
+	routing.Get(router, "/_ops_/ready", readyHandler(deps.Health, logger), routing.WithTags("ops"))
 
-	router.Post("/_work_/claim", claimHandler(deps, logger))
-	router.Post("/_work_/submit", submitHandler(deps, logger))
-	router.Get("/_work_/providers", workProvidersHandler(deps, logger))
+	routing.Post(router, "/_work_/claim", claimHandler(deps, logger), routing.WithTags("work"), ok)
+	routing.Post(router, "/_work_/submit", submitHandler(deps, logger), routing.WithTags("work"), ok)
+	routing.Get(router, "/_work_/providers", workProvidersHandler(deps), routing.WithTags("work"))
 
-	router.Get("/_config_/providers", providersListHandler(deps, logger))
-	router.Put("/_config_/providers/{providerName}", providerPutHandler(deps, logger, providerName))
-	router.Delete("/_config_/providers/{providerName}", providerDeleteHandler(deps, logger, providerName))
-	router.Get("/_config_/areas", areasListHandler(deps, logger))
-	router.Post("/_config_/areas", areaCreateHandler(deps, logger))
-	router.Get("/_config_/areas/{areaID}", areaGetHandler(deps, logger, areaID))
-	router.Patch("/_config_/areas/{areaID}", areaUpdateHandler(deps, logger, areaID))
-	router.Delete("/_config_/areas/{areaID}", areaDeleteHandler(deps, logger, areaID))
-	router.Post("/_config_/areas/{areaID}/enable", areaEnableHandler(deps, logger, areaID))
-	router.Post("/_config_/areas/{areaID}/disable", areaDisableHandler(deps, logger, areaID))
-	router.Put("/_config_/areas/{areaID}/geojson", areaGeoJSONHandler(deps, logger, areaID))
+	routing.Get(router, "/_config_/providers", providersListHandler(deps), routing.WithTags("providers"))
+	routing.Put(router, "/_config_/providers/{providerName}", providerPutHandler(deps, logger), routing.WithTags("providers"))
+	routing.Delete(router, "/_config_/providers/{providerName}", providerDeleteHandler(deps, logger),
+		routing.WithTags("providers"), routing.WithResponseStatus(http.StatusNoContent))
+	routing.Get(router, "/_config_/areas", areasListHandler(deps, logger), routing.WithTags("areas"))
+	routing.Post(router, "/_config_/areas", areaCreateHandler(deps, logger), routing.WithTags("areas"))
+	routing.Get(router, "/_config_/areas/{areaID}", areaGetHandler(deps, logger), routing.WithTags("areas"))
+	routing.Patch(router, "/_config_/areas/{areaID}", areaUpdateHandler(deps, logger), routing.WithTags("areas"))
+	routing.Delete(router, "/_config_/areas/{areaID}", areaDeleteHandler(deps, logger),
+		routing.WithTags("areas"), routing.WithResponseStatus(http.StatusNoContent))
+	routing.Post(router, "/_config_/areas/{areaID}/enable", areaEnableHandler(deps, logger), routing.WithTags("areas"), ok)
+	routing.Post(router, "/_config_/areas/{areaID}/disable", areaDisableHandler(deps, logger), routing.WithTags("areas"), ok)
+	routing.Put(router, "/_config_/areas/{areaID}/geojson", areaGeoJSONHandler(deps, logger), routing.WithTags("areas"),
+		routing.WithDescription("Replaces the area's geometry. The request body is a raw GeoJSON polygon document."))
+}
+
+// estimateInput carries /estimate's query params; origin and dest are "lat,lng"
+// pairs parsed in-handler so a bad coordinate reports which side is wrong.
+type estimateInput struct {
+	Origin  string `query:"origin"`
+	Dest    string `query:"dest"`
+	Profile string `query:"profile"`
 }
 
 // estimateResponse is the JSON body for a successful estimate.
@@ -97,40 +110,42 @@ type estimateResponse struct {
 	Stale          bool    `json:"stale"`
 }
 
-func estimateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		origin, err := parseLatLng(r.URL.Query().Get("origin"))
+func estimateHandler(deps *Deps, logger logging.Logger) routing.Handler[estimateInput, estimateResponse] {
+	return func(ctx context.Context, in estimateInput) (estimateResponse, error) {
+		var zero estimateResponse
+
+		origin, err := parseLatLng(in.Origin)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
+			return zero, nil
 		}
 
-		dest, err := parseLatLng(r.URL.Query().Get("dest"))
+		dest, err := parseLatLng(in.Dest)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
+			return zero, nil
 		}
 
 		profile := deps.DefaultProfile
-		if p := strings.TrimSpace(r.URL.Query().Get("profile")); p != "" {
+		if p := strings.TrimSpace(in.Profile); p != "" {
 			profile = beeline.Profile(p)
 		}
 
-		result, err := deps.Handler.Estimate(r.Context(), origin, dest, profile)
+		result, err := deps.Handler.Estimate(ctx, origin, dest, profile)
 		if err != nil {
 			logger.Error("computing estimate", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, estimateResponse{
+		return estimateResponse{
 			DurationSec:    result.Estimate.Duration,
 			DistanceMeters: result.Estimate.Distance,
 			ComputedAt:     result.ComputedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			Source:         string(result.Source),
 			Profile:        string(profile),
 			Stale:          result.Stale,
-		})
+		}, nil
 	}
 }
 
@@ -166,40 +181,36 @@ type tableResponse struct {
 	Meta      tableMeta    `json:"meta"`
 }
 
-func tableHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req tableRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid table body: "+err.Error())
-			return
-		}
+func tableHandler(deps *Deps, logger logging.Logger) routing.Handler[tableRequest, tableResponse] {
+	return func(ctx context.Context, req tableRequest) (tableResponse, error) {
+		var zero tableResponse
 
 		if len(req.Sources) == 0 || len(req.Destinations) == 0 {
-			writeError(w, logger, http.StatusBadRequest, "sources and destinations must both be non-empty")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "sources and destinations must both be non-empty")
+			return zero, nil
 		}
 		if len(req.Sources)*len(req.Destinations) > maxTableCells {
-			writeError(w, logger, http.StatusBadRequest,
+			fail(ctx, logger, http.StatusBadRequest,
 				"table too large: sources × destinations exceeds "+strconv.Itoa(maxTableCells))
-			return
+			return zero, nil
 		}
 
 		sources, err := parseLatLngs(req.Sources)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid source: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid source: "+err.Error())
+			return zero, nil
 		}
 
 		destinations, err := parseLatLngs(req.Destinations)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid destination: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid destination: "+err.Error())
+			return zero, nil
 		}
 
 		skip, err := parseSkip(req.Skip, len(sources), len(destinations))
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid skip: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid skip: "+err.Error())
+			return zero, nil
 		}
 
 		profile := deps.DefaultProfile
@@ -212,7 +223,7 @@ func tableHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			fill = *req.Fill
 		}
 
-		result, err := deps.Handler.Table(r.Context(), &query.TableQuery{
+		result, err := deps.Handler.Table(ctx, &query.TableQuery{
 			Sources:      sources,
 			Destinations: destinations,
 			Profile:      profile,
@@ -221,11 +232,11 @@ func tableHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		})
 		if err != nil {
 			logger.Error("computing table", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, toTableResponse(result, string(profile)))
+		return toTableResponse(result, string(profile)), nil
 	}
 }
 
@@ -300,37 +311,44 @@ func toTableResponse(result query.TableResult, profile string) tableResponse {
 	}
 }
 
+// areaQueryInput is the optional ?area=<id> scope shared by the freshness and
+// cells rollups.
+type areaQueryInput struct {
+	Area string `query:"area"`
+}
+
 // freshnessHandler serves the §3 debt contract. Without ?area it reports the aggregate
 // across every enabled area (the whole working set); with ?area=<id> it reports that
 // one area.
-func freshnessHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if raw := strings.TrimSpace(r.URL.Query().Get("area")); raw != "" {
+func freshnessHandler(deps *Deps, logger logging.Logger) routing.Handler[areaQueryInput, beeline.DebtStats] {
+	return func(ctx context.Context, in areaQueryInput) (beeline.DebtStats, error) {
+		var zero beeline.DebtStats
+
+		if raw := strings.TrimSpace(in.Area); raw != "" {
 			id, err := parseAreaID(raw)
 			if err != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid area: "+err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid area: "+err.Error())
+				return zero, nil
 			}
 
-			stats, statErr := deps.Coordinator.DebtForArea(r.Context(), id)
+			stats, statErr := deps.Coordinator.DebtForArea(ctx, id)
 			if statErr != nil {
 				logger.Error("reading area freshness debt", statErr)
-				writeError(w, logger, http.StatusInternalServerError, statErr.Error())
-				return
+				fail(ctx, logger, http.StatusInternalServerError, statErr.Error())
+				return zero, nil
 			}
 
-			writeJSON(w, logger, http.StatusOK, stats)
-			return
+			return stats, nil
 		}
 
-		stats, err := deps.Index.Debt(r.Context())
+		stats, err := deps.Index.Debt(ctx)
 		if err != nil {
 			logger.Error("reading freshness debt", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, stats)
+		return stats, nil
 	}
 }
 
@@ -356,14 +374,16 @@ type cellsResponse struct {
 
 // cellsHandler paints one area's progress with ?area=<id>, or every enabled area's when
 // omitted.
-func cellsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func cellsHandler(deps *Deps, logger logging.Logger) routing.Handler[areaQueryInput, cellsResponse] {
+	return func(ctx context.Context, in areaQueryInput) (cellsResponse, error) {
+		var zero cellsResponse
+
 		var ids []beeline.AreaID
-		if raw := strings.TrimSpace(r.URL.Query().Get("area")); raw != "" {
+		if raw := strings.TrimSpace(in.Area); raw != "" {
 			id, err := parseAreaID(raw)
 			if err != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid area: "+err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid area: "+err.Error())
+				return zero, nil
 			}
 			ids = []beeline.AreaID{id}
 		} else {
@@ -372,11 +392,11 @@ func cellsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 
 		cells := make([]cellStateResponse, 0)
 		for _, id := range ids {
-			states, err := deps.Coordinator.CellStatesForArea(r.Context(), id)
+			states, err := deps.Coordinator.CellStatesForArea(ctx, id)
 			if err != nil {
 				logger.Error("reading cell states", err)
-				writeError(w, logger, http.StatusInternalServerError, err.Error())
-				return
+				fail(ctx, logger, http.StatusInternalServerError, err.Error())
+				return zero, nil
 			}
 
 			for i := range states {
@@ -399,7 +419,7 @@ func cellsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			}
 		}
 
-		writeJSON(w, logger, http.StatusOK, cellsResponse{Cells: cells})
+		return cellsResponse{Cells: cells}, nil
 	}
 }
 
@@ -434,31 +454,28 @@ type pairsResponse struct {
 // pairsHandler is the console's hover probe: a pure cache read (never the engine)
 // over the store seam, returning whichever of the asked origin→dest pairs are
 // cached right now.
-func pairsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req pairsRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid pairs body: "+err.Error())
-			return
-		}
+func pairsHandler(deps *Deps, logger logging.Logger) routing.Handler[pairsRequest, pairsResponse] {
+	return func(ctx context.Context, req pairsRequest) (pairsResponse, error) {
+		var zero pairsResponse
+
 		if req.Area <= 0 {
-			writeError(w, logger, http.StatusBadRequest, "area must be a positive id")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "area must be a positive id")
+			return zero, nil
 		}
 		if len(req.Dests) == 0 {
-			writeError(w, logger, http.StatusBadRequest, "dests must be non-empty")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "dests must be non-empty")
+			return zero, nil
 		}
 		if len(req.Dests) > maxPairsDests {
-			writeError(w, logger, http.StatusBadRequest,
+			fail(ctx, logger, http.StatusBadRequest,
 				"too many dests: limit "+strconv.Itoa(maxPairsDests))
-			return
+			return zero, nil
 		}
 
 		origin, err := parseCell(req.Origin)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
+			return zero, nil
 		}
 
 		profile := deps.DefaultProfile
@@ -471,14 +488,14 @@ func pairsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		for _, raw := range req.Dests {
 			dest, destErr := parseCell(raw)
 			if destErr != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid dest: "+destErr.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid dest: "+destErr.Error())
+				return zero, nil
 			}
 			if dest.Resolution() != origin.Resolution() {
-				writeError(w, logger, http.StatusBadRequest,
+				fail(ctx, logger, http.StatusBadRequest,
 					"dest "+raw+" is resolution "+strconv.Itoa(dest.Resolution())+
 						", want the origin's "+strconv.Itoa(origin.Resolution()))
-				return
+				return zero, nil
 			}
 			dests = append(dests, dest)
 			keys = append(keys, beeline.PairKey{
@@ -490,11 +507,11 @@ func pairsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			})
 		}
 
-		stored, err := deps.Store.BatchGet(r.Context(), keys)
+		stored, err := deps.Store.BatchGet(ctx, keys)
 		if err != nil {
 			logger.Error("reading cached pairs", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return zero, nil
 		}
 
 		pairs := make([]pairEstimateResponse, 0, len(stored))
@@ -510,7 +527,7 @@ func pairsHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			})
 		}
 
-		writeJSON(w, logger, http.StatusOK, pairsResponse{Pairs: pairs})
+		return pairsResponse{Pairs: pairs}, nil
 	}
 }
 
@@ -552,32 +569,29 @@ type warmResponse struct {
 // here and delegates area membership to the coordinator, whose ErrInvalidWarm maps
 // to 400. Like every endpoint in this prototype it is unauthenticated; a real
 // deploy would gate it.
-func warmHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req warmRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid warm body: "+err.Error())
-			return
-		}
+func warmHandler(deps *Deps, logger logging.Logger) routing.Handler[warmRequest, warmResponse] {
+	return func(ctx context.Context, req warmRequest) (warmResponse, error) {
+		var zero warmResponse
+
 		if req.Area <= 0 {
-			writeError(w, logger, http.StatusBadRequest, "area must be a positive id")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "area must be a positive id")
+			return zero, nil
 		}
 		if len(req.Pairs) == 0 {
-			writeError(w, logger, http.StatusBadRequest, "pairs must be non-empty")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "pairs must be non-empty")
+			return zero, nil
 		}
 		if len(req.Pairs) > maxWarmPairs {
-			writeError(w, logger, http.StatusBadRequest,
+			fail(ctx, logger, http.StatusBadRequest,
 				"too many pairs: limit "+strconv.Itoa(maxWarmPairs))
-			return
+			return zero, nil
 		}
 
 		mode := warmModeBump
 		if m := strings.TrimSpace(req.Mode); m != "" {
 			if m != warmModeBump && m != warmModeSeed {
-				writeError(w, logger, http.StatusBadRequest, "unknown mode "+m+" (want bump or seed)")
-				return
+				fail(ctx, logger, http.StatusBadRequest, "unknown mode "+m+" (want bump or seed)")
+				return zero, nil
 			}
 			mode = m
 		}
@@ -592,19 +606,19 @@ func warmHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			p := &req.Pairs[i]
 			origin, err := parseCell(p.Origin)
 			if err != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
+				return zero, nil
 			}
 			dest, err := parseCell(p.Dest)
 			if err != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
+				return zero, nil
 			}
 			if dest.Resolution() != origin.Resolution() {
-				writeError(w, logger, http.StatusBadRequest,
+				fail(ctx, logger, http.StatusBadRequest,
 					"dest "+p.Dest+" is resolution "+strconv.Itoa(dest.Resolution())+
 						", want the origin's "+strconv.Itoa(origin.Resolution()))
-				return
+				return zero, nil
 			}
 			keys = append(keys, beeline.PairKey{
 				Area:    beeline.AreaID(req.Area),
@@ -615,18 +629,18 @@ func warmHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			})
 		}
 
-		accepted, err := deps.Coordinator.WarmPairs(r.Context(), beeline.AreaID(req.Area), keys, mode == warmModeSeed)
+		accepted, err := deps.Coordinator.WarmPairs(ctx, beeline.AreaID(req.Area), keys, mode == warmModeSeed)
 		if err != nil {
 			if errors.Is(err, control.ErrInvalidWarm) {
-				writeError(w, logger, http.StatusBadRequest, err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, err.Error())
+				return zero, nil
 			}
 			logger.Error("warming pairs", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, warmResponse{Accepted: accepted, Mode: mode})
+		return warmResponse{Accepted: accepted, Mode: mode}, nil
 	}
 }
 
@@ -729,89 +743,100 @@ type providerResponse struct {
 // providersListHandler returns every registered routing provider (default first) so
 // the operator console can render the registry and populate its picker from live
 // state. Entries marked builtin cannot be modified or deleted.
-func providersListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
+func providersListHandler(deps *Deps) routing.Handler[routing.Empty, []providerResponse] {
+	return func(_ context.Context, _ routing.Empty) ([]providerResponse, error) {
 		infos := deps.Coordinator.ListProviderInfos()
 		out := make([]providerResponse, 0, len(infos))
 		for i := range infos {
 			out = append(out, providerResponse{ProviderSpec: infos[i].Spec, Builtin: infos[i].Builtin})
 		}
 
-		writeJSON(w, logger, http.StatusOK, out)
+		return out, nil
 	}
 }
 
-// providerPutHandler creates or replaces one operator-defined provider by name. The
-// path names the provider; a body name is overridden, so the URL is authoritative.
+// providerPutInput is the PUT body — a full provider spec — plus the path name.
+// The path names the provider; a body name is overridden, so the URL is
+// authoritative.
+type providerPutInput struct {
+	ProviderName string `json:"-" path:"providerName"`
+	beeline.ProviderSpec
+}
+
+// providerPutHandler creates or replaces one operator-defined provider by name.
 // This is the single place a cluster's routing config changes: followers pick the
 // new registry up on their next claim via the catalog hash.
-func providerPutHandler(deps *Deps, logger logging.Logger, providerName func(*http.Request) string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := strings.TrimSpace(providerName(r))
+func providerPutHandler(deps *Deps, logger logging.Logger) routing.Handler[providerPutInput, providerResponse] {
+	return func(ctx context.Context, in providerPutInput) (providerResponse, error) {
+		var zero providerResponse
+
+		name := strings.TrimSpace(in.ProviderName)
 		if name == "" {
-			writeError(w, logger, http.StatusBadRequest, "invalid or missing provider name")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid or missing provider name")
+			return zero, nil
 		}
 
-		var spec beeline.ProviderSpec
-		if err := decodeJSON(r, &spec); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid provider body: "+err.Error())
-			return
-		}
+		spec := in.ProviderSpec
 		spec.Name = name
 
-		info, err := deps.Coordinator.PutProvider(r.Context(), &spec)
+		info, err := deps.Coordinator.PutProvider(ctx, &spec)
 		if err != nil {
-			writeProviderError(w, logger, err)
-			return
+			writeProviderError(ctx, logger, err)
+			return zero, nil
 		}
 
 		logger.Info("routing provider upserted")
-		writeJSON(w, logger, http.StatusOK, providerResponse{ProviderSpec: info.Spec, Builtin: info.Builtin})
+		return providerResponse{ProviderSpec: info.Spec, Builtin: info.Builtin}, nil
 	}
+}
+
+// providerNameInput names a provider through the path alone; it has no body
+// fields, so the request body is never read.
+type providerNameInput struct {
+	ProviderName string `path:"providerName"`
 }
 
 // providerDeleteHandler removes one operator-defined provider. Deletion is refused
 // while any area still routes through the name (409) and for built-ins (400).
-func providerDeleteHandler(deps *Deps, logger logging.Logger, providerName func(*http.Request) string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := strings.TrimSpace(providerName(r))
+func providerDeleteHandler(deps *Deps, logger logging.Logger) routing.Handler[providerNameInput, routing.Empty] {
+	return func(ctx context.Context, in providerNameInput) (routing.Empty, error) {
+		name := strings.TrimSpace(in.ProviderName)
 		if name == "" {
-			writeError(w, logger, http.StatusBadRequest, "invalid or missing provider name")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid or missing provider name")
+			return routing.Empty{}, nil
 		}
 
-		if err := deps.Coordinator.DeleteProvider(r.Context(), name); err != nil {
-			writeProviderError(w, logger, err)
-			return
+		if err := deps.Coordinator.DeleteProvider(ctx, name); err != nil {
+			writeProviderError(ctx, logger, err)
+			return routing.Empty{}, nil
 		}
 
 		logger.Info("routing provider deleted")
-		w.WriteHeader(http.StatusNoContent)
+		return routing.Empty{}, nil
 	}
 }
 
 // writeProviderError maps a provider mutation error to an HTTP status: unknown name
 // → 404, still referenced by an area → 409, everything else (reserved built-in,
 // validation) → 400.
-func writeProviderError(w http.ResponseWriter, logger logging.Logger, err error) {
+func writeProviderError(ctx context.Context, logger logging.Logger, err error) {
 	switch {
 	case errors.Is(err, control.ErrProviderNotFound):
-		writeError(w, logger, http.StatusNotFound, err.Error())
+		fail(ctx, logger, http.StatusNotFound, err.Error())
 	case errors.Is(err, control.ErrProviderInUse):
-		writeError(w, logger, http.StatusConflict, err.Error())
+		fail(ctx, logger, http.StatusConflict, err.Error())
 	default:
-		writeError(w, logger, http.StatusBadRequest, err.Error())
+		fail(ctx, logger, http.StatusBadRequest, err.Error())
 	}
 }
 
-func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		areas, err := deps.Coordinator.List(r.Context())
+func areasListHandler(deps *Deps, logger logging.Logger) routing.Handler[routing.Empty, []areaResponse] {
+	return func(ctx context.Context, _ routing.Empty) ([]areaResponse, error) {
+		areas, err := deps.Coordinator.List(ctx)
 		if err != nil {
 			logger.Error("listing areas", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return nil, nil
 		}
 
 		out := make([]areaResponse, 0, len(areas))
@@ -819,7 +844,7 @@ func areasListHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			out = append(out, toAreaResponse(logger, &areas[i], false))
 		}
 
-		writeJSON(w, logger, http.StatusOK, out)
+		return out, nil
 	}
 }
 
@@ -861,27 +886,23 @@ type createAreaRequest struct {
 	Layers          []layerPayload  `json:"layers"`
 }
 
-func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req createAreaRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid area body: "+err.Error())
-			return
-		}
+func areaCreateHandler(deps *Deps, logger logging.Logger) routing.Handler[createAreaRequest, areaResponse] {
+	return func(ctx context.Context, req createAreaRequest) (areaResponse, error) {
+		var zero areaResponse
 
 		ttl, err := parseDuration(req.DemandIdleTTL)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid demandIdleTTL: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid demandIdleTTL: "+err.Error())
+			return zero, nil
 		}
 
 		fresh, err := parseFreshness(req.TargetTTL, req.LeaseDuration, req.SweepInterval)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, err.Error())
+			return zero, nil
 		}
 
-		area, err := deps.Coordinator.Create(r.Context(), &control.CreateAreaInput{
+		area, err := deps.Coordinator.Create(ctx, &control.CreateAreaInput{
 			Name:            req.Name,
 			WarmStrategy:    beeline.WarmStrategy(req.WarmStrategy),
 			RoutingProvider: req.RoutingProvider,
@@ -893,29 +914,38 @@ func areaCreateHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			Layers:          toLayers(req.Layers),
 		})
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, err.Error())
+			return zero, nil
 		}
 
 		logger.Info("service area created")
-		writeJSON(w, logger, http.StatusCreated, toAreaResponse(logger, &area, true))
+		return toAreaResponse(logger, &area, true), nil
 	}
 }
 
-func areaGetHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
+// areaIDInput names an area through the path alone. The param is a string bound
+// as-is and parsed by requireAreaID, so a non-numeric id keeps this API's
+// established 400 body instead of a framework binding error.
+type areaIDInput struct {
+	AreaID string `path:"areaID"`
+}
+
+func areaGetHandler(deps *Deps, logger logging.Logger) routing.Handler[areaIDInput, areaResponse] {
+	return func(ctx context.Context, in areaIDInput) (areaResponse, error) {
+		var zero areaResponse
+
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
 		if !ok {
-			return
+			return zero, nil
 		}
 
-		area, err := deps.Coordinator.Get(r.Context(), id)
+		area, err := deps.Coordinator.Get(ctx, id)
 		if err != nil {
-			writeAreaError(w, logger, err)
-			return
+			writeAreaError(ctx, logger, err)
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
+		return toAreaResponse(logger, &area, true), nil
 	}
 }
 
@@ -932,170 +962,191 @@ type updateAreaRequest struct {
 	Layers          []layerPayload `json:"layers"`
 }
 
-func areaUpdateHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
+// areaUpdateInput is the PATCH body plus the path id.
+type areaUpdateInput struct {
+	AreaID string `json:"-" path:"areaID"`
+	updateAreaRequest
+}
+
+func areaUpdateHandler(deps *Deps, logger logging.Logger) routing.Handler[areaUpdateInput, areaResponse] {
+	return func(ctx context.Context, in areaUpdateInput) (areaResponse, error) {
+		var zero areaResponse
+
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
 		if !ok {
-			return
+			return zero, nil
 		}
 
-		var req updateAreaRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid area body: "+err.Error())
-			return
-		}
-
-		ttl, err := parseDuration(req.DemandIdleTTL)
+		ttl, err := parseDuration(in.DemandIdleTTL)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid demandIdleTTL: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "invalid demandIdleTTL: "+err.Error())
+			return zero, nil
 		}
 
-		fresh, err := parseFreshness(req.TargetTTL, req.LeaseDuration, req.SweepInterval)
+		fresh, err := parseFreshness(in.TargetTTL, in.LeaseDuration, in.SweepInterval)
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, err.Error())
+			return zero, nil
 		}
 
-		area, err := deps.Coordinator.Update(r.Context(), id, &control.UpdateAreaInput{
-			Name:            req.Name,
-			WarmStrategy:    beeline.WarmStrategy(req.WarmStrategy),
-			RoutingProvider: req.RoutingProvider,
+		area, err := deps.Coordinator.Update(ctx, id, &control.UpdateAreaInput{
+			Name:            in.Name,
+			WarmStrategy:    beeline.WarmStrategy(in.WarmStrategy),
+			RoutingProvider: in.RoutingProvider,
 			DemandIdleTTL:   ttl,
 			TargetTTL:       fresh.targetTTL,
 			LeaseDuration:   fresh.lease,
 			SweepInterval:   fresh.sweep,
-			Layers:          toLayers(req.Layers),
+			Layers:          toLayers(in.Layers),
 		})
 		if err != nil {
-			writeAreaError(w, logger, err)
-			return
+			writeAreaError(ctx, logger, err)
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
+		return toAreaResponse(logger, &area, true), nil
 	}
 }
 
-func areaDeleteHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
+func areaDeleteHandler(deps *Deps, logger logging.Logger) routing.Handler[areaIDInput, routing.Empty] {
+	return func(ctx context.Context, in areaIDInput) (routing.Empty, error) {
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
 		if !ok {
-			return
+			return routing.Empty{}, nil
 		}
 
-		if err := deps.Coordinator.Delete(r.Context(), id); err != nil {
-			writeAreaError(w, logger, err)
-			return
+		if err := deps.Coordinator.Delete(ctx, id); err != nil {
+			writeAreaError(ctx, logger, err)
+			return routing.Empty{}, nil
 		}
 
-		w.WriteHeader(http.StatusNoContent)
+		return routing.Empty{}, nil
 	}
 }
 
-func areaEnableHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
+func areaEnableHandler(deps *Deps, logger logging.Logger) routing.Handler[areaIDInput, areaResponse] {
+	return func(ctx context.Context, in areaIDInput) (areaResponse, error) {
+		var zero areaResponse
+
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
 		if !ok {
-			return
+			return zero, nil
 		}
 
-		area, err := deps.Coordinator.Enable(r.Context(), id)
+		area, err := deps.Coordinator.Enable(ctx, id)
 		if err != nil {
-			writeAreaError(w, logger, err)
-			return
+			writeAreaError(ctx, logger, err)
+			return zero, nil
 		}
 
 		logger.Info("service area enabled")
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
+		return toAreaResponse(logger, &area, true), nil
 	}
 }
 
-func areaDisableHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
+func areaDisableHandler(deps *Deps, logger logging.Logger) routing.Handler[areaIDInput, areaResponse] {
+	return func(ctx context.Context, in areaIDInput) (areaResponse, error) {
+		var zero areaResponse
+
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
 		if !ok {
-			return
+			return zero, nil
 		}
 
-		area, err := deps.Coordinator.Disable(r.Context(), id)
+		area, err := deps.Coordinator.Disable(ctx, id)
 		if err != nil {
-			writeAreaError(w, logger, err)
-			return
+			writeAreaError(ctx, logger, err)
+			return zero, nil
 		}
 
 		logger.Info("service area disabled")
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
+		return toAreaResponse(logger, &area, true), nil
 	}
 }
 
 // areaGeoJSONHandler replaces an area's geometry from the uploaded GeoJSON body.
-func areaGeoJSONHandler(deps *Deps, logger logging.Logger, areaID func(*http.Request) uint64) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := requireAreaID(w, logger, r, areaID)
+// The body is a raw document, not a struct — areaIDInput has no body fields, so
+// the framework leaves it unread and the handler consumes it directly.
+func areaGeoJSONHandler(deps *Deps, logger logging.Logger) routing.Handler[areaIDInput, areaResponse] {
+	return func(ctx context.Context, in areaIDInput) (areaResponse, error) {
+		var zero areaResponse
+
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
 		if !ok {
-			return
+			return zero, nil
+		}
+
+		r, ok := requestFrom(ctx)
+		if !ok {
+			fail(ctx, logger, http.StatusInternalServerError, "request unavailable")
+			return zero, nil
 		}
 
 		raw, err := io.ReadAll(io.LimitReader(r.Body, maxGeoJSONBytes))
 		if err != nil {
-			writeError(w, logger, http.StatusBadRequest, "reading geojson body: "+err.Error())
-			return
+			fail(ctx, logger, http.StatusBadRequest, "reading geojson body: "+err.Error())
+			return zero, nil
 		}
 
-		area, err := deps.Coordinator.SetGeoJSON(r.Context(), id, raw)
+		area, err := deps.Coordinator.SetGeoJSON(ctx, id, raw)
 		if err != nil {
-			writeAreaError(w, logger, err)
-			return
+			writeAreaError(ctx, logger, err)
+			return zero, nil
 		}
 
-		writeJSON(w, logger, http.StatusOK, toAreaResponse(logger, &area, true))
+		return toAreaResponse(logger, &area, true), nil
 	}
 }
 
-func liveHandler(logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, logger, http.StatusOK, map[string]string{"status": string(healthcheck.StatusUp)})
+// statusResponse is the health probes' body: {"status":"up"}.
+type statusResponse struct {
+	Status string `json:"status"`
+}
+
+func liveHandler() routing.Handler[routing.Empty, statusResponse] {
+	return func(_ context.Context, _ routing.Empty) (statusResponse, error) {
+		return statusResponse{Status: string(healthcheck.StatusUp)}, nil
 	}
 }
 
-func readyHandler(registry healthcheck.Registry, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func readyHandler(registry healthcheck.Registry, logger logging.Logger) routing.Handler[routing.Empty, *healthcheck.Result] {
+	return func(ctx context.Context, _ routing.Empty) (*healthcheck.Result, error) {
 		if registry == nil {
-			writeJSON(w, logger, http.StatusOK, map[string]string{"status": string(healthcheck.StatusUp)})
-			return
+			commitJSON(ctx, logger, http.StatusOK, statusResponse{Status: string(healthcheck.StatusUp)})
+			return nil, nil
 		}
 
-		result := registry.CheckAll(r.Context())
-		status := http.StatusOK
+		result := registry.CheckAll(ctx)
 		if result.Status == healthcheck.StatusDown {
-			status = http.StatusServiceUnavailable
+			commitJSON(ctx, logger, http.StatusServiceUnavailable, result)
+			return nil, nil
 		}
 
-		writeJSON(w, logger, status, result)
+		return result, nil
 	}
 }
 
-// requireAreaID fetches and validates the {areaID} path param, writing a 400 and
-// returning ok=false when it is missing or not a positive integer.
-func requireAreaID(w http.ResponseWriter, logger logging.Logger, r *http.Request, fetch func(*http.Request) uint64) (beeline.AreaID, bool) {
-	raw := fetch(r)
-	if raw == 0 {
-		writeError(w, logger, http.StatusBadRequest, "invalid or missing area id")
+// requireAreaID parses the {areaID} path param, failing the request with a 400 and
+// returning ok=false when it is not a positive integer.
+func requireAreaID(ctx context.Context, logger logging.Logger, raw string) (beeline.AreaID, bool) {
+	id, err := parseAreaID(raw)
+	if err != nil {
+		fail(ctx, logger, http.StatusBadRequest, "invalid or missing area id")
 		return 0, false
 	}
 
-	return beeline.AreaID(raw), true
+	return id, true
 }
 
 // writeAreaError maps a coordinator error to an HTTP status: not-found → 404,
 // everything else (validation, geometry, store) → 400.
-func writeAreaError(w http.ResponseWriter, logger logging.Logger, err error) {
+func writeAreaError(ctx context.Context, logger logging.Logger, err error) {
 	if isNotFound(err) {
-		writeError(w, logger, http.StatusNotFound, err.Error())
+		fail(ctx, logger, http.StatusNotFound, err.Error())
 		return
 	}
 
-	writeError(w, logger, http.StatusBadRequest, err.Error())
+	fail(ctx, logger, http.StatusBadRequest, err.Error())
 }
 
 // isNotFound reports whether err signals a missing area. The SQLite store's ErrNotFound
@@ -1164,7 +1215,7 @@ func parseFreshness(targetTTL, lease, sweep string) (freshnessKnobs, error) {
 	return freshnessKnobs{targetTTL: tt, lease: ls, sweep: sw}, nil
 }
 
-// parseAreaID parses a positive area id from a query-string value.
+// parseAreaID parses a positive area id from a path or query value.
 func parseAreaID(raw string) (beeline.AreaID, error) {
 	id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || id <= 0 {
@@ -1174,7 +1225,8 @@ func parseAreaID(raw string) (beeline.AreaID, error) {
 	return beeline.AreaID(id), nil
 }
 
-// decodeJSON strictly decodes a JSON request body into v.
+// decodeJSON decodes a JSON request body into v: lenient (unknown fields pass)
+// and bounded by maxGeoJSONBytes, the API's established decode behavior.
 func decodeJSON(r *http.Request, v any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxGeoJSONBytes))
 	return dec.Decode(v)
@@ -1218,8 +1270,4 @@ func writeJSON(w http.ResponseWriter, logger logging.Logger, status int, body an
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		logger.Error("encoding response body", err)
 	}
-}
-
-func writeError(w http.ResponseWriter, logger logging.Logger, status int, message string) {
-	writeJSON(w, logger, status, map[string]string{"error": message})
 }

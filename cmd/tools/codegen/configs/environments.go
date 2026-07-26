@@ -5,11 +5,11 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v4/httpclient"
-	"github.com/primandproper/platform-go/v4/observability"
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v4/observability/logging/config"
-	serverhttp "github.com/primandproper/platform-go/v4/server/http"
+	"github.com/primandproper/platform-go/v7/httpclient"
+	"github.com/primandproper/platform-go/v7/observability"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	loggingcfg "github.com/primandproper/platform-go/v7/observability/logging/config"
+	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 )
 
 // Each builder returns a fully-formed *config.Config for one environment. The

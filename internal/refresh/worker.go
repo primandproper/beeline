@@ -13,7 +13,7 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/logging"
 )
 
 // Config tunes the refresh pool.

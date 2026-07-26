@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/logging"
 )
 
 // defaultFlushInterval backstops a zero FlushInterval so a misconfigured Recorder

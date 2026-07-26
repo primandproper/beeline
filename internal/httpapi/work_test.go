@@ -15,10 +15,10 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v4/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v4/observability/tracing/noop"
-	chirouter "github.com/primandproper/platform-go/v4/routing/chi"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	metricsnoop "github.com/primandproper/platform-go/v7/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v7/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,11 +49,11 @@ type submitEnvelope struct {
 func newWorkRouter(t *testing.T, index beeline.FreshnessIndex, store beeline.Store) http.Handler {
 	t.Helper()
 
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		logging.EnsureLogger(nil),
 		tracingnoop.NewTracerProvider(),
 		metricsnoop.NewMetricsProvider(),
-		&chirouter.Config{ServiceName: "test"},
+		&chibackend.Config{ServiceName: "test"},
 	)
 	httpapi.Register(router, &httpapi.Deps{
 		Index:          index,

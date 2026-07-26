@@ -27,7 +27,7 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/logging"
 
 	"github.com/uber/h3-go/v4"
 )

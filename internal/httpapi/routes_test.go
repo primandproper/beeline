@@ -21,10 +21,10 @@ import (
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v4/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v4/observability/tracing/noop"
-	chirouter "github.com/primandproper/platform-go/v4/routing/chi"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	metricsnoop "github.com/primandproper/platform-go/v7/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v7/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -67,11 +67,11 @@ func newTestRouter(t *testing.T) (http.Handler, *memstore.Store) {
 	engine := haversineengine.New(map[beeline.Profile]float64{"car": 10}, 0)
 	handler := query.NewHandler(store, index, oneEngine{engine: engine}, oneArea{}, nil, nil)
 
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		logging.EnsureLogger(nil),
 		tracingnoop.NewTracerProvider(),
 		metricsnoop.NewMetricsProvider(),
-		&chirouter.Config{ServiceName: "test"},
+		&chibackend.Config{ServiceName: "test"},
 	)
 	httpapi.Register(router, &httpapi.Deps{Handler: handler, Store: store, DefaultProfile: "car"})
 
@@ -313,11 +313,11 @@ func newWarmHarness(t *testing.T) *warmHarness {
 	require.GreaterOrEqual(t, len(disk), 2)
 
 	handler := query.NewHandler(store, index, coord, coord, nil, nil)
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		logging.EnsureLogger(nil),
 		tracingnoop.NewTracerProvider(),
 		metricsnoop.NewMetricsProvider(),
-		&chirouter.Config{ServiceName: "test"},
+		&chibackend.Config{ServiceName: "test"},
 	)
 	httpapi.Register(router, &httpapi.Deps{Handler: handler, Store: store, Index: index, Coordinator: coord, DefaultProfile: "car"})
 

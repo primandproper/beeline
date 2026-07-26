@@ -15,9 +15,9 @@ import (
 	"github.com/primandproper/beeline/internal/telemetry"
 	"github.com/primandproper/beeline/internal/webui"
 
-	"github.com/primandproper/platform-go/v4/healthcheck"
-	chirouter "github.com/primandproper/platform-go/v4/routing/chi"
-	serverhttp "github.com/primandproper/platform-go/v4/server/http"
+	"github.com/primandproper/platform-go/v7/healthcheck"
+	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
+	serverhttp "github.com/primandproper/platform-go/v7/server/http"
 
 	"github.com/spf13/cobra"
 )
@@ -176,11 +176,11 @@ func (a *application) serve(ctx context.Context) error {
 	}).Info("area store opened; starting refresh and HTTP server")
 
 	// HTTP router + server, built from the observability pillars.
-	router := chirouter.NewRouter(
+	router := httpapi.NewRouter(
 		a.logger,
 		a.pillars.TracerProvider,
 		a.pillars.MetricsProvider,
-		&chirouter.Config{
+		&chibackend.Config{
 			ServiceName:            a.cfg.Observability.Logging.ServiceName,
 			EnableCORSForLocalhost: true,
 			SilenceRouteLogging:    mcfg.SilenceRouteLogging,
@@ -201,6 +201,13 @@ func (a *application) serve(ctx context.Context) error {
 
 	// Serve the embedded operator console at / (talks to the endpoints above).
 	if err = webui.Register(router, a.logger); err != nil {
+		return err
+	}
+
+	// The generated spec for the typed routes above; /docs is a browser UI over it.
+	router.MountOpenAPI("/openapi.json", "/docs")
+
+	if err = router.Err(); err != nil {
 		return err
 	}
 

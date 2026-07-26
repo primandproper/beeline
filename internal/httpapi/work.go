@@ -1,13 +1,15 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v4/observability/logging"
+	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v7/routing"
 )
 
 // The /_work_/ endpoints are the leader side of the leader/follower split (design
@@ -69,20 +71,17 @@ type claimResponse struct {
 // claimHandler leases up to batchSize due pairs to the calling follower via the
 // same Index.Claim the local refresh pool uses, so leader workers and followers
 // drain one queue with identical priority order.
-func claimHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req claimRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid claim body: "+err.Error())
-			return
-		}
+func claimHandler(deps *Deps, logger logging.Logger) routing.Handler[claimRequest, claimResponse] {
+	return func(ctx context.Context, req claimRequest) (claimResponse, error) {
+		var zero claimResponse
+
 		if req.BatchSize < 0 {
-			writeError(w, logger, http.StatusBadRequest, "batchSize must be >= 0")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "batchSize must be >= 0")
+			return zero, nil
 		}
 		if req.LeaseSeconds < 0 {
-			writeError(w, logger, http.StatusBadRequest, "leaseSeconds must be >= 0")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "leaseSeconds must be >= 0")
+			return zero, nil
 		}
 
 		batch := req.BatchSize
@@ -101,11 +100,11 @@ func claimHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			lease = maxClaimLease
 		}
 
-		keys, err := deps.Index.Claim(r.Context(), batch, lease)
+		keys, err := deps.Index.Claim(ctx, batch, lease)
 		if err != nil {
 			logger.Error("claiming work for follower", err)
-			writeError(w, logger, http.StatusInternalServerError, err.Error())
-			return
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+			return zero, nil
 		}
 
 		resp := claimResponse{
@@ -135,7 +134,7 @@ func claimHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			}
 		}
 
-		writeJSON(w, logger, http.StatusOK, resp)
+		return resp, nil
 	}
 }
 
@@ -144,9 +143,9 @@ func claimHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 // and whenever a claim response carries an unfamiliar hash, then build their
 // engines from it: provider configuration lives only on the leader, and followers
 // need to know nothing but a leader URL.
-func workProvidersHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, logger, http.StatusOK, deps.Coordinator.Catalog())
+func workProvidersHandler(deps *Deps) routing.Handler[routing.Empty, beeline.ProviderCatalog] {
+	return func(_ context.Context, _ routing.Empty) (beeline.ProviderCatalog, error) {
+		return deps.Coordinator.Catalog(), nil
 	}
 }
 
@@ -179,21 +178,18 @@ type submitResponse struct {
 // keys anyway, but Store.Put would happily resurrect estimates the disable just
 // purged). An invalid cell fails the whole request: results echo leader-issued
 // keys, so garbage here means a broken follower, not bad user input.
-func submitHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req submitRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, logger, http.StatusBadRequest, "invalid submit body: "+err.Error())
-			return
-		}
+func submitHandler(deps *Deps, logger logging.Logger) routing.Handler[submitRequest, submitResponse] {
+	return func(ctx context.Context, req submitRequest) (submitResponse, error) {
+		var zero submitResponse
+
 		if len(req.Results) == 0 {
-			writeError(w, logger, http.StatusBadRequest, "results must be non-empty")
-			return
+			fail(ctx, logger, http.StatusBadRequest, "results must be non-empty")
+			return zero, nil
 		}
 		if len(req.Results) > maxClaimPairs {
-			writeError(w, logger, http.StatusBadRequest,
+			fail(ctx, logger, http.StatusBadRequest,
 				"too many results: limit "+strconv.Itoa(maxClaimPairs))
-			return
+			return zero, nil
 		}
 
 		now := time.Now()
@@ -203,13 +199,13 @@ func submitHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 			res := &req.Results[i]
 			origin, err := parseCell(res.Origin)
 			if err != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid origin: "+err.Error())
+				return zero, nil
 			}
 			dest, err := parseCell(res.Dest)
 			if err != nil {
-				writeError(w, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
-				return
+				fail(ctx, logger, http.StatusBadRequest, "invalid dest: "+err.Error())
+				return zero, nil
 			}
 
 			area := beeline.AreaID(res.Area)
@@ -235,18 +231,18 @@ func submitHandler(deps *Deps, logger logging.Logger) http.HandlerFunc {
 		}
 
 		if len(entries) > 0 {
-			if err := deps.Store.Put(r.Context(), entries); err != nil {
+			if err := deps.Store.Put(ctx, entries); err != nil {
 				logger.Error("writing follower estimates", err)
-				writeError(w, logger, http.StatusInternalServerError, err.Error())
-				return
+				fail(ctx, logger, http.StatusInternalServerError, err.Error())
+				return zero, nil
 			}
-			if err := deps.Index.MarkComputed(r.Context(), keys, now); err != nil {
+			if err := deps.Index.MarkComputed(ctx, keys, now); err != nil {
 				logger.Error("marking follower estimates computed", err)
-				writeError(w, logger, http.StatusInternalServerError, err.Error())
-				return
+				fail(ctx, logger, http.StatusInternalServerError, err.Error())
+				return zero, nil
 			}
 		}
 
-		writeJSON(w, logger, http.StatusOK, submitResponse{Accepted: len(entries)})
+		return submitResponse{Accepted: len(entries)}, nil
 	}
 }

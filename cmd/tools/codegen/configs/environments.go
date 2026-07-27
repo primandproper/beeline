@@ -51,9 +51,9 @@ func buildLocalDevConfig() *config.Config {
 			Profiles:       defaultProfiles(),
 			DefaultProfile: "car",
 			Backend: config.BackendConfig{
-				// Points at the compose Postgres from `make demo`. Every serve
-				// process is a head over shared coordination state, so a local run
-				// needs the database up.
+				// Points at a local Postgres you supply — `make demo` runs its own
+				// in-cluster one. Every serve process is a head over shared
+				// coordination state, so a local run needs the database up.
 				Postgres: config.PostgresConfig{ //nolint:gosec // local demo creds
 					URL: "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable",
 				},
@@ -132,8 +132,8 @@ func buildLocalDevConfig() *config.Config {
 	}
 }
 
-// buildClusterConfig is the distributed-mode config the multi-head demo (and
-// any real multi-head deployment) starts from: identical heads over a shared
+// buildClusterConfig is the distributed-mode config `make demo` (and any real
+// multi-head deployment) starts from: identical heads over a shared
 // Postgres — the freshness index, operator config, and estimate cache all live
 // there, so every head is stateless and disposable. Heads run coordinator-only
 // (refreshWorkers 0) with the simulated-latency provider available, so compute
@@ -158,8 +158,8 @@ func buildClusterConfig() *config.Config {
 			Profiles:       defaultProfiles(),
 			DefaultProfile: "car",
 			Backend: config.BackendConfig{
-				// Demo credentials for the throwaway local docker postgres; real
-				// deploys override via BEELINE_MATRIX_BACKEND_POSTGRES_URL.
+				// Demo credentials for the throwaway in-cluster postgres; every
+				// deployment overrides this via BEELINE_MATRIX_BACKEND_POSTGRES_URL.
 				Postgres: config.PostgresConfig{ //nolint:gosec // local demo creds
 					URL: "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable",
 				},

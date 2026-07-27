@@ -1,0 +1,46 @@
+# The head pool scales on CPU, because the read path is CPU-bound: a cached
+# /estimate or a /table grid is H3 indexing plus a batched store read plus JSON
+# encoding, with no I/O wait worth speaking of. Heads also serve /_work_/claim
+# and /_work_/submit for the entire follower pool, so worker scale-out drives
+# head CPU too — the two autoscalers in this directory visibly couple.
+#
+# minReplicas/maxReplicas are environment-scoped and patched by the overlay; the
+# values here are the shape, not the sizing.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: beeline-head
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: head
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: beeline-head
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # 60% of the Deployment's 250m CPU *request* — the request is what makes
+          # this number mean anything, which is why head.yaml sets one.
+          averageUtilization: 60
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+    scaleDown:
+      # The default is 300s, which is far too slow to watch. Read traffic is
+      # bursty but cheap to over-provision, so a minute of hysteresis is plenty.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 30

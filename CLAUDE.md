@@ -118,16 +118,25 @@ HTTP endpoints (default `:8080`):
   `config/<env>.json` via `config.Render`. The checked-in JSON is a projection of these builders — edit
   the Go, never the JSON, then re-run `make configs`.
 - `config/` — generated per-environment config files (`localdev.json`, `cluster.json` — the
-  the compose-cluster reference, used by `make demo` — and `production.json`); committed so
-  they stay reviewable, and loadable at runtime via `--config`.
-- `Dockerfile` + `docker-compose.yml` — the containerized deployment behind `make demo`: one
-  cgo-enabled image (uber/h3-go wraps the C library) serving every role, and a compose cluster of
-  Postgres + Redis + 3 `serve` heads + 8 `work` followers. Only `head-a` carries the build block (four
-  services declaring one tag makes buildx race); the heads share a `heads` network alias so followers
-  spread across the pool. Backend wiring is env-only (`BEELINE_MATRIX_BACKEND_*` over
-  `config/cluster.json`).
+  distributed-mode reference both roles run from in `make demo` — and `production.json`); committed so
+  they stay reviewable, and loadable at runtime via `--config`. Note `cluster.json`'s `targetTTL` is
+  only a **fallback**: a service area created with its own `targetTTL` (as the demo's are, at 5m)
+  overrides it, and the per-area value is what the debt/throughput SQL divides by.
+- `Dockerfile` + `deploy/` — the Kubernetes deployment behind `make demo`. One cgo-enabled image
+  (uber/h3-go wraps the C library) serves every role, `serve` and `work` alike. `deploy/base/` is what
+  beeline *is*: the head Deployment/Service/PDB, the worker Deployment, an ingress, and the *shape* of
+  both autoscalers — a CPU `HorizontalPodAutoscaler` for the heads and a KEDA `ScaledObject` for the
+  followers. Neither Deployment carries a `replicas` field, because an autoscaler owns it.
+  `deploy/environments/local/` is what makes it a laptop demo: a k3d cluster spec, in-cluster Postgres
+  and Redis, throwaway credentials, a k6 load generator, and laptop-sized bounds. Base names its
+  dependencies (`beeline-postgres` Secret, `beeline-head-env`/`beeline-worker-env` ConfigMaps) and the
+  environment supplies them, so pointing at managed Postgres is an overlay change and nothing more.
+  Backend wiring is env-only (`BEELINE_MATRIX_BACKEND_*` over `config/cluster.json`) — but use
+  `BEELINE_OBSERVABILITY_LOGGING_LEVEL`, since `BEELINE_LOG_LEVEL` is inert whenever `--config` is set.
 - `scripts/seed_demo_areas.sh` — the three canonical Austin demo areas (downtown res 9 full mesh,
-  city res 8 / 8 km, metro res 7+6), shared by all three demo scripts so the polygons live in one place.
+  city res 8 / 8 km, metro res 7+6), used by `make demo` so the polygons live in one place. It creates
+  each area with `targetTTL: 5m`, which is what sets the demo's required throughput (~3.6k pairs/sec
+  over a ~1.1M-pair working set) and therefore both autoscalers' arithmetic.
 - `internal/cli/` — cobra root command, observability bootstrap + shutdown, subcommands
   (`version.go`, `serve.go`). `serve.go` wires the whole matrix pipeline from `application.cfg` +
   `application.pillars`.
@@ -308,12 +317,20 @@ make build          # Compile all packages, then build artifacts/beeline with ve
 make run ARGS="version"   # go run the CLI with arguments
 make run ARGS="serve --config config/localdev.json"   # connect to Postgres + refresh + serve on :8080
                     # (needs a reachable Postgres — `make demo` brings one up)
-make demo           # the deployment as a docker-compose cluster: Postgres (coordination) + Redis
-                    # (hot store) wired into a pool of 3 serve heads (:8080/:8090/:8100) and a pool
-                    # of 8 `work` followers; seeds via head A and tails all three heads. Stop a head
-                    # and the survivors keep the contract. WORKERS=n to scale the follower pool;
-                    # needs Docker (Compose v2), no local binary. The only demo, because it is the
-                    # only deployment shape.
+make docker-build   # Build beeline:demo — the one image both roles run from — with version
+                    # metadata as build args. `make demo` calls this for you.
+make demo           # the deployment on a local k3s cluster (k3d): Postgres (coordination) + Redis
+                    # (hot store), an autoscaling pool of `serve` heads behind one Service, an
+                    # autoscaling pool of `work` followers, and a k6 load generator; seeds the three
+                    # Austin areas and tails debt/throughput next to live replica counts. Heads
+                    # scale on CPU (metrics-server); followers scale on freshness debt read off
+                    # /_ops_/freshness by KEDA's metrics-api scaler, down to zero. The seeded areas
+                    # re-stale every 5m, so both pools cycle unattended — leave it running.
+                    # PORT publishes the ingress; WORKER_MAX bounds the follower pool; RPS drives
+                    # the load generator; KEEP_CLUSTER=true skips teardown. Needs Docker, kubectl
+                    # and k3d (`brew install k3d`), no local binary. The only demo, because it is
+                    # the only deployment shape.
+make demo-down      # Delete a cluster left behind by KEEP_CLUSTER=true.
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
 make test           # Run tests (race detector, shuffle, failfast) against real Postgres + Redis;
@@ -384,13 +401,20 @@ because `format_imports.sh` runs `dirname` on it to derive the org-level prefix.
 - The `--log-level` / `--service-name` persistent flags default from the `BEELINE_LOG_LEVEL` and
   `BEELINE_SERVICE_NAME` environment variables. The `--config` flag (default from
   `BEELINE_CONFIG_FILEPATH`) points at a JSON config file; when set, `bootstrap` loads it via
-  `config.LoadFromFile` instead of the flag/env defaults.
+  `config.LoadFromFile` instead of the flag/env defaults. **`LoadFromFile` ignores `Options`
+  entirely**, so with `--config` set the `--log-level` / `--service-name` flags and their
+  `BEELINE_LOG_LEVEL` / `BEELINE_SERVICE_NAME` defaults are silently dropped. Deployments that pass
+  `--config` (which is all of them) must use the nested `BEELINE_OBSERVABILITY_LOGGING_LEVEL`.
 - Configuration is layered: defaults (or a JSON file) < `BEELINE_`-prefixed environment variables.
   Env vars follow platform-go's nested `envPrefix` tags, e.g.
   `BEELINE_OBSERVABILITY_LOGGING_LEVEL`. Give new `Config` fields both `envPrefix`/`env` and `json`
   tags so they participate in `Load` and `LoadFromFile`.
 - To enable real tracing/metrics/profiling, populate the sub-configs in `internal/config` and call
   `observability.Config.NewPillars`, or swap the noop constructors in `Config.NewPillars`.
+- Every `kubectl` call in `scripts/demo.sh` — and every command it prints for you to copy — names
+  `--context k3d-beeline-local` explicitly. The demo never reads or changes your current context
+  (`switchCurrentContext: false` in the k3d config), so whatever cluster you were pointed at stays
+  the one you are pointed at. Keep it that way when adding commands.
 
 ## Linting
 

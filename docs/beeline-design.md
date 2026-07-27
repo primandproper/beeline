@@ -408,7 +408,8 @@ the shared `refreshBatch`/`leaseDuration`, so an untuned follower paces itself
 like a local worker. The follower's only HTTP surface is `/_ops_/live` and
 `/_ops_/ready` (= leader reachable) on `matrix.follower.port` (default 8081). A
 leader started with `refreshWorkers: 0` computes nothing itself — a pure
-coordinator; `make demo-cluster` stages exactly that.
+coordinator; that is the shape `make demo` runs, with all compute in an
+autoscaling follower pool.
 
 ### 8.2 Stateless heads over shared Postgres
 
@@ -421,7 +422,7 @@ elect a leader *of* except two singleton chores.
 This is no longer opt-in — it is the only mode. The zero-dependency single-node
 build (in-memory index and store, SQLite operator config) has been **deleted**,
 along with `matrix.backend.mode`, so `matrix.backend.postgres.url` is required and
-`make demo` needs Docker. That trade is deliberate: keeping a per-head in-memory
+`make demo` needs Docker, kubectl and k3d. That trade is deliberate: keeping a per-head in-memory
 backend alive meant every design conversation carried a second set of operational
 semantics, and "how does this degrade without Postgres?" was a question about a
 deployment nobody ran. One backend, one set of semantics, one deployment story.
@@ -475,10 +476,11 @@ Where the state went:
   interleaving.
 
 Followers are untouched: they still speak `/_work_/claim|submit` to "the
-leader," which is now any head behind a load balancer. `make demo-multihead`
-stages the whole thing — two heads over one containerized Postgres, followers
-split between them, one area enabled through head A and served by both; kill
-either head and the other keeps the freshness contract.
+leader," which is now any head behind a load balancer. `make demo` stages the
+whole thing on a local k3s cluster — an autoscaling head pool behind one Service
+over a shared Postgres, an autoscaling follower pool split across it, the demo
+areas enabled through one head and served by all of them; kill any head and the
+others keep the freshness contract.
 
 Accepted looseness: a head's `AreaEnabled` snapshot lags a disable elsewhere by
 up to one poll interval, so a follower submit routed through the lagging head

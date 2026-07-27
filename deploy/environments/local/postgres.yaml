@@ -1,0 +1,109 @@
+# Postgres for the local environment only: coordination state (the freshness
+# index, operator config, advisory-lock election) for a cluster that gets deleted
+# when you press Ctrl-C. A real environment points BEELINE_MATRIX_BACKEND_POSTGRES_URL
+# at a managed instance and drops this file entirely — which is why it lives here
+# and not in base.
+#
+# Deployment, not StatefulSet: a StatefulSet earns nothing without a PVC, and the
+# compose original this replaces was explicitly tmpfs-backed and throwaway.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beeline-postgres
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: postgres
+    role: postgres
+spec:
+  replicas: 1
+  strategy:
+    # Required, not tidiness: a RollingUpdate would briefly run a second Postgres
+    # with a freshly-initdb'd empty database alongside the live one.
+    type: Recreate
+  selector:
+    matchLabels:
+      role: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: beeline
+        app.kubernetes.io/component: postgres
+        role: postgres
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          # A throwaway database carrying a write-heavy ~1.1M-row freshness index:
+          # durability buys nothing here, so trade it for throughput. This is the
+          # Kubernetes equivalent of the compose file's tmpfs data directory.
+          #
+          # max_connections matters: at 6 heads plus 8 workers the pgx pools add
+          # up, and the default 100 becomes a ceiling exactly at the top of both
+          # autoscalers' ranges — where it looks like an application bug rather
+          # than a database setting.
+          args:
+            - "-c"
+            - "fsync=off"
+            - "-c"
+            - "synchronous_commit=off"
+            - "-c"
+            - "full_page_writes=off"
+            - "-c"
+            - "max_connections=200"
+            - "-c"
+            - "shared_buffers=512MB"
+          envFrom:
+            - secretRef:
+                name: beeline-postgres
+          ports:
+            - name: postgres
+              containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "beeline", "-d", "beeline"]
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "beeline", "-d", "beeline"]
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              # Measured ~1.45Gi steady-state with the demo's ~1.1M-row freshness
+              # index and shared_buffers at 512MB. 2Gi left no room for a burst.
+              memory: 3Gi
+          # Note the absence of a hardened securityContext here, unlike the
+          # beeline pods. The official postgres entrypoint starts as root to chown
+          # PGDATA before dropping to uid 999, so runAsNonRoot breaks the image.
+      volumes:
+        - name: data
+          # Plain emptyDir, not `medium: Memory` — a memory-backed volume counts
+          # against the container's memory limit, and with fsync off the node's
+          # filesystem is already quick enough. Dies with the pod either way.
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beeline-postgres
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: postgres
+spec:
+  type: ClusterIP
+  selector:
+    role: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

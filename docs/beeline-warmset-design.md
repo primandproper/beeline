@@ -55,7 +55,8 @@ Read these before changing anything.
   round-tripped in `internal/store/sqlite/areas.go`). Validated `>= 1` in
   `internal/control/control.go` (`validateAreaFields`, ~line 448). Exposed over HTTP as JSON
   `radiusRings` (`internal/httpapi/routes.go`, create/update DTOs). The console form
-  (`internal/webui/static/`) collects it. `scripts/demo.sh` / `make demo` seed a demo area with it.
+  (`internal/webui/static/`) collects it. `scripts/seed_demo_areas.sh` / `make demo` seed the demo
+  areas with it.
 - **Tessellation is purely geometric.** `tessellate.PairsFromCells`
   (`internal/tessellate/tessellate.go:74`): for each origin cell, `h3.GridDisk(origin, radiusRings)`,
   then **clip destinations to in-area cells**, emit one directed `PairKey` per
@@ -154,7 +155,7 @@ the obvious O(N²) blow-up with a `log()`/warning if the cell count is large.
   (allow `>= 0`; document `0` = full mesh; reject negative); `seedLocked` passes `RadiusMeters`.
 - `internal/httpapi/routes.go` — rename DTO fields to `radiusMeters` (create/update/response).
 - `internal/webui/static/` — console form: rings input → meters (or a miles input that ×1609.34).
-- `scripts/demo.sh`, `Makefile` (`demo` target) — update the seeded area's field.
+- `scripts/seed_demo_areas.sh` — update the seeded areas' field.
 
 **Done when:** create/enable an area with `radiusMeters`, pairs match the expected ring disk;
 `radiusMeters: 0` yields full mesh; all existing tests updated and green.
@@ -303,8 +304,8 @@ Areas remain **database-owned**, created disabled via the control plane — none
 
 ## 8. How to validate end to end
 
-Beyond unit tests, drive the real flow (`make demo` boots a gitignored SQLite DB and serves on
-`:8080`):
+Beyond unit tests, drive the real flow (`make demo` brings up a local k3s cluster and publishes
+the head pool on `:8080`):
 1. Create + enable a `lazy` area; confirm `/_ops_/freshness` shows workingSet 0.
 2. Issue `GET /estimate?...` inside it; confirm the pair appears and gets refreshed.
 3. Advance past `demandIdleTTL` with no further queries; confirm the pair is swept (workingSet drops).

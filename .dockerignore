@@ -18,4 +18,4 @@ vendor/
 .golangci.yml
 sqlc.yaml
 Dockerfile
-docker-compose.yml
+deploy/

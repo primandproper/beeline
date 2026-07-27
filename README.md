@@ -15,7 +15,8 @@ subcommand. A long-running worker? Add a subcommand. An HTTP service? Add a
 ## Quickstart
 
 Requires **Go 1.26+**. [Docker](https://www.docker.com/) is used for linting and
-shellcheck.
+shellcheck. The demo additionally needs `kubectl` and [k3d](https://k3d.io)
+(`brew install k3d`) — it runs on a real Kubernetes cluster.
 
 ```bash
 make setup                  # create artifacts/ and download the module cache
@@ -41,39 +42,79 @@ stand-in (great-circle distance ÷ per-profile speed) behind the same interface 
 (OSRM/Valhalla) would implement, so the whole pipeline runs with **no external routing
 dependency**.
 
-There is one demo, because there is one deployment shape. **`make demo`** brings up a
-docker-compose cluster of shared Postgres (the freshness index, operator config, and singleton
-election), Redis (the hot estimate store), a pool of **three identical `serve` heads** on
-`:8080`/`:8090`/`:8100`, and a pool of **eight `work` followers**, seeded with the same three
-Austin service areas (downtown at res 9, the city at res 8, the metro at res 7+6 — ~1.1M
-pairs). The areas are enabled through head A and served by all three within a config-poll
-interval, and the script tails all three heads' freshness side by side so you can see them
-agree. Stop one and the survivors keep the contract:
+There is one demo, because there is one deployment shape. **`make demo`** brings up a local
+**k3s cluster** (via [k3d](https://k3d.io)) running shared Postgres (the freshness index,
+operator config, and singleton election), Redis (the hot estimate store), an **autoscaling pool
+of `serve` heads** behind one Service, an **autoscaling pool of `work` followers**, and a k6 load
+generator aimed at the heads. It seeds the three Austin service areas (downtown at res 9, the
+city at res 8, the metro at res 7+6 — ~1.1M pairs) and then tails the freshness contract next to
+live replica counts:
+
+```
+  debt=1087054  achieved=213    required=3635    heads=2/2    workers=1/1
+  debt= 481907  achieved=4820   required=3635    heads=2/3    workers=2/2
+  debt=  56681  achieved=11940  required=3635    heads=3/3    workers=8/8
+  debt=      0  achieved=9310   required=3635    heads=3/3    workers=0/0
+```
+
+**Both pools scale on their own, and that is the point.**
+
+- The **head pool** scales on CPU — the read path is CPU-bound, so a `HorizontalPodAutoscaler`
+  over the metrics-server k3s already ships is the honest signal. The bundled load generator is
+  what moves it. Heads also serve `/_work_/claim` and `/_work_/submit` for the follower pool, so
+  the two autoscalers visibly couple.
+- The **follower pool** scales on **freshness debt** — the §3 contract read straight off
+  `GET /_ops_/freshness` by KEDA's `metrics-api` scaler, with no metrics pipeline in between. The
+  cache's own health is the scaling metric. It scales **to zero**: no enabled areas means no debt
+  means no reason to run a compute pool at all.
+
+Because the seeded areas carry a 5-minute `targetTTL`, the whole working set re-stales at once
+every five minutes — so the pool wakes, burns ~1.1M pairs of debt down to zero in about ninety
+seconds, and goes back to sleep. Just leave it running and watch the sawtooth.
 
 ```bash
-make demo                        # or WORKERS=16 make demo
-docker compose -p beeline-demo stop head-b                     # A and C keep burning debt
-curl 'localhost:8100/estimate?origin=30.27,-97.745&dest=30.275,-97.74'   # head C answers for head A's areas
+make demo                                    # or RPS=250 WORKER_MAX=16 make demo
+kubectl --context k3d-beeline-local -n beeline-local get hpa,scaledobject,deploy -w
+
+# turn the read load up; the head pool follows. Cost per request matters more than
+# rate — a bigger /table grid is what pushes head CPU past the 60% target.
+kubectl --context k3d-beeline-local -n beeline-local \
+  set env deploy/beeline-loadgen RPS=250 TABLE_GRID=48 TABLE_RATIO=0.6
+
+# kill ONE head; the survivors keep the contract. (Deleting them all with
+# -l role=head is an outage, not a demo: a PDB gates evictions, never a delete.)
+kubectl --context k3d-beeline-local -n beeline-local delete pod --wait=false \
+  "$(kubectl --context k3d-beeline-local -n beeline-local get pod -l role=head -o name | head -1)"
+curl 'localhost:8080/estimate?origin=30.27,-97.745&dest=30.275,-97.74'
 ```
 
 Then open **http://localhost:8080** for the operator console.
 
-It needs Docker (Compose v2) and no local binary. Postgres is not optional: there is no
-single-node mode, which is what makes every head disposable and every endpoint answer the same
-regardless of which head you ask.
+It needs Docker, `kubectl` and k3d, and no local binary. It never reads or changes your current
+kubectl context — every command above names the demo's context explicitly, and the cluster is
+created with `switchCurrentContext: false`. Postgres is not optional: there is no single-node
+mode, which is what makes every head disposable and every endpoint answer the same regardless of
+which head you ask.
 
-The compute side scales with the `work` subcommand: the same binary pointed at a running head
-becomes a stateless **follower** that claims pending pairs, computes them locally, and submits
-the results back — add followers until the freshness debt burns down smoothly. A head started
-with `refreshWorkers: 0` does no computing of its own, which is the shape `config/cluster.json`
-and `config/production.json` both use: heads coordinate and serve reads, the follower pool
-computes.
+The manifests are split the way you would split them for a real deployment. `deploy/base/` is
+what beeline *is* — two roles, how they are exposed, and the shape of both autoscalers.
+`deploy/environments/local/` is what makes it a laptop demo — in-cluster Postgres and Redis,
+throwaway credentials, the load generator, laptop-sized bounds. Base names its dependencies and
+the environment supplies them, so pointing a new environment at managed Postgres is an overlay
+change and nothing else.
+
+The compute side is the `work` subcommand: the same binary pointed at a running head becomes a
+stateless **follower** that claims pending pairs, computes them locally, and submits the results
+back. A head started with `refreshWorkers: 0` does no computing of its own, which is the shape
+`config/cluster.json` and `config/production.json` both use: heads coordinate and serve reads,
+the follower pool computes. Followers hold no state at all — a dead one just lets its leases
+expire — which is what makes handing the replica count to an autoscaler safe.
 
 ```bash
 ./artifacts/beeline work --config config/cluster.json --leader http://localhost:8080
 ```
 
-To run a head against your own Postgres instead of the compose one:
+To run a head against your own Postgres instead of the demo cluster's:
 
 ```bash
 make build

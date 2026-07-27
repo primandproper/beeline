@@ -127,24 +127,60 @@ build: $(ARTIFACTS_DIR)
 run:
 	go run $(CMD_PACKAGE) $(ARGS)
 
+## IMAGES
+
+# docker-build produces the one image every role runs from: `serve` (a head) and
+# `work` (a follower) are the same binary with different arguments. Version
+# metadata rides in as build args because .dockerignore keeps .git out of the
+# build context. `make demo` calls this for you; the target exists so you can
+# build without standing a cluster up.
+IMAGE ?= beeline:demo
+.PHONY: docker-build
+docker-build:
+	IMAGE=$(IMAGE) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/docker_build.sh
+
 ## DEMO
 #
-# demo runs the deployment as a docker-compose cluster: shared Postgres
-# (coordination state) and Redis (hot estimate store) wired into a pool of three
-# identical serve heads on :8080/:8090/:8100 and a pool of eight work followers,
-# seeded with the three Austin service areas (scripts/seed_demo_areas.sh). Areas
-# enabled through one head are served by all three; stop a head and the survivors
-# keep the freshness contract. Everything runs in containers — no local binary
-# needed — so it needs only Docker (Compose v2).
+# demo runs the deployment on a local k3s cluster (k3d): shared Postgres
+# (coordination state) and Redis (hot estimate store), an autoscaling pool of
+# `serve` heads behind one Service, an autoscaling pool of `work` followers, and
+# a bundled k6 load generator aimed at the heads. Seeded with the three Austin
+# service areas (scripts/seed_demo_areas.sh).
 #
-# This is the only demo, because it is the only deployment shape: there is no
-# single-node mode to show off any more. PORT moves the first head; WORKERS=n
-# scales the follower pool.
+# Both pools scale, which is the point:
+#
+#   * heads on CPU, via a HorizontalPodAutoscaler over the metrics-server k3s
+#     already ships — the read path is CPU-bound, and the load generator is what
+#     moves it;
+#   * followers on freshness DEBT, read straight off GET /_ops_/freshness by
+#     KEDA's metrics-api scaler with no metrics pipeline in between, all the way
+#     down to zero when nothing is stale.
+#
+# The seeded areas carry a 5m targetTTL, so the whole working set re-stales at
+# once every five minutes and both pools cycle unattended. Leave it running.
+#
+# Manifests live in deploy/base (what beeline is) plus deploy/environments/local
+# (what makes it a laptop demo). Needs Docker, kubectl and k3d
+# (`brew install k3d`); it never reads or changes your current kubectl context.
+#
+# This is the only demo, because it is the only deployment shape. PORT publishes
+# the ingress; WORKER_MAX bounds the follower pool (its size is KEDA's call, not
+# a fixed count); RPS drives the load generator.
+ENVIRONMENT ?= local
 PORT ?= 8080
-WORKERS ?= 8
+WORKER_MAX ?= 8
+RPS ?= 25
+KEEP_CLUSTER ?= false
 .PHONY: demo
 demo:
-	PORT=$(PORT) WORKERS=$(WORKERS) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/demo.sh
+	ENVIRONMENT=$(ENVIRONMENT) PORT=$(PORT) WORKER_MAX=$(WORKER_MAX) RPS=$(RPS) \
+		IMAGE=$(IMAGE) KEEP_CLUSTER=$(KEEP_CLUSTER) CONTAINER_RUNNER=$(CONTAINER_RUNNER) \
+		$(SCRIPTS_DIR)/demo.sh
+
+# demo-down deletes a cluster left behind by KEEP_CLUSTER=true.
+.PHONY: demo-down
+demo-down:
+	k3d cluster delete beeline-$(ENVIRONMENT)
 
 # test runs the whole suite against real Postgres and Redis. The suite
 # provisions its own containers, so nothing silently skips; this target starts

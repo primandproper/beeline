@@ -12,6 +12,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,7 +24,14 @@ import (
 	"github.com/primandproper/platform-go/v7/observability/tracing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// The class 40 SQLSTATEs Postgres resolves by retrying the whole transaction.
+const (
+	pgerrSerializationFailure = "40001"
+	pgerrDeadlockDetected     = "40P01"
 )
 
 // Config tunes the index. TargetTTL is the index-wide freshness default an
@@ -330,9 +338,16 @@ func (i *Index) Bump(ctx context.Context, keys []beeline.PairKey) error {
 	}
 
 	areas, profiles, resolutions, origins, dests := keyColumns(keys)
+	// DISTINCT is load-bearing, not tidiness: ON CONFLICT DO UPDATE refuses to
+	// touch the same row twice in one statement (SQLSTATE 21000), and callers
+	// legitimately pass duplicates — a /table grid whose coordinates collapse
+	// onto one H3 cell pair, or a warm-set feed naming a pair twice. Without it
+	// Postgres rejects the WHOLE batch, so one repeat silently discards every
+	// demand signal alongside it. The memory index, looping over a map, has
+	// always tolerated this; the conformance suite now pins both.
 	if _, err := i.pool.Exec(ctx, `
 		INSERT INTO pair_freshness AS pf (area_id, profile, res, origin, dest, bumped)
-		SELECT area_id, profile, res, origin, dest, TRUE
+		SELECT DISTINCT area_id, profile, res, origin, dest, TRUE
 		FROM unnest($1::bigint[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
 		     AS k(area_id, profile, res, origin, dest)
 		ON CONFLICT (area_id, profile, res, origin, dest) DO UPDATE
@@ -414,34 +429,84 @@ func (i *Index) SweepArea(ctx context.Context, area beeline.AreaID, cutoff time.
 	return scanKeys(rows)
 }
 
+// setAreaFreshnessAttempts bounds the deadlock retry below. Postgres kills one
+// transaction to break a deadlock and expects the loser to try again; the bulk
+// re-derive is the biggest writer in the system and so the usual victim.
+const setAreaFreshnessAttempts = 4
+
 // SetAreaFreshness records an area's freshness contract (target TTL + claim
-// lease; non-positive values fall back to the index-wide defaults) and
-// re-derives the denormalized stale_at of its already-computed pairs so the
-// new TTL takes effect immediately. Enable-time cadence, so the extra UPDATE
-// is rare.
+// lease; non-positive values fall back to the index-wide defaults) and, when
+// that contract actually changed, re-derives the denormalized stale_at of its
+// already-computed pairs so the new TTL takes effect immediately.
+//
+// "When it actually changed" is the whole trick. Callers hit this constantly
+// with values that are already stored: every head runs it per enabled area at
+// boot and again on every config-poll convergence (control.projectAreaLocked,
+// which documents itself as idempotent). Re-deriving unconditionally made each
+// of those a rewrite of every computed row in the area — a six-figure UPDATE per
+// head per area, competing for row locks with the follower pool's MarkComputed
+// writes, which deadlocked and (since it runs during boot) crashlooped the head.
+// Skipping the no-op case is what makes the projection path idempotent in fact
+// and not just in the comment; the retry below covers the genuine change that
+// still collides with live traffic.
+//
+// Skipping is safe because MarkComputed derives stale_at from this same row at
+// mark time, so an unchanged contract cannot leave a stale stale_at behind.
 func (i *Index) SetAreaFreshness(ctx context.Context, area beeline.AreaID, targetTTL, lease time.Duration) error {
+	var err error
+	for attempt := 1; ; attempt++ {
+		if err = i.setAreaFreshness(ctx, area, targetTTL, lease); err == nil {
+			return nil
+		}
+		if attempt >= setAreaFreshnessAttempts || !isSerializationFailure(err) {
+			return err
+		}
+		i.log.WithValues(map[string]any{
+			"area": int64(area), "attempt": attempt, "error": err.Error(),
+		}).Info("retrying area freshness after a serialization failure")
+	}
+}
+
+// setAreaFreshness is one attempt of SetAreaFreshness.
+func (i *Index) setAreaFreshness(ctx context.Context, area beeline.AreaID, targetTTL, lease time.Duration) error {
 	tx, err := i.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("freshness: beginning freshness tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() //nolint:errcheck // rollback after commit is a no-op
 
-	if _, err = tx.Exec(ctx, `
+	// The DO UPDATE ... WHERE suppresses the row entirely when nothing differs,
+	// so RowsAffected is 0 for a genuine no-op and 1 for an insert or a real
+	// change. That is the signal the re-derive below keys off.
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO area_freshness (area_id, target_ttl_seconds, lease_seconds)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (area_id) DO UPDATE
 		SET target_ttl_seconds = excluded.target_ttl_seconds,
-		    lease_seconds      = excluded.lease_seconds`,
-		int64(area), targetTTL.Seconds(), lease.Seconds()); err != nil {
+		    lease_seconds      = excluded.lease_seconds
+		WHERE area_freshness.target_ttl_seconds IS DISTINCT FROM excluded.target_ttl_seconds
+		   OR area_freshness.lease_seconds      IS DISTINCT FROM excluded.lease_seconds`,
+		int64(area), targetTTL.Seconds(), lease.Seconds())
+	if err != nil {
 		return fmt.Errorf("freshness: setting area freshness: %w", err)
 	}
 
-	if _, err = tx.Exec(ctx, `
-		UPDATE pair_freshness
-		SET stale_at = computed_at + make_interval(secs => COALESCE(NULLIF($2, 0), $3))
-		WHERE area_id = $1 AND computed_at IS NOT NULL`,
-		int64(area), targetTTL.Seconds(), i.cfg.TargetTTL.Seconds()); err != nil {
-		return fmt.Errorf("freshness: rederiving stale_at: %w", err)
+	if tag.RowsAffected() > 0 {
+		// The ::float8 casts are load-bearing. Both operands here are parameters,
+		// so without them Postgres infers $2's type from the bare `0` literal,
+		// makes it an integer, and truncates the seconds — a sub-second TTL
+		// becomes 0, which is this expression's "fall back to the index-wide
+		// default" sentinel. The area's override would then be silently ignored
+		// by exactly the statement whose job is to apply it. (The sibling
+		// expressions in Claim and MarkComputed take their NULLIF operand from a
+		// double precision column, so they were never exposed to this.)
+		if _, err = tx.Exec(ctx, `
+			UPDATE pair_freshness
+			SET stale_at = computed_at + make_interval(secs => COALESCE(NULLIF($2::float8, 0), $3::float8))
+			WHERE area_id = $1 AND computed_at IS NOT NULL`,
+			int64(area), targetTTL.Seconds(), i.cfg.TargetTTL.Seconds()); err != nil {
+			return fmt.Errorf("freshness: rederiving stale_at: %w", err)
+		}
 	}
 
 	if err = tx.Commit(ctx); err != nil {
@@ -449,6 +514,20 @@ func (i *Index) SetAreaFreshness(ctx context.Context, area beeline.AreaID, targe
 	}
 
 	return nil
+}
+
+// isSerializationFailure reports whether err is one of the two transient class
+// 40 conditions Postgres resolves by asking the caller to retry the whole
+// transaction: deadlock_detected and serialization_failure. Anything else —
+// including a constraint violation or a dead connection — is the caller's
+// problem and must not be retried.
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+
+	return pgErr.Code == pgerrDeadlockDetected || pgErr.Code == pgerrSerializationFailure
 }
 
 // scanKeys collects (area, profile, res, origin, dest) rows into pair keys.

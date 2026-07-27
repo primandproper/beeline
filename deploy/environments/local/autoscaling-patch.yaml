@@ -1,0 +1,56 @@
+# Laptop sizing for the two autoscalers, plus the namespace-qualified KEDA
+# trigger URL. Everything here is a number; the shapes live in deploy/base.
+#
+# The numbers come from the actual workload. The three seeded Austin areas
+# polyfill to ~370k directed pairs, times three profiles (car, bike, walk), so the
+# working set is ~1.1M. Each area is created with its own targetTTL of 5m — the
+# per-area value wins over the config default — so required throughput is
+# 1.1M / 300s ~= 3,670 pairs/sec.
+#
+# A claim of 256 keys is contiguous in origin order (the index orders by bumped,
+# then computed_at, then origin, dest), so it collapses into one or two dense 1xK
+# table calls, each paying ONE simulated 25-120ms engine hop rather than one per
+# pair. That is roughly 1,700-3,500 pairs/sec per worker thread, so a 4-thread pod
+# does 4-7k/sec and two or three pods already beat the required rate. Postgres,
+# not the engine, is what stops this scaling further.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: beeline-head
+spec:
+  # Two heads, minimum: the "kill a head and the survivors keep the contract"
+  # property is only demonstrable if there is a survivor.
+  minReplicas: 2
+  maxReplicas: 6
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: beeline-worker
+spec:
+  # Zero is reachable and meaningful: no enabled areas means no debt means no
+  # reason to run a compute pool at all.
+  minReplicaCount: 0
+  # 8 x 300m = 2.4 CPU, and 32 worker threads is already past the point where
+  # Postgres is the bottleneck. Raising this would demo a database queue, not a
+  # scaler.
+  maxReplicaCount: 8
+  triggers:
+    - type: metrics-api
+      metadata:
+        # keda-operator lives in the `keda` namespace and resolves this from
+        # there, so it must be fully qualified against ours.
+        url: "http://beeline-head.beeline-local.svc.cluster.local:8080/_ops_/freshness"
+        format: "json"
+        valueLocation: "debt"
+        # Debt per replica (AverageValue), i.e. replicas = ceil(debt / 50000).
+        # Against a cold-start debt of ~1.1M that asks for the full pool
+        # immediately, then walks down a visible staircase as debt burns:
+        # 400k -> 8, 200k -> 4, 100k -> 2, 50k -> 1.
+        targetValue: "50000"
+        # Compared against the RAW debt, not the per-replica figure. 5,000 out of a
+        # 1.1M working set is 0.45%, so reaching zero means the pool genuinely
+        # caught up rather than rounded down to it.
+        activationTargetValue: "5000"
+        timeout: "5s"

@@ -1,0 +1,26 @@
+# What beeline *is*: two roles, how they are exposed, and the shape of their
+# autoscalers. Nothing in here decides where it runs.
+#
+# This base is not applied directly — pick an environment:
+#
+#   kubectl apply -k deploy/environments/local
+#
+# The environment supplies everything this base only names: the
+# `beeline-postgres` Secret, the `beeline-head-env` / `beeline-worker-env`
+# ConfigMaps, the image tag, the namespace, and the autoscaler bounds. A
+# deployment against managed Postgres and Redis changes those and nothing here.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - head.yaml
+  - head-hpa.yaml
+  - worker.yaml
+  - worker-scaledobject.yaml
+  - ingress.yaml
+
+# Not `commonLabels`: that variant also rewrites selectors, which would bake the
+# environment name into an immutable Deployment selector.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: beeline

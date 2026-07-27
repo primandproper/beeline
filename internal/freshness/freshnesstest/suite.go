@@ -249,6 +249,102 @@ func Run(t *testing.T, factory Factory) {
 		assert.Len(t, due, 1, "the 400ms area TTL made it due despite the 1h default")
 	})
 
+	t.Run("bumping the same pair twice in one batch is not an error", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Millisecond)
+
+		// Callers legitimately repeat a key inside one batch: a /table grid whose
+		// coordinates collapse onto one H3 cell pair, or a warm-set feed naming a
+		// pair twice. The map-based memory index never noticed; the Postgres index
+		// used to reject the WHOLE statement with SQLSTATE 21000 ("ON CONFLICT DO
+		// UPDATE command cannot affect row a second time"), silently discarding
+		// every other pair's demand signal along with the duplicate.
+		dup := key(117, 1, 2)
+		other := key(117, 3, 4)
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{dup, other}))
+		require.NoError(t, idx.MarkComputed(ctx, []beeline.PairKey{dup, other}, time.Now()))
+		time.Sleep(50 * time.Millisecond) // both past the 1ms TTL — equally stale
+
+		require.NoError(t, idx.Bump(ctx, []beeline.PairKey{dup, other, dup, dup}),
+			"a duplicated key in one batch must not fail the batch")
+
+		claimed, err := idx.Claim(ctx, 2, time.Minute)
+		require.NoError(t, err)
+		assert.Equal(t, keySet([]beeline.PairKey{dup, other}), keySet(claimed),
+			"the duplicate's neighbors keep their bump")
+	})
+
+	t.Run("bumping only unknown duplicate keys still tracks them once", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Hour)
+
+		// The same duplicate hazard on the insert side: an unseeded key repeated in
+		// one batch has no existing row to conflict with the first time and one the
+		// second time, all inside a single statement.
+		k := key(118, 1, 2)
+		require.NoError(t, idx.Bump(ctx, []beeline.PairKey{k, k}))
+
+		claimed, err := idx.Claim(ctx, 10, time.Minute)
+		require.NoError(t, err)
+		assert.Equal(t, []beeline.PairKey{k}, claimed,
+			"a repeated unknown key joins the working set exactly once")
+	})
+
+	t.Run("re-registering an unchanged area contract preserves freshness", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Hour)
+
+		// Every head calls SetAreaFreshness per enabled area at boot and again on
+		// every config-poll convergence, almost always with the values already
+		// stored. That repeat has to be a genuine no-op: it must not disturb
+		// freshness, and (on the Postgres index) it must not rewrite every computed
+		// row in the area, which is what used to deadlock against the follower
+		// pool's concurrent MarkComputed writes and crashloop the booting head.
+		k := key(119, 1, 2)
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{k}))
+		require.NoError(t, idx.SetAreaFreshness(ctx, 119, time.Hour, 0))
+
+		claimed, err := idx.Claim(ctx, 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		require.NoError(t, idx.MarkComputed(ctx, claimed, time.Now()))
+
+		require.NoError(t, idx.SetAreaFreshness(ctx, 119, time.Hour, 0), "re-registering is idempotent")
+
+		due, err := idx.Claim(ctx, 10, time.Minute)
+		require.NoError(t, err)
+		assert.Empty(t, due, "an unchanged contract leaves the computed pair fresh")
+	})
+
+	t.Run("shortening an area TTL re-derives already-computed pairs", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Hour)
+
+		// The flip side of the no-op above: when the contract really does change,
+		// pairs computed under the old TTL must come due against the new one
+		// without waiting to be recomputed first.
+		//
+		// The new TTL is deliberately sub-second. A whole-second value would pass
+		// even against a backend that truncates the override to an integer and
+		// falls back to its index-wide default, which is precisely the bug the
+		// Postgres re-derive shipped with.
+		k := key(120, 1, 2)
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{k}))
+		require.NoError(t, idx.SetAreaFreshness(ctx, 120, time.Hour, 0))
+
+		claimed, err := idx.Claim(ctx, 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		require.NoError(t, idx.MarkComputed(ctx, claimed, time.Now()))
+
+		require.NoError(t, idx.SetAreaFreshness(ctx, 120, 300*time.Millisecond, 0))
+		time.Sleep(900 * time.Millisecond)
+
+		due, err := idx.Claim(ctx, 10, time.Minute)
+		require.NoError(t, err)
+		assert.Len(t, due, 1, "the shortened 300ms TTL made the already-computed pair due")
+	})
+
 	t.Run("invalidate requeues computed pairs", func(t *testing.T) {
 		t.Parallel()
 		idx := factory(t, time.Hour)

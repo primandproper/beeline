@@ -480,19 +480,44 @@ func (i *Index) Bump(_ context.Context, keys []beeline.PairKey) error {
 	return nil
 }
 
-// Invalidate re-enqueues every computed pair older than sel.OlderThan by clearing
-// its ComputedAt, so it sorts to the front of the queue.
-func (i *Index) Invalidate(_ context.Context, sel beeline.Selector) error {
+// Invalidate re-enqueues every computed pair the selector matches by clearing its
+// ComputedAt (so it sorts to the front of the queue) and its lease (so it is
+// claimable at once, even if a worker holds it). Cached estimates are untouched;
+// only the schedule changes. It returns how many pairs were selected.
+func (i *Index) Invalidate(_ context.Context, sel beeline.Selector) (int, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
-	for _, e := range i.entries {
-		if !e.computedAt.IsZero() && e.computedAt.Before(sel.OlderThan) {
-			e.computedAt = time.Time{}
+	var n int
+	for k, e := range i.entries {
+		if !selects(sel, k, e.computedAt) {
+			continue
 		}
+		e.computedAt = time.Time{}
+		e.leaseUntil = time.Time{}
+		n++
 	}
 
-	return nil
+	return n, nil
+}
+
+// selects reports whether one pair falls inside a Selector: computed at all, old
+// enough if an age bound is set, and inside every scope the selector names.
+func selects(sel beeline.Selector, k beeline.PairKey, computedAt time.Time) bool {
+	switch {
+	case computedAt.IsZero(): // never computed: already maximally stale
+		return false
+	case !sel.OlderThan.IsZero() && !computedAt.Before(sel.OlderThan):
+		return false
+	case sel.Area != 0 && k.Area != sel.Area:
+		return false
+	case sel.Res != nil && k.Res != *sel.Res:
+		return false
+	case sel.Profile != "" && k.Profile != sel.Profile:
+		return false
+	default:
+		return true
+	}
 }
 
 // Debt reports the freshness contract signals: working-set size, count of pairs

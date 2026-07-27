@@ -72,6 +72,7 @@ type Index struct {
 	log    logging.Logger
 	pool   *pgxpool.Pool
 	access *accessBuffer
+	bumps  *bumpBatcher
 	stats  *statsCache
 	cfg    Config
 }
@@ -102,13 +103,16 @@ func New(pool *pgxpool.Pool, cfg *Config, log logging.Logger) (*Index, error) {
 		stats: stats,
 	}
 	i.access = newAccessBuffer(i, cfg.Clock, cfg.AccessFlushInterval, cfg.AccessFlushLimit)
+	i.bumps = newBumpBatcher(i)
 
 	return i, nil
 }
 
-// Close stops the access flusher and drains anything still buffered.
+// Close stops the access flusher and the bump batcher, draining whatever each
+// still holds. Both are drained even if the first fails: leaving a bump's
+// waiters parked would outlive the shutdown that is trying to release them.
 func (i *Index) Close(ctx context.Context) error {
-	return i.access.close(ctx)
+	return errors.Join(i.access.close(ctx), i.bumps.close(ctx))
 }
 
 // keyColumns splits keys into the five parallel arrays every unnest join uses.
@@ -332,31 +336,18 @@ func (i *Index) MarkComputed(ctx context.Context, keys []beeline.PairKey, _ time
 // Bump raises refresh priority for demand-driven pairs (stale-while-
 // revalidate), adding unknown keys as unpinned demand entries; a bump is also
 // an access.
+//
+// The write is merged with every other bump in flight on this head (see
+// bumpBatcher) and the caller blocks until its own keys land, so the
+// read-your-write contract holds — bump, then claim, and the bumped pair comes
+// first — while the read path can no longer put one upsert per request on the
+// pool.
 func (i *Index) Bump(ctx context.Context, keys []beeline.PairKey) error {
 	if len(keys) == 0 {
 		return nil
 	}
 
-	areas, profiles, resolutions, origins, dests := keyColumns(keys)
-	// DISTINCT is load-bearing, not tidiness: ON CONFLICT DO UPDATE refuses to
-	// touch the same row twice in one statement (SQLSTATE 21000), and callers
-	// legitimately pass duplicates — a /table grid whose coordinates collapse
-	// onto one H3 cell pair, or a warm-set feed naming a pair twice. Without it
-	// Postgres rejects the WHOLE batch, so one repeat silently discards every
-	// demand signal alongside it. The memory index, looping over a map, has
-	// always tolerated this; the conformance suite now pins both.
-	if _, err := i.pool.Exec(ctx, `
-		INSERT INTO pair_freshness AS pf (area_id, profile, res, origin, dest, bumped)
-		SELECT DISTINCT area_id, profile, res, origin, dest, TRUE
-		FROM unnest($1::bigint[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
-		     AS k(area_id, profile, res, origin, dest)
-		ON CONFLICT (area_id, profile, res, origin, dest) DO UPDATE
-		SET bumped = TRUE, last_access = now()`,
-		areas, profiles, resolutions, origins, dests); err != nil {
-		return fmt.Errorf("freshness: bumping: %w", err)
-	}
-
-	return nil
+	return i.bumps.bump(ctx, keys)
 }
 
 // Access records that pairs were queried: unknown keys join the working set as
@@ -371,23 +362,65 @@ func (i *Index) Access(_ context.Context, keys []beeline.PairKey) error {
 	return nil
 }
 
-// Invalidate re-enqueues every computed pair older than sel.OlderThan by
-// clearing its computed_at, so it sorts to the front of the queue.
-func (i *Index) Invalidate(ctx context.Context, sel beeline.Selector) error {
-	if _, err := i.pool.Exec(ctx, `
-		UPDATE pair_freshness SET computed_at = NULL, stale_at = NULL
-		WHERE computed_at IS NOT NULL AND computed_at < $1`, sel.OlderThan); err != nil {
-		return fmt.Errorf("freshness: invalidating: %w", err)
+// Invalidate re-enqueues every computed pair the selector matches by clearing its
+// computed_at/stale_at (so it sorts to the front of the claim order, which reads
+// NULLS FIRST) and releasing any lease on it (so a pair claimed moments earlier is
+// immediately re-claimable rather than swallowing the invalidation). Cached
+// estimates in the store are untouched: only the schedule changes.
+//
+// Each scope is expressed as a nullable parameter so one plan serves every
+// combination; area+res is the operator's layer invalidation and rides the primary
+// key's leading column. It returns how many rows were re-enqueued.
+func (i *Index) Invalidate(ctx context.Context, sel beeline.Selector) (int, error) {
+	var (
+		olderThan *time.Time
+		area      *int64
+		res       *int16
+		profile   *string
+	)
+	if !sel.OlderThan.IsZero() {
+		olderThan = &sel.OlderThan
+	}
+	if sel.Area != 0 {
+		id := int64(sel.Area)
+		area = &id
+	}
+	if sel.Res != nil {
+		r := int16(*sel.Res) // an H3 resolution is 0-15; the HTTP edge rejects anything else
+		res = &r
+	}
+	if sel.Profile != "" {
+		p := string(sel.Profile)
+		profile = &p
 	}
 
-	return nil
+	tag, err := i.pool.Exec(ctx, `
+		UPDATE pair_freshness
+		SET computed_at = NULL, stale_at = NULL, lease_until = 'epoch'
+		WHERE computed_at IS NOT NULL
+		  AND ($1::timestamptz IS NULL OR computed_at < $1)
+		  AND ($2::bigint IS NULL OR area_id = $2)
+		  AND ($3::smallint IS NULL OR res = $3)
+		  AND ($4::text IS NULL OR profile = $4)`,
+		olderThan, area, res, profile)
+	if err != nil {
+		return 0, fmt.Errorf("freshness: invalidating: %w", err)
+	}
+
+	// The memoized debt/cells aggregates would otherwise report the pre-invalidation
+	// working set for another StatsCacheTTL, which is exactly the moment an operator
+	// is watching the console for the debt spike they just caused.
+	i.stats.purge(ctx)
+
+	return int(tag.RowsAffected()), nil
 }
 
 // Unseed removes every pair belonging to one area, plus its freshness override
-// and throughput baseline. Buffered accesses for the area are discarded so a
-// later flush cannot resurrect its pairs.
+// and throughput baseline. Buffered accesses and bumps for the area are
+// discarded so a later flush cannot resurrect its pairs.
 func (i *Index) Unseed(ctx context.Context, area beeline.AreaID) error {
 	i.access.dropArea(area)
+	i.bumps.dropArea(area)
 
 	tx, err := i.pool.Begin(ctx)
 	if err != nil {

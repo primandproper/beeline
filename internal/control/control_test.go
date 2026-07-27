@@ -144,6 +144,41 @@ func layers1(maxRadius, coreRadius float64) []beeline.Layer {
 	return []beeline.Layer{{Resolution: testRes, MaxRadiusMeters: maxRadius, CoreRadiusMeters: coreRadius}}
 }
 
+// drainClaims computes the whole due working set the way the refresh pool would —
+// claim, write the estimate, mark computed — until nothing is claimable, and returns
+// how many pairs it computed. It is how a test gets an area to "fully fresh" before
+// exercising invalidation.
+func drainClaims(t *testing.T, h *harness) int {
+	t.Helper()
+
+	ctx := context.Background()
+	var total int
+	for {
+		claimed, err := h.index.Claim(ctx, 10_000, time.Minute)
+		require.NoError(t, err)
+		if len(claimed) == 0 {
+			return total
+		}
+
+		entries := make([]beeline.Entry, 0, len(claimed))
+		for i := range claimed {
+			entries = append(entries, beeline.Entry{
+				Key:    claimed[i],
+				Stored: beeline.Stored{ComputedAt: time.Now(), Estimate: beeline.Estimate{Duration: 60, Distance: 1000}},
+			})
+		}
+		require.NoError(t, h.store.Put(ctx, entries))
+		require.NoError(t, h.index.MarkComputed(ctx, claimed, time.Now()))
+		total += len(claimed)
+	}
+}
+
+// ptr is the optional-scalar helper the invalidation input needs (resolution 0 is a
+// real H3 resolution, so nil is the only way to say "every layer").
+//
+//go:fix inline
+func ptr[T any](v T) *T { return new(v) }
+
 // resolutions projects a layer list to its resolution order.
 func resolutions(layers []beeline.Layer) []int {
 	out := make([]int, 0, len(layers))
@@ -985,4 +1020,85 @@ func TestWarmPairsSeedModeSurvivesSweep(t *testing.T) {
 	want := pair
 	want.Area = area.ID
 	assert.Equal(t, []beeline.PairKey{want}, claimed, "and is claimable at top priority")
+}
+
+func TestInvalidateScopesToOneLayer(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+
+	// The same ~9 km two-layer geometry as TestMultiLayerEnableSeedsEveryLayer: both
+	// res-8 and res-7 polyfills are non-empty, so the layers can be told apart by the
+	// resolution of the pairs left due after an invalidation.
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name:    "invalidate",
+		GeoJSON: diskGeoJSON(t, 4),
+		Layers: []beeline.Layer{
+			{Resolution: testRes, MaxRadiusMeters: 3000},
+			{Resolution: 7, MinDistanceMeters: 2000, MaxRadiusMeters: 6000},
+		},
+	})
+	_, err := h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	// Compute the whole working set, both layers, so nothing is due.
+	drainClaims(t, h)
+	debt, err := h.index.DebtForArea(ctx, area.ID)
+	require.NoError(t, err)
+	require.Zero(t, debt.Debt, "the whole area is fresh before the invalidation")
+	total := debt.WorkingSet
+
+	n, err := h.coord.Invalidate(ctx, area.ID, &control.InvalidateInput{Resolution: new(7)})
+	require.NoError(t, err)
+	assert.Positive(t, n)
+	assert.Less(t, n, total, "the res-8 layer was left alone")
+
+	// Everything now due belongs to the invalidated layer, and the count matches.
+	due, err := h.index.Claim(ctx, total, time.Minute)
+	require.NoError(t, err)
+	assert.Len(t, due, n, "exactly the invalidated pairs are claimable")
+	for i := range due {
+		assert.Equal(t, 7, due[i].Res, "only the res-7 layer was invalidated")
+		assert.Equal(t, area.ID, due[i].Area)
+	}
+
+	// The estimates themselves are untouched: invalidation reschedules, it does not
+	// evict, so reads keep answering from cache while the pool catches up.
+	stored, err := h.store.BatchGet(ctx, due[:1])
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.NotNil(t, stored[0], "the cached estimate survives its own invalidation")
+}
+
+func TestInvalidateValidation(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newHarness(t)
+	area := createAreaWith(t, h, &control.CreateAreaInput{
+		Name: "invalidate-validation", GeoJSON: diskGeoJSON(t, 1), Layers: layers1(1500, 0),
+	})
+
+	// Not enabled yet: there are no pairs in the index to re-enqueue.
+	_, err := h.coord.Invalidate(ctx, area.ID, nil)
+	require.ErrorIs(t, err, control.ErrInvalidInvalidation)
+
+	_, err = h.coord.Enable(ctx, area.ID)
+	require.NoError(t, err)
+
+	_, err = h.coord.Invalidate(ctx, area.ID, &control.InvalidateInput{Resolution: new(testRes + 1)})
+	require.ErrorIs(t, err, control.ErrInvalidInvalidation, "a resolution the area has no layer for is rejected")
+
+	_, err = h.coord.Invalidate(ctx, area.ID, &control.InvalidateInput{Profile: "hovercraft"})
+	require.ErrorIs(t, err, control.ErrInvalidInvalidation, "an unknown profile is rejected")
+
+	_, err = h.coord.Invalidate(ctx, area.ID+999, nil)
+	require.ErrorIs(t, err, control.ErrInvalidInvalidation, "an unknown area is rejected")
+
+	// A nil input is the whole-area form: every layer, every profile.
+	drainClaims(t, h)
+	n, err := h.coord.Invalidate(ctx, area.ID, nil)
+	require.NoError(t, err)
+	assert.Positive(t, n)
 }

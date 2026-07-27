@@ -18,6 +18,16 @@
   var h3 = window.h3;
   var L = window.L;
 
+  // HOVER_NEIGHBORS caps how many adjacent cells the hover overlay annotates with
+  // cached duration/distance from the hovered cell (nearest rings first).
+  var HOVER_NEIGHBORS = 100;
+
+  // How long the area list waits for an answer, and how it backs off between
+  // retries once it stops getting one.
+  var AREAS_TIMEOUT_MS = 8000;
+  var AREAS_RETRY_MIN_MS = 1000;
+  var AREAS_RETRY_MAX_MS = 15000;
+
   // ---- State ----------------------------------------------------------------
   var areas = [];            // list rows from /_config_/areas
   var selectedId = null;     // currently selected area id
@@ -30,10 +40,9 @@
   var hoverTimer = null;     // debounce for the hover estimate probe
   var hoverAbort = null;     // in-flight hover fetch, cancelled on move-away
   var toastTimer;
-
-  // HOVER_NEIGHBORS caps how many adjacent cells the hover overlay annotates with
-  // cached duration/distance from the hovered cell (nearest rings first).
-  var HOVER_NEIGHBORS = 100;
+  var areasError = null;     // last area-list failure, shown in place of the empty hint
+  var areasRetry = null;     // pending area-list retry timer
+  var areasRetryDelay = AREAS_RETRY_MIN_MS;
 
   function id(x) { return document.getElementById(x); }
   var els = {
@@ -204,16 +213,73 @@
   }
 
   // ---- Areas list -----------------------------------------------------------
+  // refreshAreas re-lists the areas. Its failure is shown and retried rather
+  // than swallowed, because the two states are not distinguishable to the eye:
+  // a head that accepts the request and never answers (a starved connection
+  // pool does exactly this) used to leave the sidebar with no rows, no "no
+  // areas yet" hint and no error — identical to a healthy but empty registry —
+  // since the boot fetch's rejection went to a no-op handler and nothing ever
+  // re-listed. Resolves either way, so callers can keep chaining off it.
   function refreshAreas() {
-    return fetch("/_config_/areas").then(jsonOk).then(function (rows) {
-      areas = rows || [];
-      renderAreasList();
-    }).catch(noop);
+    clearAreasRetry();
+
+    return fetchWithTimeout("/_config_/areas", AREAS_TIMEOUT_MS)
+      .then(jsonOk)
+      .then(function (rows) {
+        areas = rows || [];
+        areasError = null;
+        areasRetryDelay = AREAS_RETRY_MIN_MS;
+        renderAreasList();
+      })
+      .catch(function (err) {
+        // An abort is our own timeout firing, whose message ("The operation was
+        // aborted") describes the client, not what went wrong.
+        areasError = err.name === "AbortError" ? "no response in " + (AREAS_TIMEOUT_MS / 1000) + "s" : err.message;
+        renderAreasList();
+        scheduleAreasRetry();
+      });
+  }
+
+  // scheduleAreasRetry re-lists on a backoff so the console heals by itself once
+  // the head recovers — the poll loop only refreshes the *selected* area, so
+  // without this a single failure is permanent until a manual reload.
+  function scheduleAreasRetry() {
+    clearAreasRetry();
+    areasRetry = setTimeout(refreshAreas, areasRetryDelay);
+    areasRetryDelay = Math.min(areasRetryDelay * 2, AREAS_RETRY_MAX_MS);
+  }
+
+  function clearAreasRetry() {
+    if (areasRetry) clearTimeout(areasRetry);
+    areasRetry = null;
+  }
+
+  // renderAreasError puts the failure where the areas would have been, with the
+  // retry countdown already running and a button to skip the wait.
+  function renderAreasError() {
+    var box = document.createElement("div");
+    box.className = "areas-error";
+
+    var msg = document.createElement("span");
+    msg.textContent = "Can't list areas: " + areasError;
+
+    var retry = document.createElement("button");
+    retry.className = "ghost";
+    retry.type = "button";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", refreshAreas);
+
+    box.appendChild(msg);
+    box.appendChild(retry);
+    els.list.appendChild(box);
   }
 
   function renderAreasList() {
     els.list.innerHTML = "";
-    els.empty.hidden = areas.length > 0;
+    // "No areas yet" is a claim about the registry, so it is only honest when
+    // the registry actually answered; a failed list shows the error instead.
+    els.empty.hidden = areas.length > 0 || areasError != null;
+    if (areasError != null) renderAreasError();
     areas.forEach(function (a) {
       var row = document.createElement("div");
       row.className = "area-row" + (a.id === selectedId ? " selected" : "");
@@ -307,7 +373,9 @@
 
   // renderLayersTable paints the precision-layers table, finest first. Rows are
   // clickable: the selected row is the layer drawn (and freshness-painted) on the
-  // map. Layer *config* stays display-only — reshape layers via the API.
+  // map. Layer *config* stays display-only — reshape layers via the API — but each
+  // row carries a cache-invalidation button (enabled areas only; a disabled area
+  // has no pairs in the freshness index to re-enqueue).
   function renderLayersTable(layers) {
     var tbody = els.detailLayers.querySelector("tbody");
     tbody.innerHTML = "";
@@ -328,9 +396,47 @@
         td.textContent = text;
         tr.appendChild(td);
       });
+
+      var actions = document.createElement("td");
+      if (detail && detail.enabled) {
+        var btn = document.createElement("button");
+        btn.className = "layer-action ghost danger";
+        btn.type = "button";
+        btn.textContent = "Invalidate";
+        btn.title = "Re-enqueue this layer's cached pairs for refresh (cached values keep serving reads meanwhile)";
+        btn.addEventListener("click", function (ev) {
+          ev.stopPropagation(); // the row click selects the layer; the button must not
+          invalidateLayer(l.resolution, btn);
+        });
+        actions.appendChild(btn);
+      }
+      tr.appendChild(actions);
+
       tr.addEventListener("click", function () { setActiveLayer(l.resolution); });
       tbody.appendChild(tr);
     });
+  }
+
+  // invalidateLayer re-enqueues one precision layer's cached pairs for refresh. The
+  // estimates themselves survive — reads keep being answered from cache throughout —
+  // so the only visible effect is a debt spike the pool then burns down, which is why
+  // we poll immediately after.
+  function invalidateLayer(res, btn) {
+    if (!selectedId || !detail) return;
+    if (!window.confirm(
+      'Invalidate res ' + res + ' of "' + detail.name + '"?\n\n' +
+      "Its cached pairs go to the front of the refresh queue. The cached values are " +
+      "not dropped — reads keep being answered from them until they are recomputed."
+    )) return;
+
+    btn.disabled = true;
+    postJSON("/_config_/areas/" + selectedId + "/invalidate?resolution=" + res, null)
+      .then(function (r) {
+        toast("res " + res + ": " + (r.invalidated || 0).toLocaleString() + " pairs queued for refresh");
+        pollOnce();
+      })
+      .catch(function (err) { toast(err.message, true); })
+      .finally(function () { btn.disabled = false; });
   }
 
   // setActiveLayer switches the map to another of the area's layers: redraw its
@@ -654,6 +760,17 @@
   function jsonOk(r) {
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
+  }
+
+  // fetchWithTimeout rejects with an AbortError once ms have passed without an
+  // answer. fetch itself has no timeout: a server that accepts the connection
+  // and then stalls — the shape of a starved connection pool — leaves the
+  // promise pending forever, so no amount of error handling downstream can see it.
+  function fetchWithTimeout(url, ms) {
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, ms);
+
+    return fetch(url, { signal: ctl.signal }).finally(function () { clearTimeout(timer); });
   }
 
   function noop() {}

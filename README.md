@@ -128,8 +128,10 @@ it is the area's canonical geometry), and create it. The area starts **disabled*
 Flip it **On** and the refresh loop begins filling it with H3 cells. An area carries
 one or more **precision layers** (H3 resolutions, DoorDash-style); each layer's cell
 set is derived from the polygon and precomputed independently. The console creates
-one-layer areas; add more layers via the HTTP API. Multiple areas can be enabled at
-once; the progress overlay paints the selected one.
+one-layer areas; add more layers via the HTTP API. Each layer's row carries an
+**Invalidate** button that re-queues just that layer's cached pairs for refresh (the
+cached values are not dropped; reads keep being answered from them until recomputed).
+Multiple areas can be enabled at once; the progress overlay paints the selected one.
 
 Everything the console does is a plain HTTP call — drive it with curl too:
 
@@ -148,6 +150,14 @@ curl -sX POST localhost:8080/_config_/areas/1/enable
 curl 'localhost:8080/_ops_/freshness?area=1'   # §3 debt/throughput contract (watch it drain)
 curl 'localhost:8080/_ops_/cells?area=1'       # per-origin-cell freshness rollup (the console's overlay)
 curl 'localhost:8080/estimate?origin=30.34,-98.02&dest=30.35,-98.00&profile=car'
+
+# invalidate a cache: re-enqueue pairs at the front of the refresh queue. scope it to
+# one precision layer with ?resolution= (and/or one profile with ?profile=); no query
+# string invalidates the whole area. cached estimates are not dropped — reads keep being
+# answered from them until a worker recomputes — so this spends refresh throughput, not
+# read latency. watch it land in /_ops_/freshness.
+curl -sX POST 'localhost:8080/_config_/areas/1/invalidate?resolution=8'
+
 curl -sX POST localhost:8080/_config_/areas/1/disable   # stop refreshing it; its pairs leave the working set
 ```
 

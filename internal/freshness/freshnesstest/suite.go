@@ -42,12 +42,18 @@ type Factory func(tb testing.TB, targetTTL time.Duration) Index
 // subtest, so shared backends (one Postgres schema per test binary run) don't
 // cross-contaminate.
 func key(area beeline.AreaID, origin, dest int) beeline.PairKey {
+	return keyAt(area, origin, dest, 8)
+}
+
+// keyAt is key with an explicit resolution, for the cases that need more than one
+// precision layer of the same area (layer-scoped invalidation).
+func keyAt(area beeline.AreaID, origin, dest, res int) beeline.PairKey {
 	return beeline.PairKey{
 		Profile: "car",
 		Area:    area,
 		Origin:  beeline.H3Cell(origin),
 		Dest:    beeline.H3Cell(dest),
-		Res:     8,
+		Res:     res,
 	}
 }
 
@@ -355,7 +361,9 @@ func Run(t *testing.T, factory Factory) {
 		require.NoError(t, err)
 		require.NoError(t, idx.MarkComputed(ctx, claimed, time.Now()))
 
-		require.NoError(t, idx.Invalidate(ctx, beeline.Selector{OlderThan: time.Now().Add(time.Hour)}))
+		n, err := idx.Invalidate(ctx, beeline.Selector{OlderThan: time.Now().Add(time.Hour)})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n, "the count reports what was re-enqueued")
 
 		due, err := idx.Claim(ctx, 10, time.Minute)
 		require.NoError(t, err)
@@ -364,6 +372,85 @@ func Run(t *testing.T, factory Factory) {
 		stats, err := idx.DebtForArea(ctx, 111)
 		require.NoError(t, err)
 		assert.Equal(t, 1, stats.Debt)
+	})
+
+	t.Run("invalidate ignores never-computed pairs", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Hour)
+
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{key(121, 1, 2)}))
+
+		n, err := idx.Invalidate(ctx, beeline.Selector{})
+		require.NoError(t, err)
+		assert.Zero(t, n, "a pair that was never computed is already maximally stale")
+	})
+
+	t.Run("invalidate scopes to one area's precision layer", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Hour)
+
+		// Two layers of one area, plus the same layer of a second area: only the
+		// (area, res) pair named by the selector may be re-enqueued.
+		fine := keyAt(122, 1, 2, 9)
+		coarse := keyAt(122, 3, 4, 7)
+		other := keyAt(123, 5, 6, 9)
+		all := []beeline.PairKey{fine, coarse, other}
+
+		require.NoError(t, idx.Seed(ctx, all))
+		require.NoError(t, idx.MarkComputed(ctx, all, time.Now()))
+
+		res := 9
+		n, err := idx.Invalidate(ctx, beeline.Selector{Area: 122, Res: &res})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n, "only area 122's res-9 layer is selected")
+
+		due, err := idx.Claim(ctx, 10, time.Minute)
+		require.NoError(t, err)
+		assert.Equal(t, map[beeline.PairKey]bool{fine: true}, keySet(due),
+			"the other layer and the other area stay fresh")
+	})
+
+	t.Run("invalidate scopes to one profile", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, time.Hour)
+
+		car := keyAt(124, 1, 2, 8)
+		bike := car
+		bike.Profile = "bike"
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{car, bike}))
+		require.NoError(t, idx.MarkComputed(ctx, []beeline.PairKey{car, bike}, time.Now()))
+
+		n, err := idx.Invalidate(ctx, beeline.Selector{Area: 124, Profile: "bike"})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+
+		due, err := idx.Claim(ctx, 10, time.Minute)
+		require.NoError(t, err)
+		assert.Equal(t, map[beeline.PairKey]bool{bike: true}, keySet(due))
+	})
+
+	t.Run("invalidate releases an outstanding lease", func(t *testing.T) {
+		t.Parallel()
+		idx := factory(t, 200*time.Millisecond)
+
+		k := key(125, 1, 2)
+		require.NoError(t, idx.Seed(ctx, []beeline.PairKey{k}))
+		require.NoError(t, idx.MarkComputed(ctx, []beeline.PairKey{k}, time.Now()))
+
+		// Wait out the TTL so the pair is due, then lease it: the pair is now both
+		// computed and in flight, the case an invalidation must not lose.
+		time.Sleep(600 * time.Millisecond)
+		claimed, err := idx.Claim(ctx, 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		n, err := idx.Invalidate(ctx, beeline.Selector{Area: 125})
+		require.NoError(t, err)
+		assert.Equal(t, 1, n)
+
+		due, err := idx.Claim(ctx, 10, time.Minute)
+		require.NoError(t, err)
+		assert.Len(t, due, 1, "the invalidated pair is claimable without waiting out the lease")
 	})
 
 	t.Run("marking unknown keys is a no-op", func(t *testing.T) {

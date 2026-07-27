@@ -174,13 +174,18 @@ type execer interface {
 // flushAccess upserts one batch of access stamps: unknown keys become unpinned
 // never-computed demand entries (their last_access defaults to now()), known
 // keys get their last_access refreshed.
+//
+// The ORDER BY puts this statement on the same total row-lock order as bumpKeys
+// — the two upserts share this table, and one ordering them without the other
+// would still leave a deadlock cycle between them.
 func flushAccess(ctx context.Context, db execer, keys []beeline.PairKey) error {
 	areas, profiles, resolutions, origins, dests := keyColumns(keys)
 	if _, err := db.Exec(ctx, `
 		INSERT INTO pair_freshness (area_id, profile, res, origin, dest)
-		SELECT area_id, profile, res, origin, dest
+		SELECT DISTINCT area_id, profile, res, origin, dest
 		FROM unnest($1::bigint[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
 		     AS k(area_id, profile, res, origin, dest)
+		ORDER BY area_id, profile, res, origin, dest
 		ON CONFLICT (area_id, profile, res, origin, dest) DO UPDATE
 		SET last_access = now()`,
 		areas, profiles, resolutions, origins, dests); err != nil {

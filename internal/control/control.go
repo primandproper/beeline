@@ -62,6 +62,10 @@ type AreaIndex interface {
 	// entries), the decayable half of the model-driven warm feed.
 	Bump(ctx context.Context, keys []beeline.PairKey) error
 	Unseed(ctx context.Context, area beeline.AreaID) error
+	// Invalidate re-enqueues the computed pairs a selector matches, returning how
+	// many. The coordinator scopes it to one area (and optionally one of that
+	// area's precision layers) for operator-driven cache invalidation.
+	Invalidate(ctx context.Context, sel beeline.Selector) (int, error)
 	SweepArea(ctx context.Context, area beeline.AreaID, cutoff time.Time) ([]beeline.PairKey, error)
 	CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error)
 	DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.DebtStats, error)
@@ -1051,6 +1055,77 @@ func (c *Coordinator) validateWarmPair(finest *enabledLayer, p *beeline.PairKey)
 	}
 
 	return nil
+}
+
+// ErrInvalidInvalidation marks an invalidation request the coordinator rejected: an
+// area that is not enabled (its pairs are not in the index at all), a resolution the
+// area has no precision layer for, or an unknown profile. It maps to 400 at the HTTP
+// edge. Naming a layer that does not exist is an error rather than a silent
+// zero-row no-op precisely because the operator's next move depends on the answer.
+var ErrInvalidInvalidation = errors.New("control: invalid invalidation request")
+
+// InvalidateInput scopes an invalidation within one area. Both fields are
+// optional and narrow the selection: the zero value invalidates every cached pair
+// of the area, across all its layers and profiles.
+type InvalidateInput struct {
+	// Resolution names one of the area's precision layers. Nil means every layer.
+	// A resolution the area has no layer for is rejected.
+	Resolution *int
+	// Profile names one routing profile. Empty means every profile.
+	Profile beeline.Profile
+}
+
+// Invalidate re-enqueues an enabled area's cached pairs for refresh, optionally
+// scoped to one precision layer and/or profile, and reports how many pairs it
+// moved. It is the operator's answer to "the routing data behind this layer
+// changed": the layer's pairs go to the front of the refresh queue (ahead of every
+// merely-stale pair, behind live demand bumps) and the pool recomputes them at the
+// area's normal throughput.
+//
+// It deliberately does not touch the hot store, so invalidating a million-pair layer
+// spends refresh throughput, not read latency, and /_ops_/freshness shows the debt
+// spike and burn-down as it happens. The tradeoff is that the invalidation is
+// invisible on the read path: reads keep serving the pre-invalidation value for as
+// long as the burn-down takes, and report it as fresh, because staleness there is
+// measured from the stored estimate's own age against the area TTL. A layer whose
+// cached values must not be served again wants disable/enable, which drops the
+// estimates outright.
+//
+// Only enabled areas can be invalidated: a disabled area has no pairs in the index
+// to re-enqueue, and enabling it seeds them as never-computed anyway.
+func (c *Coordinator) Invalidate(ctx context.Context, id beeline.AreaID, in *InvalidateInput) (int, error) {
+	if in == nil {
+		in = &InvalidateInput{}
+	}
+
+	c.mu.RLock()
+	ea, ok := c.enabled[id]
+	if !ok {
+		c.mu.RUnlock()
+
+		return 0, fmt.Errorf("%w: area %d is not enabled", ErrInvalidInvalidation, id)
+	}
+	resolutions := make([]int, 0, len(ea.layers))
+	for i := range ea.layers {
+		resolutions = append(resolutions, ea.layers[i].resolution)
+	}
+	c.mu.RUnlock()
+
+	if in.Resolution != nil && !slices.Contains(resolutions, *in.Resolution) {
+		return 0, fmt.Errorf("%w: area %d has no precision layer at resolution %d (layers: %v)",
+			ErrInvalidInvalidation, id, *in.Resolution, resolutions)
+	}
+	if in.Profile != "" && !slices.Contains(c.profiles, in.Profile) {
+		return 0, fmt.Errorf("%w: unknown profile %q", ErrInvalidInvalidation, in.Profile)
+	}
+
+	// Outside the lock, like WarmPairs: the index serializes on its own, and a
+	// concurrent disable at worst re-enqueues pairs its Unseed then removes.
+	return c.index.Invalidate(ctx, beeline.Selector{
+		Area:    id,
+		Res:     in.Resolution,
+		Profile: in.Profile,
+	})
 }
 
 // persistAndConvergeLocked writes area and, if it is enabled, re-converges its working

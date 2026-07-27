@@ -74,6 +74,22 @@ type FreshnessIndex interface {
 	// without raising refresh priority the way Bump does. It is the demand-fill and
 	// fresh-hit signal that keeps actively-queried pairs alive against the sweep.
 	Access(ctx context.Context, keys []PairKey) error
-	Invalidate(ctx context.Context, sel Selector) error
+	// Invalidate re-enqueues every computed pair matching sel by forgetting when
+	// it was computed, and returns how many pairs it selected. The pairs sort to
+	// the front of the queue (ahead of every computed pair, behind live
+	// demand bumps) and become immediately claimable — an outstanding lease on a
+	// selected pair is released, so the invalidation cannot be swallowed by a
+	// worker that claimed the pair moments earlier. That worker's late submit is
+	// still accepted, exactly as any other duplicate compute is: at most one
+	// batch's worth of pairs can land a pre-invalidation value and wait a further
+	// TTL, which is the same at-least-once bargain Claim/MarkComputed already make.
+	//
+	// Cached estimates are untouched, so invalidating a large layer costs refresh
+	// throughput, never read latency. It is invisible to readers: they keep
+	// getting the last computed value, and it still reports itself fresh, because
+	// the read path judges staleness from the Store's own ComputedAt against the
+	// area TTL — not from this schedule. Invalidate moves *when a pair is
+	// recomputed*, nothing about what is served in the meantime.
+	Invalidate(ctx context.Context, sel Selector) (int, error)
 	Debt(ctx context.Context) (DebtStats, error)
 }

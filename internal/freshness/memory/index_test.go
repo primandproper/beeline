@@ -188,7 +188,9 @@ func TestIndexInvalidateReenqueues(t *testing.T) {
 		require.Empty(t, none)
 
 		// ...until an explicit invalidation of everything computed so far.
-		require.NoError(t, idx.Invalidate(ctx, beeline.Selector{OlderThan: time.Now()}))
+		n, err := idx.Invalidate(ctx, beeline.Selector{OlderThan: time.Now()})
+		require.NoError(t, err)
+		require.Equal(t, 3, n)
 		due, err := idx.Claim(ctx, 10, time.Second)
 		require.NoError(t, err)
 		assert.Len(t, due, 3)

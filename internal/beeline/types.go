@@ -127,8 +127,30 @@ type CellState struct {
 	OldestAgeSeconds float64 // p100 staleness among this cell's computed pairs
 }
 
-// Selector chooses a subset of the index for Invalidate. A pair whose ComputedAt
-// predates OlderThan is re-enqueued for refresh.
+// Selector chooses a subset of the index for Invalidate. Every non-zero field
+// narrows the selection (they AND together); the zero Selector selects every
+// computed pair in the index.
+//
+// Scoping by Area and Res is what makes "invalidate one precision layer of one
+// service area" expressible — the operator action behind
+// POST /_config_/areas/{areaID}/invalidate.
 type Selector struct {
+	// OlderThan bounds the selection by age: only pairs computed before this
+	// instant are selected. The zero value means "no age bound" — every computed
+	// pair in scope, however recently computed. That is what a layer invalidation
+	// wants, and it deliberately avoids comparing a head's clock against the
+	// backend's: the Postgres index stamps ComputedAt from the database's now(),
+	// so a head passing its own time.Now() here could leave just-computed pairs
+	// behind under clock skew.
 	OlderThan time.Time
+	// Res scopes the selection to one precision layer. Nil means every layer;
+	// resolution 0 is a real H3 resolution, so this cannot be a sentinel int.
+	Res *int
+	// Profile scopes the selection to one routing profile. Empty means every
+	// profile.
+	Profile Profile
+	// Area scopes the selection to one service area's partition. The zero value
+	// means every area — AreaID(0) is "no area", never a real partition, so it can
+	// never be selected deliberately.
+	Area AreaID
 }

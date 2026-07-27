@@ -410,3 +410,114 @@ func TestWarmEndpointRejectsBadInput(t *testing.T) {
 		})
 	}
 }
+
+func postInvalidate(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, path, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	return rec
+}
+
+// TestInvalidateEndpointRequeuesLayer drives the endpoint end to end over the
+// coordinator-backed harness: warm a pair, compute it, then invalidate the layer it
+// belongs to and watch it become claimable again. Layer *scoping* across several
+// resolutions is pinned in internal/control and the freshness conformance suite;
+// what matters here is the wire contract, including that an empty body is the valid
+// whole-area form.
+func TestInvalidateEndpointRequeuesLayer(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newWarmHarness(t)
+	area := strconv.FormatInt(int64(h.areaID), 10)
+
+	body := `{"area": ` + area + `, "pairs": [{"origin": "` + h.origin.String() + `", "dest": "` + h.dest.String() + `"}]}`
+	require.Equal(t, http.StatusOK, postWarm(t, h.handler, body).Code)
+
+	claimed, err := h.index.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.NoError(t, h.index.MarkComputed(ctx, claimed, time.Now()))
+
+	rec := postInvalidate(t, h.handler, "/_config_/areas/"+area+"/invalidate?resolution=8")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp struct {
+		Resolution  *int   `json:"resolution"`
+		Profile     string `json:"profile"`
+		Area        int64  `json:"area"`
+		Invalidated int    `json:"invalidated"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, int64(h.areaID), resp.Area)
+	assert.Equal(t, 1, resp.Invalidated)
+	require.NotNil(t, resp.Resolution)
+	assert.Equal(t, 8, *resp.Resolution, "the response echoes the layer that was hit")
+	assert.Empty(t, resp.Profile, "an unscoped profile stays absent")
+
+	due, err := h.index.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, claimed, due, "the invalidated pair is due again")
+}
+
+func TestInvalidateEndpointWholeAreaAndScopes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := newWarmHarness(t)
+	area := strconv.FormatInt(int64(h.areaID), 10)
+
+	body := `{"area": ` + area + `, "pairs": [{"origin": "` + h.origin.String() + `", "dest": "` + h.dest.String() + `"}]}`
+	require.Equal(t, http.StatusOK, postWarm(t, h.handler, body).Code)
+	claimed, err := h.index.Claim(ctx, 10, 15*time.Second)
+	require.NoError(t, err)
+	require.NoError(t, h.index.MarkComputed(ctx, claimed, time.Now()))
+
+	// No query string at all: every layer, every profile, no request body needed.
+	rec := postInvalidate(t, h.handler, "/_config_/areas/"+area+"/invalidate")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp struct {
+		Resolution  *int `json:"resolution"`
+		Invalidated int  `json:"invalidated"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, 1, resp.Invalidated)
+	assert.Nil(t, resp.Resolution, "an unscoped invalidation reports no resolution")
+
+	// Both scopes together: the area's only registered profile plus its only layer.
+	require.NoError(t, h.index.MarkComputed(ctx, claimed, time.Now()))
+	rec = postInvalidate(t, h.handler, "/_config_/areas/"+area+"/invalidate?profile=car&resolution=8")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, 1, resp.Invalidated)
+}
+
+func TestInvalidateEndpointRejectsBadInput(t *testing.T) {
+	t.Parallel()
+
+	h := newWarmHarness(t)
+	area := strconv.FormatInt(int64(h.areaID), 10)
+
+	cases := map[string]string{
+		"non-numeric area":     "/_config_/areas/nope/invalidate",
+		"unknown area":         "/_config_/areas/99999/invalidate",
+		"resolution not a int": "/_config_/areas/" + area + "/invalidate?resolution=eight",
+		"resolution too large": "/_config_/areas/" + area + "/invalidate?resolution=16",
+		"resolution negative":  "/_config_/areas/" + area + "/invalidate?resolution=-1",
+		"absent layer":         "/_config_/areas/" + area + "/invalidate?resolution=7",
+		"unknown profile":      "/_config_/areas/" + area + "/invalidate?profile=hovercraft",
+	}
+
+	for name, path := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := postInvalidate(t, h.handler, path)
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "expected 400 for %s, got %s", name, rec.Body.String())
+		})
+	}
+}

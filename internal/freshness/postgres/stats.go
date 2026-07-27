@@ -103,6 +103,25 @@ func (c *statsCache) putCells(ctx context.Context, key string, states []beeline.
 	_ = c.cells.Set(ctx, key, &states) //nolint:errcheck // memoization is best-effort
 }
 
+// purge drops every memoized aggregate on this head. It is for the operator
+// mutations that move the numbers by design — invalidating a layer moves the
+// whole working set into debt — where waiting out the TTL would show the
+// operator a stale readout of the change they just made. The polling path never
+// calls it; the caches are a handful of entries, so flushing both is cheaper
+// than reasoning about which keys one selector touched.
+//
+// Only this head's memo is dropped: another head serves its own cached copy for
+// up to its own TTL, which is the same head-independent staleness the memo
+// already has.
+func (c *statsCache) purge(ctx context.Context) {
+	if c == nil {
+		return
+	}
+
+	_ = c.debt.Flush(ctx)  //nolint:errcheck // memoization is best-effort
+	_ = c.cells.Flush(ctx) //nolint:errcheck // memoization is best-effort
+}
+
 // Debt reports the aggregate freshness contract: working set, stale count
 // (never-computed pairs count as debt), p100 age, and required vs achieved
 // throughput. Required sums each area's workingSet/TTL; achieved comes from

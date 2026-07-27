@@ -88,6 +88,10 @@ func Register(router *routing.Router, deps *Deps) {
 		routing.WithTags("areas"), routing.WithResponseStatus(http.StatusNoContent))
 	routing.Post(router, "/_config_/areas/{areaID}/enable", areaEnableHandler(deps, logger), routing.WithTags("areas"), ok)
 	routing.Post(router, "/_config_/areas/{areaID}/disable", areaDisableHandler(deps, logger), routing.WithTags("areas"), ok)
+	routing.Post(router, "/_config_/areas/{areaID}/invalidate", areaInvalidateHandler(deps, logger), routing.WithTags("areas"), ok,
+		routing.WithDescription("Re-enqueues the area's cached pairs for refresh, optionally one precision "+
+			"layer (?resolution=) and/or profile (?profile=). Cached estimates are not dropped: reads keep "+
+			"being answered from them until the refresh pool recomputes them."))
 	routing.Put(router, "/_config_/areas/{areaID}/geojson", areaGeoJSONHandler(deps, logger), routing.WithTags("areas"),
 		routing.WithDescription("Replaces the area's geometry. The request body is a raw GeoJSON polygon document."))
 }
@@ -1095,6 +1099,74 @@ func areaGeoJSONHandler(deps *Deps, logger logging.Logger) routing.Handler[areaI
 		}
 
 		return toAreaResponse(logger, &area, true), nil
+	}
+}
+
+// areaInvalidateInput scopes an invalidation through the path and query string
+// alone — no body, so `POST …/invalidate` with no payload is the valid
+// "every layer, every profile" form. Both filters are strings parsed in-handler so
+// an omitted one is distinguishable from resolution 0, a real H3 resolution.
+type areaInvalidateInput struct {
+	AreaID     string `path:"areaID"`
+	Resolution string `query:"resolution"`
+	Profile    string `query:"profile"`
+}
+
+// areaInvalidateResponse echoes the scope that was applied — so a caller can see
+// which layer it actually hit — plus the number of pairs re-enqueued.
+type areaInvalidateResponse struct {
+	Resolution  *int   `json:"resolution"`
+	Profile     string `json:"profile,omitempty"`
+	Area        int64  `json:"area"`
+	Invalidated int    `json:"invalidated"`
+}
+
+// areaInvalidateHandler re-enqueues an enabled area's cached pairs for refresh,
+// optionally just one precision layer (?resolution=7) and/or one profile
+// (?profile=car). Cached estimates survive and keep answering reads unchanged while
+// the pool recomputes them, so this is a throughput cost, not a read outage.
+func areaInvalidateHandler(deps *Deps, logger logging.Logger) routing.Handler[areaInvalidateInput, areaInvalidateResponse] {
+	return func(ctx context.Context, in areaInvalidateInput) (areaInvalidateResponse, error) {
+		var zero areaInvalidateResponse
+
+		id, ok := requireAreaID(ctx, logger, in.AreaID)
+		if !ok {
+			return zero, nil
+		}
+
+		var res *int
+		if raw := strings.TrimSpace(in.Resolution); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 || parsed > 15 {
+				fail(ctx, logger, http.StatusBadRequest, "invalid resolution "+raw+" (want an H3 resolution 0-15)")
+				return zero, nil
+			}
+			res = &parsed
+		}
+
+		n, err := deps.Coordinator.Invalidate(ctx, id, &control.InvalidateInput{
+			Resolution: res,
+			Profile:    beeline.Profile(strings.TrimSpace(in.Profile)),
+		})
+		if err != nil {
+			if errors.Is(err, control.ErrInvalidInvalidation) {
+				fail(ctx, logger, http.StatusBadRequest, err.Error())
+				return zero, nil
+			}
+			logger.Error("invalidating area pairs", err)
+			fail(ctx, logger, http.StatusInternalServerError, err.Error())
+
+			return zero, nil
+		}
+
+		logger.WithValues(map[string]any{"invalidated": n}).Info("service area pairs invalidated")
+
+		return areaInvalidateResponse{
+			Area:        int64(id),
+			Resolution:  res,
+			Profile:     strings.TrimSpace(in.Profile),
+			Invalidated: n,
+		}, nil
 	}
 }
 

@@ -97,7 +97,17 @@ HTTP endpoints (default `:8080`):
   Postgres store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
   `layers` list of precision levels);
   `GET`/`PATCH`/`DELETE /_config_/areas/{areaID}`; `POST …/{areaID}/enable` + `…/disable`;
-  `PUT …/{areaID}/geojson` (replace geometry). Plus the **provider registry** under
+  `PUT …/{areaID}/geojson` (replace geometry); `POST …/{areaID}/invalidate` (cache invalidation,
+  scoped by query param — `?resolution=7` for **one precision layer**, `?profile=car`, both, or
+  neither for the whole enabled area; no request body). It re-enqueues the selected pairs at the
+  front of the refresh queue (via `Coordinator.Invalidate` → `FreshnessIndex.Invalidate`) and answers
+  `{"area","resolution","profile","invalidated"}`. Cached estimates are deliberately **not** dropped, so
+  invalidating a million-pair layer costs refresh throughput, not read latency — watch the debt spike
+  and burn-down on `/_ops_/freshness`. The flip side is that it is invisible to readers: `/estimate`
+  keeps serving the pre-invalidation value, and still reports `stale:false`, because the read path
+  measures staleness from the *stored* estimate's age against the area TTL, not from the refresh
+  schedule. A layer whose cached values must not be served again wants disable/enable, which drops them. A resolution the area has no layer for is a 400, not a silent
+  no-op, and a disabled area is a 400 (it has no pairs in the index). Plus the **provider registry** under
   `/_config_/providers`: `GET` (list every provider — built-ins flagged) and
   `PUT`/`DELETE /_config_/providers/{providerName}` (upsert/remove an operator-defined provider —
   haversine or osrm spec, Postgres-backed). Updating a provider re-points enabled areas' engines live
@@ -174,7 +184,8 @@ HTTP endpoints (default `:8080`):
 
 - `internal/beeline/` — domain model and the three pluggable interfaces: `RoutingEngine`, `Store`,
   `FreshnessIndex` (§5). Core types (`Area`, `Layer`, `AreaID`, `PairKey` — keyed by `Area` —
-  `Estimate`, `Stored`, `DebtStats`, `RoutedArea`/`RoutedLayer`, `ProviderSpec`/`ProviderCatalog` —
+  `Estimate`, `Stored`, `DebtStats`, `Selector` — the scope of one `Invalidate` (age bound, area,
+  precision layer, profile) — `RoutedArea`/`RoutedLayer`, `ProviderSpec`/`ProviderCatalog` —
   the persisted + wire shape of one routing provider and the content-hashed registry followers
   sync, …) and cell helpers (`Center`, `CellAt`). `H3Cell` aliases `h3.Cell`.
 - `internal/geo/` — pure `Haversine(a, b)` great-circle distance.
@@ -232,8 +243,8 @@ HTTP endpoints (default `:8080`):
 - `internal/freshness/memory/` — in-memory `FreshnessIndex`: leased queue (`Claim`/`MarkComputed`,
   §8), demand `Bump`, the query-access signal `Access` (tracks a pair + stamps last-access without
   raising refresh priority), per-area demand decay `SweepArea` (evicts unpinned, unqueried pairs; `Seed`
-  pins the eager core), the `Debt` signals (§3), and per-area `Seed`/`Unseed` + `DebtForArea`/
-  `CellStatesForArea` (each area keeps its own throughput baseline). Time comes from an injected
+  pins the eager core), the `Debt` signals (§3), per-area `Seed`/`Unseed` + `DebtForArea`/
+  `CellStatesForArea` (each area keeps its own throughput baseline), and scoped `Invalidate`. Time comes from an injected
   `clock.Clock` (nil = wall clock); the clock-dependent tests run inside `testing/synctest` bubbles,
   where the wall clock reads bubble time.
 - `internal/freshness/postgres/` — the same `FreshnessIndex` contract over shared Postgres (design
@@ -241,7 +252,16 @@ HTTP endpoints (default `:8080`):
   timestamp comes from the database's `now()` (the `at` param of `MarkComputed` is advisory),
   `Seed` is CopyFrom + `ON CONFLICT DO NOTHING` (idempotent across racing heads), `Access` stamps
   coalesce in a bounded buffer (flushed on interval/fullness; `MarkComputed` flushes its own keys
-  first inside its tx — the demand-fill ordering rule), and `Debt`/`CellStates` aggregates memoize
+  first inside its tx — the demand-fill ordering rule), `Bump` merges every in-flight demand write on
+  the head into one upsert (`bump.go`, group commit: callers still block until their own keys land,
+  so the read-your-write contract the conformance suite pins is intact, but the read path can no
+  longer put one statement per request on the pool — it once wedged a demo by holding ~30 connections
+  in deadlocking upserts and starving `/_config_/areas`), and every writer of `pair_freshness` orders
+  its rows by the primary key so their lock acquisition is on one total order and contention degrades
+  into a queue rather than a 40P01 cycle, `Invalidate` expresses every `Selector`
+  scope as a nullable parameter in one statement (area+res rides the primary key's leading column)
+  and purges this head's stats memo so the console sees the debt spike it just caused, and
+  `Debt`/`CellStates` aggregates memoize
   ~500ms per head for console polling in platform-go `cache/memory` caches (a nil cache — `StatsCacheTTL`
   <= 0 — disables memoization, which the tests rely on). No fencing tokens by design — see §8.2.
 - `internal/freshness/freshnesstest/` — the conformance suite both index implementations run
@@ -284,7 +304,11 @@ HTTP endpoints (default `:8080`):
   areas re-pointed live, deletes refused while referenced) and published as a content-hashed
   `beeline.ProviderCatalog` (`Catalog`/`ProvidersHash`) that followers sync from. `Enable` polyfills every layer from the area's GeoJSON and seeds by warm strategy (eager
   pins each layer's whole bound, lazy nothing, hybrid each layer's core);
-  `SweepExpired` (driven by a janitor goroutine in `serve.go`) evicts cold demand pairs per area. It
+  `SweepExpired` (driven by a janitor goroutine in `serve.go`) evicts cold demand pairs per area;
+  `Invalidate` (behind `POST /_config_/areas/{id}/invalidate`) re-enqueues an enabled area's cached
+  pairs for refresh, optionally scoped to one precision layer and/or profile — it validates the
+  resolution against the area's live layer list, then hands a `beeline.Selector` to the index, and
+  never touches the hot store (reschedule, not evict). It
   also implements `query.AreaRouter` (`Locate` — containment is the finest layer's cell set; the
   returned `RoutedArea` carries the full layer list finest→coarsest). `serve.go` calls
   `ResumeEnabled` at boot.
@@ -301,9 +325,14 @@ HTTP endpoints (default `:8080`):
 - `internal/webui/` — the embedded single-page operator console (`go:embed static`): Leaflet + h3-js
   (vendored under `static/assets/vendor/`, no CDN or build step). List/enable/disable areas, create a
   one-layer area from an uploaded GeoJSON polygon (client-side polyfill preview; multi-layer areas are
-  shaped via the API and rendered display-only), and watch a selected area's load via
+  shaped via the API and rendered display-only), invalidate any one precision layer's cache from its
+  row in the layers table (enabled areas only — it POSTs `…/invalidate?resolution=`, then polls so the
+  debt spike shows immediately), and watch a selected area's load via
   `/_ops_/freshness?area` + `/_ops_/cells?area`. Map tiles come
-  from OSM, so the basemap needs internet at runtime; cells/markers still render offline.
+  from OSM, so the basemap needs internet at runtime; cells/markers still render offline. The area
+  list bounds its own fetch and retries on a backoff, because a head that accepts the request and
+  never answers is otherwise indistinguishable from an empty registry — no rows, no "no areas yet"
+  hint, no error — and nothing else in the poll loop ever re-lists.
 - `version/` — build metadata (`CommitHash`/`BuildTime`/`CommitTime`), injected via `-ldflags` by
   `scripts/build.sh`.
 

@@ -86,6 +86,69 @@ func TestConcurrentClaimsDoNotOverlap(t *testing.T) {
 	assert.Equal(t, len(keys), total, "every pair claimed exactly once across racing claimers")
 }
 
+// TestConcurrentBumpsDoNotDeadlock is the regression test for the outage this
+// batcher was written for. The read path bumps on every stale cache hit, so
+// heavy overlapping traffic used to put one INSERT … ON CONFLICT DO UPDATE per
+// in-flight request on the same rows; batches that reached those rows in
+// different orders deadlocked (SQLSTATE 40P01), and the failed bumps piled up
+// until they held every pool connection and starved unrelated queries.
+//
+// Overlapping key sets are the point: without merged, order-stable writes this
+// deadlocks within a few rounds.
+func TestConcurrentBumpsDoNotDeadlock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	idx := newIndex(t, time.Hour)
+
+	// Each batch is a different *window* of a shared pool of pairs — overlapping
+	// its neighbors, but agreeing with none of them on membership or size. That
+	// difference is what reproduces the outage: distinct key sets give the
+	// planner no reason to reach the shared rows in the same relative order, so
+	// two batches take the same two locks in opposite orders and cycle. (Batches
+	// that are mere rotations of one identical set do NOT reproduce it — the
+	// statement's DISTINCT normalizes them into the same order by accident.)
+	const (
+		bumpers = 16
+		rounds  = 12
+		pool    = 60
+	)
+	key := func(n int) beeline.PairKey {
+		return beeline.PairKey{
+			Profile: "car", Area: 202, Res: 8,
+			Origin: beeline.H3Cell(n%pool + 1), Dest: beeline.H3Cell(n%pool + 2),
+		}
+	}
+
+	errs := make(chan error, bumpers)
+	for b := range bumpers {
+		go func() {
+			for r := range rounds {
+				batch := make([]beeline.PairKey, 15+(b*3+r)%20)
+				for i := range batch {
+					batch[i] = key(b*7 + r*3 + i)
+				}
+				if err := idx.Bump(ctx, batch); err != nil {
+					errs <- err
+
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range bumpers {
+		require.NoError(t, <-errs, "concurrent overlapping bumps must not deadlock")
+	}
+
+	// Read-your-write survives the merge: Bump returns only once its own keys
+	// have landed, so every bumped pair is claimable the moment the last
+	// bumper returns.
+	claimed, err := idx.Claim(ctx, pool*2, time.Minute)
+	require.NoError(t, err)
+	assert.Len(t, claimed, pool, "every distinct bumped pair joined the working set exactly once")
+}
+
 // TestStatsCacheServesWithinTTL verifies the per-head memoization that keeps
 // console polling cheap: within the TTL, reads come from the memo.
 func TestStatsCacheServesWithinTTL(t *testing.T) {

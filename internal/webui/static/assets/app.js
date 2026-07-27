@@ -84,7 +84,7 @@
   function initMap() {
     // The initial view is a placeholder for an empty registry; boot recenters on
     // the first listed area once the list loads (centerOnFirstArea).
-    map = L.map("map", { zoomControl: true }).setView([37.7749, -122.4194], 11);
+    map = L.map("map", { zoomControl: true }).setView([30.2672, -97.7431], 11);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 19,
       attribution: "&copy; OpenStreetMap contributors",

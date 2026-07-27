@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# make fulldemo — the whole distributed deployment, containerized: a
+# make demo — the whole distributed deployment, containerized: a
 # docker-compose cluster of shared Postgres (coordination state), Redis (the hot
 # estimate store), a pool of THREE identical `serve` heads, and a pool of EIGHT
 # `work` followers. See docker-compose.yml for the wiring.
@@ -14,8 +14,8 @@
 #
 # Things worth trying mid-run:
 #
-#   docker compose -p beeline-fulldemo stop head-b        # A and C keep the contract
-#   docker compose -p beeline-fulldemo up -d --scale worker=16
+#   docker compose -p beeline-demo stop head-b        # A and C keep the contract
+#   docker compose -p beeline-demo up -d --scale worker=16
 #   curl 'localhost:8100/estimate?origin=30.27,-97.745&dest=30.275,-97.74'
 #                                                         # head C answers for head A's areas
 #
@@ -31,7 +31,7 @@ CONTAINER_RUNNER="${CONTAINER_RUNNER:-docker}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT_DIR="${PROJECT_ROOT}/scripts"
 COMPOSE_FILE="${COMPOSE_FILE:-${PROJECT_ROOT}/docker-compose.yml}"
-PROJECT_NAME="beeline-fulldemo"
+PROJECT_NAME="beeline-demo"
 
 PORT="${PORT:-8080}"
 PORT_B="${PORT_B:-$((PORT + 10))}"
@@ -51,13 +51,13 @@ STATS_INTERVAL="${STATS_INTERVAL:-2}"
 export PORT PORT_B PORT_C WORKERS FOLLOWER_WORKERS
 
 if ! "${CONTAINER_RUNNER}" compose version >/dev/null 2>&1; then
-  echo "fulldemo: '${CONTAINER_RUNNER} compose' is unavailable — install Docker Compose v2" >&2
+  echo "demo: '${CONTAINER_RUNNER} compose' is unavailable — install Docker Compose v2" >&2
   exit 1
 fi
 
 for base in "${BASE_A}" "${BASE_B}" "${BASE_C}"; do
   if curl -sf "${base}/_ops_/live" >/dev/null 2>&1; then
-    echo "fulldemo: something is already serving on ${base} — stop it (or set PORT) first" >&2
+    echo "demo: something is already serving on ${base} — stop it (or set PORT) first" >&2
     exit 1
   fi
 done
@@ -93,7 +93,7 @@ for base in "${BASE_A}" "${BASE_B}" "${BASE_C}"; do
     sleep 0.5
   done
   if [[ -z "${up}" ]]; then
-    echo "fulldemo: head on ${base} never became ready — '${CONTAINER_RUNNER} compose -p ${PROJECT_NAME} logs' has the detail" >&2
+    echo "demo: head on ${base} never became ready — '${CONTAINER_RUNNER} compose -p ${PROJECT_NAME} logs' has the detail" >&2
     exit 1
   fi
 done

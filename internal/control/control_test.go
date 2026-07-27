@@ -12,7 +12,6 @@ import (
 	"github.com/primandproper/beeline/internal/engine/registry"
 	memindex "github.com/primandproper/beeline/internal/freshness/memory"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
-	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,7 +29,7 @@ const (
 // harness bundles a coordinator with the concrete seams it drives, so tests can assert
 // against the shared index/store as well as the persisted repo.
 type harness struct {
-	repo  *areasqlite.Repository
+	repo  *memstore.Repository
 	index *memindex.Index
 	store *memstore.Store
 	coord *control.Coordinator
@@ -39,11 +38,7 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
-	db, err := areasqlite.Open(":memory:")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-
-	repo := areasqlite.NewRepository(db, nil)
+	repo := memstore.NewRepository(nil)
 	index := memindex.New(testTTL, nil)
 	store := memstore.New()
 
@@ -51,7 +46,7 @@ func newHarness(t *testing.T) *harness {
 
 	// Register one named OSRM provider alongside the built-in default, so tests can
 	// exercise per-area provider selection and unknown-provider rejection.
-	_, err = coord.PutProvider(context.Background(), &beeline.ProviderSpec{
+	_, err := coord.PutProvider(context.Background(), &beeline.ProviderSpec{
 		Name: testProvider, Type: beeline.ProviderTypeOSRM, BaseURL: "http://osrm-test:5000", MaxTableSize: 10000,
 	})
 	require.NoError(t, err)
@@ -62,7 +57,7 @@ func newHarness(t *testing.T) *harness {
 // newCoordinator builds a coordinator over the given seams with the built-in
 // registry and the operator-defined providers loaded from repo — the boot sequence
 // serve.go runs, minus area resume.
-func newCoordinator(t *testing.T, repo *areasqlite.Repository, index *memindex.Index, store *memstore.Store) *control.Coordinator {
+func newCoordinator(t *testing.T, repo *memstore.Repository, index *memindex.Index, store *memstore.Store) *control.Coordinator {
 	t.Helper()
 
 	speeds := map[string]float64{"car": 10}
@@ -584,7 +579,7 @@ func TestDeleteRemovesEverything(t *testing.T) {
 	require.NoError(t, h.coord.Delete(ctx, area.ID))
 
 	_, err = h.coord.Get(ctx, area.ID)
-	assert.ErrorIs(t, err, areasqlite.ErrNotFound)
+	assert.ErrorIs(t, err, beeline.ErrNotFound)
 
 	debt, err := h.index.Debt(ctx)
 	require.NoError(t, err)
@@ -814,10 +809,7 @@ func TestInitProvidersSeedsFromFileConfigOnce(t *testing.T) {
 
 	ctx := context.Background()
 
-	db, err := areasqlite.Open(":memory:")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	repo := areasqlite.NewRepository(db, nil)
+	repo := memstore.NewRepository(nil)
 
 	seed := []beeline.ProviderSpec{{
 		Name: "osrm-legacy", Type: beeline.ProviderTypeOSRM, BaseURL: "http://legacy:5000",
@@ -850,7 +842,7 @@ func TestInitProvidersSeedsFromFileConfigOnce(t *testing.T) {
 
 // newCoordinatorSeeded is newCoordinator with file-config seed specs passed to
 // InitProviders.
-func newCoordinatorSeeded(t *testing.T, repo *areasqlite.Repository, seed []beeline.ProviderSpec) *control.Coordinator {
+func newCoordinatorSeeded(t *testing.T, repo *memstore.Repository, seed []beeline.ProviderSpec) *control.Coordinator {
 	t.Helper()
 
 	engineSpeeds := map[beeline.Profile]float64{"car": 10}

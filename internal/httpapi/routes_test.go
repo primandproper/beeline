@@ -19,7 +19,6 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/query"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
-	areasqlite "github.com/primandproper/beeline/internal/store/sqlite"
 
 	"github.com/primandproper/platform-go/v7/observability/logging"
 	metricsnoop "github.com/primandproper/platform-go/v7/observability/metrics/noop"
@@ -264,11 +263,7 @@ func newWarmHarness(t *testing.T) *warmHarness {
 
 	ctx := context.Background()
 
-	db, err := areasqlite.Open(":memory:")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-
-	repo := areasqlite.NewRepository(db, nil)
+	repo := memstore.NewRepository(nil)
 	index := memindex.New(time.Minute, nil)
 	store := memstore.New()
 

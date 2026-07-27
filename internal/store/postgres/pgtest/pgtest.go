@@ -58,7 +58,7 @@ const EnvDSN = "BEELINE_TEST_POSTGRES_DSN"
 const openTimeout = 30 * time.Second
 
 // Container knobs. The image matches the one the demo compose cluster runs, so
-// tests and `make fulldemo` exercise the same server version.
+// tests and `make demo` exercise the same server version.
 const (
 	containerImage        = "postgres:16-alpine"
 	containerStartTimeout = 3 * time.Minute

@@ -65,13 +65,13 @@ func TestMatrixConfigValidate(t *testing.T) {
 		t.Parallel()
 
 		cases := map[string]func(*MatrixConfig){
-			"empty database path": func(m *MatrixConfig) { m.DatabasePath = "" },
-			"no profiles":         func(m *MatrixConfig) { m.Profiles = nil },
-			"non-positive speed":  func(m *MatrixConfig) { m.Profiles["car"] = 0 },
-			"unknown default":     func(m *MatrixConfig) { m.DefaultProfile = "hovercraft" },
-			"zero ttl":            func(m *MatrixConfig) { m.TargetTTL = 0 },
-			"negative workers":    func(m *MatrixConfig) { m.RefreshWorkers = -1 },
-			"missing server port": func(m *MatrixConfig) { m.Server.Port = 0 },
+			"no backend postgres url": func(m *MatrixConfig) { m.Backend.Postgres.URL = "" },
+			"no profiles":             func(m *MatrixConfig) { m.Profiles = nil },
+			"non-positive speed":      func(m *MatrixConfig) { m.Profiles["car"] = 0 },
+			"unknown default":         func(m *MatrixConfig) { m.DefaultProfile = "hovercraft" },
+			"zero ttl":                func(m *MatrixConfig) { m.TargetTTL = 0 },
+			"negative workers":        func(m *MatrixConfig) { m.RefreshWorkers = -1 },
+			"missing server port":     func(m *MatrixConfig) { m.Server.Port = 0 },
 			"follower with a garbage leader URL": func(m *MatrixConfig) {
 				m.Follower.LeaderURL = "not a url"
 			},

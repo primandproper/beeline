@@ -21,14 +21,12 @@
 			"walk": 1.4
 		},
 		"defaultProfile": "car",
-		"databasePath": "beeline.db",
 		"server": {
 			"startupDeadline": 5000000000,
 			"port": 8080,
 			"debug": false
 		},
 		"backend": {
-			"mode": "postgres",
 			"postgres": {
 				"url": "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable"
 			},

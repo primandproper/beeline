@@ -21,16 +21,22 @@
 			"walk": 1.4
 		},
 		"defaultProfile": "car",
-		"databasePath": "beeline.db",
 		"server": {
 			"startupDeadline": 5000000000,
 			"port": 8080,
 			"debug": false
 		},
+		"backend": {
+			"postgres": {
+				"url": "postgres://beeline@postgres:5432/beeline?sslmode=require",
+				"maxConns": 16
+			},
+			"configPollInterval": 2000000000
+		},
 		"targetTTL": 300000000000,
 		"leaseDuration": 60000000000,
 		"sweepInterval": 60000000000,
-		"refreshWorkers": 8,
+		"refreshWorkers": 0,
 		"refreshBatch": 512
 	}
 }

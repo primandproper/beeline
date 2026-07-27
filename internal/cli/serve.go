@@ -178,7 +178,6 @@ func (a *application) serve(ctx context.Context) error {
 
 	enabled := coordinator.EnabledAreas()
 	a.log().WithValues(map[string]any{
-		"database":      mcfg.DatabasePath,
 		"hot_store":     mcfg.Backend.EffectiveHotStore(),
 		"enabled_areas": len(enabled),
 		"profiles":      len(profiles),
@@ -264,13 +263,11 @@ func (a *application) serve(ctx context.Context) error {
 	// real usage. Areas with decay disabled (TTL 0) are skipped inside the sweep.
 	go a.runSweeper(ctx, coordinator, backend.sweepGate)
 
-	// Cross-head config convergence (distributed mode only): poll the shared
-	// config_version generations and re-derive this head's projections when
-	// another head mutates areas or providers, so an Enable on one head routes
-	// on all heads within one poll interval.
-	if backend.configSource != nil {
-		go a.runConfigWatcher(ctx, coordinator, backend.configSource, mcfg.Backend.ConfigPollInterval)
-	}
+	// Cross-head config convergence: poll the shared config_version generations
+	// and re-derive this head's projections when another head mutates areas or
+	// providers, so an Enable on one head routes on all heads within one poll
+	// interval.
+	go a.runConfigWatcher(ctx, coordinator, backend.configSource, mcfg.Backend.ConfigPollInterval)
 
 	<-ctx.Done()
 	a.log().Info("shutdown signal received; draining HTTP server")
@@ -380,12 +377,8 @@ func (a *application) runSweeper(
 		case <-ctx.Done():
 			return
 		case <-ticker.Chan():
-			var err error
-			if gate != nil {
-				_, err = gate(ctx, sweep) // not winning is normal: another head swept
-			} else {
-				err = sweep(ctx)
-			}
+			// Not winning the election is normal: another head swept this tick.
+			_, err := gate(ctx, sweep)
 			if err != nil && ctx.Err() == nil {
 				a.log().Error("sweeping cold demand pairs", err)
 			}

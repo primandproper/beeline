@@ -1,8 +1,18 @@
-// Package memory is an in-memory beeline.FreshnessIndex: the scheduling brain of
-// the prototype. It implements the leased-queue coordination from §8 (Claim with a
-// visibility timeout, idempotent MarkComputed) and surfaces the freshness contract
-// from §3 (debt, oldest age, achieved vs required throughput). A Postgres index
-// using SELECT … FOR UPDATE SKIP LOCKED implements the same interface for scale-out.
+// Package memory is an in-memory beeline.FreshnessIndex: the leased-queue
+// coordination from §8 (Claim with a visibility timeout, idempotent
+// MarkComputed) plus the freshness contract from §3 (debt, oldest age, achieved
+// vs required throughput), all in process memory.
+//
+// It is a **test double, not a deployable backend.** Scheduling is exactly the
+// state that cannot live per-head — two heads with private queues would lease the
+// same pair to two followers — so the CLI always uses
+// internal/freshness/postgres. This implementation exists because the packages
+// that consume the index (control, httpapi, query, refresh) need to schedule
+// against something without a database, and because its injected clock lets tests
+// run inside testing/synctest bubbles, which no SQL backend can offer.
+//
+// It is pinned to the real index by internal/freshness/freshnesstest, which both
+// implementations run.
 package memory
 
 import (

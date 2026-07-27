@@ -32,64 +32,52 @@ make run ARGS="version"
 
 ## Demo: the matrix service
 
-The `serve` subcommand is the prototype. It opens a SQLite **area store**, keeps
-origin→destination travel-time estimates fresh in the background for every
-**enabled** service area, and serves the read path plus an embedded operator console
-over HTTP. The routing engine is a Haversine stand-in (great-circle distance ÷
-per-profile speed) behind the same interface a real engine (OSRM/Valhalla) would
-implement, so the whole pipeline runs with **no external routing dependency**.
+The `serve` subcommand runs a **stateless head**: coordination state — the freshness index,
+operator config, and singleton-job election — lives in shared Postgres, so any number of
+identical heads run at once and none of them is special. A head keeps origin→destination
+travel-time estimates fresh in the background for every **enabled** service area, and serves
+the read path plus an embedded operator console over HTTP. The routing engine is a Haversine
+stand-in (great-circle distance ÷ per-profile speed) behind the same interface a real engine
+(OSRM/Valhalla) would implement, so the whole pipeline runs with **no external routing
+dependency**.
 
-There are three demos, each seeding the **same three Austin service areas** (downtown
-at res 9, the city at res 8, the metro at res 7+6 — ~1.1M pairs), so what changes
-between them is the deployment, never the workload:
-
-| | what it runs | dependencies |
-|---|---|---|
-| `make simpledemo` | one process, in-process haversine engine | none |
-| `make clusterdemo` | 1 coordinator-only leader + 3 follower processes, latency-simulated engine | none |
-| `make fulldemo` | docker-compose: Postgres + Redis, 3 `serve` heads, 8 `work` followers | Docker |
-
-The fastest path is **`make simpledemo`**: it runs the server against a fresh, gitignored
-SQLite database (`artifacts/demo.db`) with the three areas **enabled**, so the console
-shows the cache loading immediately. `Ctrl-C` stops it; re-running resets from scratch.
-Override the port with `make simpledemo PORT=9090`.
+There is one demo, because there is one deployment shape. **`make demo`** brings up a
+docker-compose cluster of shared Postgres (the freshness index, operator config, and singleton
+election), Redis (the hot estimate store), a pool of **three identical `serve` heads** on
+`:8080`/`:8090`/`:8100`, and a pool of **eight `work` followers**, seeded with the same three
+Austin service areas (downtown at res 9, the city at res 8, the metro at res 7+6 — ~1.1M
+pairs). The areas are enabled through head A and served by all three within a config-poll
+interval, and the script tails all three heads' freshness side by side so you can see them
+agree. Stop one and the survivors keep the contract:
 
 ```bash
-make simpledemo                                       # fresh db + seeded demo areas + serve
-# …or start empty and configure areas yourself:
-make build
-make run ARGS="serve --config config/localdev.json"   # or ./artifacts/beeline serve --config config/localdev.json
-```
-
-Then open **http://localhost:8080**.
-
-The pipeline scales horizontally with the `work` subcommand: the same binary pointed at a running
-`serve` instance becomes a stateless **follower** that claims pending pairs from the leader, computes
-them locally, and submits the results back — add followers until the freshness debt burns down
-smoothly (a leader started with `refreshWorkers: 0` does no computing of its own).
-
-```bash
-./artifacts/beeline work --config config/localdev.json --leader http://localhost:8080
-```
-
-**`make clusterdemo`** stages the whole story in one command: a coordinator-only leader
-(`refreshWorkers: 0`) seeds the demo areas against the simulated network-latency engine — a workload
-one follower cannot keep fresh — and three followers claim, compute, and submit until achieved
-throughput clears the freshness contract's requirement. The script tails `/_ops_/freshness` so you
-can watch it happen; try `make clusterdemo FOLLOWERS=1` to see the contract missed, or kill one
-follower mid-run and watch the burn rate sag.
-
-**`make fulldemo`** goes the rest of the way: a docker-compose cluster of shared Postgres (the
-freshness index, operator config, and singleton election), Redis (the hot estimate store), a pool of
-**three identical `serve` heads** on `:8080`/`:8090`/`:8100`, and a pool of **eight `work`
-followers**. No head is special — the areas are enabled through head A and served by all three
-within a config-poll interval, and the script tails all three heads' freshness side by side so you
-can see them agree. Stop one and the survivors keep the contract:
-
-```bash
-make fulldemo                    # or WORKERS=16 make fulldemo
-docker compose -p beeline-fulldemo stop head-b                 # A and C keep burning debt
+make demo                        # or WORKERS=16 make demo
+docker compose -p beeline-demo stop head-b                     # A and C keep burning debt
 curl 'localhost:8100/estimate?origin=30.27,-97.745&dest=30.275,-97.74'   # head C answers for head A's areas
+```
+
+Then open **http://localhost:8080** for the operator console.
+
+It needs Docker (Compose v2) and no local binary. Postgres is not optional: there is no
+single-node mode, which is what makes every head disposable and every endpoint answer the same
+regardless of which head you ask.
+
+The compute side scales with the `work` subcommand: the same binary pointed at a running head
+becomes a stateless **follower** that claims pending pairs, computes them locally, and submits
+the results back — add followers until the freshness debt burns down smoothly. A head started
+with `refreshWorkers: 0` does no computing of its own, which is the shape `config/cluster.json`
+and `config/production.json` both use: heads coordinate and serve reads, the follower pool
+computes.
+
+```bash
+./artifacts/beeline work --config config/cluster.json --leader http://localhost:8080
+```
+
+To run a head against your own Postgres instead of the compose one:
+
+```bash
+make build
+BEELINE_MATRIX_BACKEND_POSTGRES_URL=postgres://…  ./artifacts/beeline serve
 ```
 
 Started with plain `serve`, a fresh database has **no areas** — nothing refreshes
@@ -122,9 +110,10 @@ curl 'localhost:8080/estimate?origin=30.34,-98.02&dest=30.35,-98.00&profile=car'
 curl -sX POST localhost:8080/_config_/areas/1/disable   # stop refreshing it; its pairs leave the working set
 ```
 
-Area definitions persist in the database (default `beeline.db`, override with
-`BEELINE_MATRIX_DATABASE_PATH`), so an enabled area re-seeds and re-warms on restart;
-a disabled one stays idle. Cells are derived data: every layer's cell set is
+Area definitions persist in the shared Postgres (point at it with
+`BEELINE_MATRIX_BACKEND_POSTGRES_URL`), so an enabled area re-seeds and re-warms on
+restart — on *every* head, not just the one it was created through — and a disabled
+one stays idle. Cells are derived data: every layer's cell set is
 re-polyfilled from the area's GeoJSON at seed time, so replacing the polygon
 (PUT …/geojson) reshapes the whole area.
 

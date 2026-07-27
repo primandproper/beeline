@@ -48,11 +48,19 @@ func buildLocalDevConfig() *config.Config {
 				Port:            8080,
 				StartupDeadline: 5 * time.Second,
 			},
-			DatabasePath:   "beeline.db",
 			Profiles:       defaultProfiles(),
 			DefaultProfile: "car",
+			Backend: config.BackendConfig{
+				// Points at the compose Postgres from `make demo`. Every serve
+				// process is a head over shared coordination state, so a local run
+				// needs the database up.
+				Postgres: config.PostgresConfig{ //nolint:gosec // local demo creds
+					URL: "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable",
+				},
+				ConfigPollInterval: 2 * time.Second,
+			},
 			// An example named provider: a local OSRM server. This block is seed data
-			// only — it is imported into the SQLite provider registry the first time a
+			// only — it is imported into the provider registry the first time a
 			// leader boots against an empty providers table, after which the database is
 			// authoritative and providers change through /_config_/providers (followers
 			// sync the registry from the leader, so nothing here reaches them). Nothing
@@ -147,11 +155,9 @@ func buildClusterConfig() *config.Config {
 				Port:            8080,
 				StartupDeadline: 5 * time.Second,
 			},
-			DatabasePath:   "beeline.db", // unused in postgres mode; validation requires it
 			Profiles:       defaultProfiles(),
 			DefaultProfile: "car",
 			Backend: config.BackendConfig{
-				Mode: config.BackendModePostgres,
 				// Demo credentials for the throwaway local docker postgres; real
 				// deploys override via BEELINE_MATRIX_BACKEND_POSTGRES_URL.
 				Postgres: config.PostgresConfig{ //nolint:gosec // local demo creds
@@ -206,13 +212,28 @@ func buildProductionConfig() *config.Config {
 				Port:            8080,
 				StartupDeadline: 5 * time.Second,
 			},
-			DatabasePath:   "beeline.db",
 			Profiles:       defaultProfiles(),
 			DefaultProfile: "car",
-			TargetTTL:      300 * time.Second,
-			LeaseDuration:  60 * time.Second,
-			SweepInterval:  60 * time.Second,
-			RefreshWorkers: 8,
+			Backend: config.BackendConfig{
+				// A placeholder DSN: a real deploy overrides it with
+				// BEELINE_MATRIX_BACKEND_POSTGRES_URL from a secret rather than
+				// shipping credentials in a committed file. It is present because
+				// validation requires a URL, and a config that cannot boot is worse
+				// documentation than one that names the knob.
+				Postgres: config.PostgresConfig{
+					URL:      "postgres://beeline@postgres:5432/beeline?sslmode=require",
+					MaxConns: 16,
+				},
+				ConfigPollInterval: 2 * time.Second,
+			},
+			TargetTTL:     300 * time.Second,
+			LeaseDuration: 60 * time.Second,
+			SweepInterval: 60 * time.Second,
+			// Zero refresh workers: heads coordinate and serve reads, the `work`
+			// follower pool computes. That is the deployment shape the follower
+			// autoscaler assumes, and it keeps a head's latency budget free of
+			// engine calls.
+			RefreshWorkers: 0,
 			RefreshBatch:   512,
 		},
 	}

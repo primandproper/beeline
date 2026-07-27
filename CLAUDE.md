@@ -25,21 +25,22 @@ The application is a **Cobra CLI**. Three subcommands:
   follower serves only health probes (`/_ops_/live`, and `/_ops_/ready` = leader reachable) on
   `matrix.follower.port` (default 8081). Scale a saturated leader by starting more `work` processes;
   a leader with `refreshWorkers: 0` computes nothing itself (pure coordinator).
-- `serve` — the prototype. Runs in one of two backend modes (`matrix.backend`, design §8.2): the
-  zero-dependency **single-node default** described below, or **distributed mode** (`mode:
-  "postgres"`), where the freshness index, hot estimate store, and operator config all live in a
-  shared Postgres so any number of identical `serve` **heads** run at once — each head is stateless
-  and disposable, "leader" just means "any head a follower points at." In distributed mode SQLite is
-  ignored; heads converge on config changes by polling a `config_version` generation (bumped
-  transactionally by every mutation, `configPollInterval`, default 2s), singleton chores are elected
-  with Postgres advisory locks (janitor sweeps per-tick, boot seeding once — later heads find the
-  working set populated and only re-project), and the database's `now()` is the only clock that
-  matters for leases/staleness. The hot store is selectable (`hotStore`): `postgres` (default —
-  benchmarked ~275ms p95 for a 300k-key BatchGet, well inside the sub-second contract) or `redis`
-  (~146ms, for batch-read headroom). Single-node it opens the SQLite **area store**, re-seeds the freshness index from any
-  already-**enabled** service areas, runs a background refresh loop that keeps those areas' pairs
-  fresh (plus a demand-decay janitor that evicts cold demand-filled pairs on the `sweepInterval`
-  cadence), and serves the read path over HTTP. Service areas live in the database (not the config file),
+- `serve` — a **stateless head** (design §8.2). There is exactly one backend: the freshness index,
+  hot estimate store, and operator config all live in a shared Postgres, so any number of identical
+  heads run at once — each is stateless and disposable, and "leader" just means "any head a follower
+  points at." `matrix.backend.postgres.url` is therefore required; there is no single-node or
+  in-memory mode, and no `matrix.backend.mode` (the zero-dependency build was deleted deliberately —
+  one backend, one set of operational semantics, one deployment story). Heads converge on config
+  changes by polling a `config_version` generation (bumped transactionally by every mutation,
+  `configPollInterval`, default 2s), singleton chores are elected with Postgres advisory locks
+  (janitor sweeps per-tick, boot seeding once — later heads find the working set populated and only
+  re-project), and the database's `now()` is the only clock that matters for leases/staleness. The
+  hot store is the one remaining choice (`hotStore`): `postgres` (default — benchmarked ~275ms p95
+  for a 300k-key BatchGet, well inside the sub-second contract) or `redis` (~146ms, for batch-read
+  headroom); coordination state stays in Postgres either way. At boot a head re-seeds the freshness
+  index from any already-**enabled** service areas, runs a background refresh loop that keeps those
+  areas' pairs fresh (plus a demand-decay janitor that evicts cold demand-filled pairs on the
+  `sweepInterval` cadence), and serves the read path over HTTP. Service areas live in the database (not the config file),
   are **disabled by default**, and only enter the working set once enabled — so a fresh database boots
   with **no areas** and nothing to refresh until the operator creates and enables one. An area is a
   **GeoJSON polygon plus an ordered list of precision layers** (DoorDash-style multi-resolution):
@@ -93,19 +94,19 @@ HTTP endpoints (default `:8080`):
   since-disabled areas are dropped). Idempotent by construction — duplicate submits and expired-lease
   submits are waste, never corruption.
 - Control plane — the area registry under `/_config_/areas`, served by `internal/control` over the
-  SQLite store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
+  Postgres store: `GET` (list) / `POST` (create disabled, from a required GeoJSON polygon plus a
   `layers` list of precision levels);
   `GET`/`PATCH`/`DELETE /_config_/areas/{areaID}`; `POST …/{areaID}/enable` + `…/disable`;
   `PUT …/{areaID}/geojson` (replace geometry). Plus the **provider registry** under
   `/_config_/providers`: `GET` (list every provider — built-ins flagged) and
   `PUT`/`DELETE /_config_/providers/{providerName}` (upsert/remove an operator-defined provider —
-  haversine or osrm spec, SQLite-backed). Updating a provider re-points enabled areas' engines live
+  haversine or osrm spec, Postgres-backed). Updating a provider re-points enabled areas' engines live
   and changes the catalog hash so followers converge on their next claim; deleting is refused (409)
   while any area references the name, and built-ins are immutable. Unauthenticated, like the other
   endpoints; a real deploy would gate these.
 - Health — `/_ops_/live` (process up) + `/_ops_/ready`, which runs a platform-go `healthcheck`
   registry populated per backend: a Postgres checker (the client's `IsReady`), a Redis checker when
-  that hot store is selected, and a SQLite ping single-node. A failing dependency answers 503 with
+  that hot store is selected. A failing dependency answers 503 with
   the component named.
 - UI — `GET /` (the embedded console) and `/assets/*` (its bundled JS/CSS + vendored Leaflet/h3-js).
 
@@ -117,9 +118,9 @@ HTTP endpoints (default `:8080`):
   `config/<env>.json` via `config.Render`. The checked-in JSON is a projection of these builders — edit
   the Go, never the JSON, then re-run `make configs`.
 - `config/` — generated per-environment config files (`localdev.json`, `cluster.json` — the
-  distributed-mode reference, used by `make fulldemo` — and `production.json`); committed so
+  the compose-cluster reference, used by `make demo` — and `production.json`); committed so
   they stay reviewable, and loadable at runtime via `--config`.
-- `Dockerfile` + `docker-compose.yml` — the containerized deployment behind `make fulldemo`: one
+- `Dockerfile` + `docker-compose.yml` — the containerized deployment behind `make demo`: one
   cgo-enabled image (uber/h3-go wraps the C library) serving every role, and a compose cluster of
   Postgres + Redis + 3 `serve` heads + 8 `work` followers. Only `head-a` carries the build block (four
   services declaring one tag makes buildx race); the heads share a `heads` network alias so followers
@@ -137,11 +138,12 @@ HTTP endpoints (default `:8080`):
   and then overlays the same environment variables. `Render` goes the other way: it validates typed
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
-  `matrix`): HTTP server, the SQLite `databasePath`, profiles+speeds, the `backend` sub-config
-  (`BackendConfig`, env prefix `BEELINE_MATRIX_BACKEND_`: `mode` memory|postgres, `hotStore`
-  postgres|redis, Postgres/Redis connection blocks — `PostgresConfig` doubles as platform-go's
-  `database.ClientConfig` — `configPollInterval` — the distributed-mode
-  switch; zero value = today's single-node behavior), and freshness knobs (`targetTTL`,
+  `matrix`): HTTP server, profiles+speeds, the `backend` sub-config
+  (`BackendConfig`, env prefix `BEELINE_MATRIX_BACKEND_`: `hotStore` postgres|redis,
+  Postgres/Redis connection blocks — `PostgresConfig` doubles as platform-go's
+  `database.ClientConfig` — and `configPollInterval`. The Postgres URL is **required**: validation
+  rejects an empty one, and a `hotStore` of `memory` is rejected by name so an upgraded config fails
+  loudly instead of silently pointing a head at the default DSN), and freshness knobs (`targetTTL`,
   `leaseDuration`, `sweepInterval` for the demand-decay janitor, refresh workers/batch —
   `refreshWorkers: 0` runs a coordinator-only leader), the `follower` sub-config (`FollowerConfig`,
   env prefix `BEELINE_MATRIX_FOLLOWER_`: leader URL, worker/batch/lease/backoff knobs, health port,
@@ -153,7 +155,7 @@ HTTP endpoints (default `:8080`):
   (`rawEnabled`) and aggregated (`aggregateEnabled`) channels, a JSONL sink path + rotation bounds,
   and buffer/flush/bucket knobs. Service areas
   — including their per-area warm strategy, precision layers (with per-layer bounds), and demand-idle
-  TTL — are not configured here; they live in the database (`internal/store/sqlite`). So do routing
+  TTL — are not configured here; they live in the database (`internal/store/postgres`). So do routing
   **providers**: the `matrix.providers` block is seed data only, imported into the database the
   first time a leader boots against an empty `providers` table, after which the database is
   authoritative (`/_config_/providers`) and the block is inert — followers ignore it entirely and
@@ -218,13 +220,6 @@ HTTP endpoints (default `:8080`):
   parallel test.
 - `internal/store/storebench/` — the shared 300k-key BatchGet benchmark harness behind `make
   bench-store` (the hot-store decision gate; p50/p95 reported per backend).
-- `internal/store/sqlite/` — the persistent **area store** (`modernc.org/sqlite`, pure-Go): a
-  `Repository` over sqlc-generated queries (`generated/`, regenerate with `make sqlc`) and embedded
-  migrations (`migrations/`, applied via `database/migrate`; the SQLite dialect takes no lock). Stores area definitions (name, `warm_strategy`,
-  `demand_idle_ttl_seconds`, GeoJSON, enabled flag, plus the `area_layers` child table — one row per
-  precision layer) and the operator-defined **provider registry** (`providers` table — one
-  `beeline.ProviderSpec` per row; built-ins are synthesized, never stored) — not the computed matrix
-  and not cells (cells are derived by polyfill at seed time).
 - `internal/freshness/memory/` — in-memory `FreshnessIndex`: leased queue (`Claim`/`MarkComputed`,
   §8), demand `Bump`, the query-access signal `Access` (tracks a pair + stamps last-access without
   raising refresh priority), per-area demand decay `SweepArea` (evicts unpinned, unqueried pairs; `Seed`
@@ -270,7 +265,7 @@ HTTP endpoints (default `:8080`):
   implemented yet). A demand-fill is cached and tracked only when the trip falls within that layer's
   `MaxRadiusMeters` bound (measured with `geo.Haversine`); beyond the bound — like an out-of-area
   coordinate — it is computed but not cached.
-- `internal/control/` — the multi-area control plane. A `Coordinator` (backed by the SQLite
+- `internal/control/` — the multi-area control plane. A `Coordinator` (backed by the Postgres
   `AreasRepository`) owns the enabled-area set and, on `Enable`/`Disable`/`Update`/`SetGeoJSON`/…,
   drives per-area seed/unseed over the `AreaIndex`/`AreaStore` seams while the refresh pool keeps
   running. It also owns the **provider registry**: built-in specs at construction plus the
@@ -308,21 +303,17 @@ HTTP endpoints (default `:8080`):
 ```bash
 make setup          # Create artifacts dir + download the module cache
 make configs        # Render config/<env>.json from the real Go objects in cmd/tools/codegen/configs
-make sqlc           # Regenerate both sqlc targets (sqlite + postgres generated/) from sqlc_queries + migrations (Docker)
+make sqlc           # Regenerate internal/store/postgres/generated from sqlc_queries + migrations (Docker)
 make build          # Compile all packages, then build artifacts/beeline with version metadata
 make run ARGS="version"   # go run the CLI with arguments
-make run ARGS="serve --config config/localdev.json"   # open area store + refresh + serve HTTP on :8080
-make simpledemo     # one process, no dependencies: fresh gitignored SQLite db (artifacts/demo.db),
-                    # the three Austin demo areas auto-seeded & enabled against the in-process
-                    # haversine engine, then serve. PORT=n to move it.
-make clusterdemo    # leader/follower live: coordinator-only leader (refreshWorkers=0) + 3 `work`
-                    # followers against the latency-simulated engine; tails /_ops_/freshness.
-                    # FOLLOWERS=n to scale.
-make fulldemo       # the whole distributed deployment as a docker-compose cluster: Postgres
-                    # (coordination) + Redis (hot store) wired into a pool of 3 serve heads
-                    # (:8080/:8090/:8100) and a pool of 8 `work` followers; seeds via head A and tails
-                    # all three heads. Stop a head and the survivors keep the contract. WORKERS=n to
-                    # scale the follower pool; needs Docker (Compose v2), no local binary.
+make run ARGS="serve --config config/localdev.json"   # connect to Postgres + refresh + serve on :8080
+                    # (needs a reachable Postgres — `make demo` brings one up)
+make demo           # the deployment as a docker-compose cluster: Postgres (coordination) + Redis
+                    # (hot store) wired into a pool of 3 serve heads (:8080/:8090/:8100) and a pool
+                    # of 8 `work` followers; seeds via head A and tails all three heads. Stop a head
+                    # and the survivors keep the contract. WORKERS=n to scale the follower pool;
+                    # needs Docker (Compose v2), no local binary. The only demo, because it is the
+                    # only deployment shape.
 make format         # Format all Go code (imports, field alignment, tag alignment, gofmt)
 make lint           # Run golangci-lint (Docker) + shellcheck
 make test           # Run tests (race detector, shuffle, failfast) against real Postgres + Redis;

@@ -18,8 +18,8 @@ import (
 // their speeds, and the freshness/refresh knobs. It sits alongside Observability
 // under the top-level Config.
 //
-// Service areas are no longer configured here — they live in the SQLite database at
-// DatabasePath, are created disabled via the control plane, and only refresh once
+// Service areas are not configured here — they live in the shared Postgres
+// database, are created disabled via the control plane, and only refresh once
 // enabled. A fresh database boots with no areas.
 //
 // Every field carries both an envPrefix/env tag and a json tag so it participates
@@ -29,7 +29,6 @@ type MatrixConfig struct {
 	Providers           map[string]ProviderConfig `env:"PROVIDERS"             json:"providers,omitempty"`
 	Profiles            map[string]float64        `env:"PROFILES"              json:"profiles"`
 	DefaultProfile      string                    `env:"DEFAULT_PROFILE"       json:"defaultProfile"`
-	DatabasePath        string                    `env:"DATABASE_PATH"         json:"databasePath"`
 	Server              serverhttp.Config         `envPrefix:"SERVER_"         json:"server"`
 	Backend             BackendConfig             `envPrefix:"BACKEND_"        json:"backend,omitzero"`
 	Telemetry           TelemetryConfig           `envPrefix:"TELEMETRY_"      json:"telemetry,omitzero"`
@@ -290,7 +289,6 @@ func defaultMatrixConfig() MatrixConfig {
 			Port:            8080,
 			StartupDeadline: 5 * time.Second,
 		},
-		DatabasePath: "beeline.db",
 		Profiles: map[string]float64{
 			"car":  13.9, // ~50 km/h
 			"bike": 4.2,  // ~15 km/h
@@ -314,10 +312,16 @@ func defaultMatrixConfig() MatrixConfig {
 			AggregateBucket:  5 * time.Minute,
 			AggregateMaxKeys: 100_000,
 		},
-		// Backend defaults are ready-to-enable: distributed mode needs only a mode
-		// and a Postgres URL; the poll cadence for cross-head config convergence is
-		// pre-filled.
+		// A localhost DSN so a bare `beeline serve` has somewhere to go — the same
+		// courtesy the old databasePath default ("beeline.db") provided.
+		// Coordination state is no longer optional, so the alternative is a default
+		// config that cannot boot. Real deploys override this through
+		// BEELINE_MATRIX_BACKEND_POSTGRES_URL or a config file. The hot store is
+		// left empty, which resolves to the same Postgres.
 		Backend: BackendConfig{
+			Postgres: PostgresConfig{ //nolint:gosec // local default, not a credential
+				URL: "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable",
+			},
 			ConfigPollInterval: 2 * time.Second,
 		},
 		// Follower defaults are ready-to-enable, like Telemetry: pointing LeaderURL
@@ -344,9 +348,6 @@ func defaultMatrixConfig() MatrixConfig {
 // validate confirms the matrix config is internally consistent. It is called from
 // Config.Validate so both loaders reject a broken config before anything uses it.
 func (m *MatrixConfig) validate(ctx context.Context) error {
-	if m.DatabasePath == "" {
-		return fmt.Errorf("database path is required")
-	}
 	if len(m.Profiles) == 0 {
 		return fmt.Errorf("at least one profile is required")
 	}

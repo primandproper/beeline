@@ -3,8 +3,9 @@ package beeline
 import "errors"
 
 // ErrNotFound reports that a requested entity does not exist. Every store that
-// implements a control-plane repository wraps it — sqlite.ErrNotFound and
-// postgres.ErrNotFound both do — so callers can branch on errors.Is without
+// implements a control-plane repository wraps it — postgres.ErrNotFound and the
+// in-memory double's memory.ErrNotFound both do, as does
+// control.ErrProviderNotFound — so callers can branch on errors.Is without
 // depending on a concrete store package, and without matching on message text.
 //
 // The HTTP layer's 404 mapping is the caller that matters: it used to test

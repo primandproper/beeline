@@ -275,6 +275,95 @@ func Run(t *testing.T, factory Factory) {
 		assert.Len(t, got.Layers, 1, "no orphaned layer rows survive the delete")
 	})
 
+	t.Run("stored areas do not alias caller memory", func(t *testing.T) {
+		t.Parallel()
+		repo := factory(t)
+
+		// A persistent store serializes through a database, so it physically
+		// cannot share memory with its caller. An in-memory implementation can,
+		// and that is the bug class this pins: mutating what you handed in, or
+		// what you read back, must not reach stored state.
+		candidate := area("no-aliasing")
+		created, err := repo.Create(ctx, &candidate)
+		require.NoError(t, err)
+
+		// Mutate the input after Create.
+		candidate.Name = "mutated-input"
+		candidate.Layers[0].Resolution = 99
+		if len(candidate.GeoJSON) > 0 {
+			candidate.GeoJSON[0] = 'X'
+		}
+
+		// Mutate what Create returned. Only the reference fields are meaningful
+		// here — a returned struct's scalars are a copy by construction and
+		// cannot alias anything.
+		created.Layers[0].MaxRadiusMeters = -1
+
+		got, err := repo.Get(ctx, created.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "no-aliasing", got.Name, "stored name is untouched by caller mutations")
+		assert.Equal(t, 9, got.Layers[0].Resolution, "stored layers are untouched")
+		assert.InDelta(t, 4000, got.Layers[0].MaxRadiusMeters, 1e-9)
+		assert.JSONEq(t, polygon, string(got.GeoJSON), "stored geometry is untouched")
+
+		// And mutating one read must not affect the next.
+		got.Layers[0].Resolution = 1
+		again, err := repo.Get(ctx, created.ID)
+		require.NoError(t, err)
+		assert.Equal(t, 9, again.Layers[0].Resolution, "each read is independent")
+	})
+
+	t.Run("update on a missing id fails and creates nothing", func(t *testing.T) {
+		t.Parallel()
+		repo := factory(t)
+
+		// The UPDATE itself matches no rows, but Update also replaces the layer
+		// set, and layer rows for a nonexistent area have nothing to hang off —
+		// both SQL stores surface a foreign-key violation. What matters for a
+		// fake is only that it refuses too: silently accepting a write the real
+		// stores reject is precisely how a double starts lying.
+		//
+		// The error *kind* is deliberately unpinned. control.Update calls Get
+		// first, so nothing in production reaches this path, and requiring
+		// ErrNotFound here would mean adding an existence check to both stores
+		// for a case no caller can hit.
+		ghost := area("ghost")
+		ghost.ID = 999111
+		require.Error(t, repo.Update(ctx, &ghost), "updating an area that does not exist must fail")
+
+		_, err := repo.Get(ctx, ghost.ID)
+		assert.ErrorIs(t, err, beeline.ErrNotFound, "and it did not conjure the area into existence")
+	})
+
+	t.Run("stored providers do not alias caller memory", func(t *testing.T) {
+		t.Parallel()
+		repo := factory(t)
+
+		spec := beeline.ProviderSpec{
+			Name:     "aliasing",
+			Type:     "osrm",
+			BaseURL:  "http://one.invalid",
+			Profiles: map[string]string{"car": "driving"},
+		}
+		require.NoError(t, repo.UpsertProvider(ctx, &spec))
+
+		// The profile map is the reference field a fake is most likely to share.
+		spec.Profiles["car"] = "mutated"
+		spec.Profiles["added"] = "later"
+
+		listed, err := repo.ListProviders(ctx)
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.Equal(t, map[string]string{"car": "driving"}, listed[0].Profiles,
+			"the stored profile map is independent of the caller's")
+
+		// And what ListProviders hands back is independent too.
+		listed[0].Profiles["car"] = "mutated-again"
+		again, err := repo.ListProviders(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"car": "driving"}, again[0].Profiles)
+	})
+
 	t.Run("provider upsert inserts then updates under one name", func(t *testing.T) {
 		t.Parallel()
 		repo := factory(t)

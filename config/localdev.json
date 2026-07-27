@@ -34,11 +34,16 @@
 			"walk": 1.4
 		},
 		"defaultProfile": "car",
-		"databasePath": "beeline.db",
 		"server": {
 			"startupDeadline": 5000000000,
 			"port": 8080,
 			"debug": false
+		},
+		"backend": {
+			"postgres": {
+				"url": "postgres://beeline:beeline@localhost:5432/beeline?sslmode=disable"
+			},
+			"configPollInterval": 2000000000
 		},
 		"telemetry": {
 			"path": "artifacts/telemetry.jsonl",

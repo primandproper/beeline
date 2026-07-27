@@ -1,9 +1,18 @@
 // Package freshnesstest is the conformance suite for FreshnessIndex
-// implementations: one set of behavioral tests both the in-memory index and
-// the Postgres index must pass, so the two backends cannot drift apart. The
-// suite runs in real time (the Postgres clock cannot be injected), so it uses
-// short-but-generous windows: hundreds of milliseconds for TTL/lease
-// expiries, with waits at 2–3× the window.
+// implementations: one set of behavioral tests both the in-memory index and the
+// Postgres index must pass.
+//
+// Its purpose narrowed when single-node mode was deleted. It is no longer keeping
+// two shipping backends aligned — Postgres is the only one that ships. It now
+// keeps the **test double honest about the real one**: the in-memory index is what
+// control, httpapi, query and refresh schedule against in their own tests, so any
+// behavior it gets wrong silently weakens every one of those suites. That is the
+// only thing justifying the double's continued existence, and this suite is what
+// makes the justification true rather than hopeful.
+//
+// The suite runs in real time (the Postgres clock cannot be injected), so it uses
+// short-but-generous windows: hundreds of milliseconds for TTL/lease expiries,
+// with waits at 2–3× the window.
 package freshnesstest
 
 import (

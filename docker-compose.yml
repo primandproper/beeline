@@ -1,4 +1,4 @@
-# make fulldemo — the whole distributed deployment in containers: shared Postgres
+# make demo — the whole distributed deployment in containers: shared Postgres
 # (coordination state: freshness index, operator config, advisory-lock election),
 # Redis (the hot estimate store), a pool of three identical `serve` heads, and a
 # pool of eight `work` followers.
@@ -13,7 +13,7 @@
 # BEELINE_MATRIX_BACKEND_* (the env overlay on top of config/cluster.json), which
 # is what puts the freshness index in Postgres and the estimate cache in Redis.
 #
-# Driven by scripts/demo_full.sh; `docker compose up` works standalone too.
+# Driven by scripts/demo.sh; `docker compose up` works standalone too.
 
 # One image, every role. Only head-a carries the build block: four services
 # declaring the same tag makes buildx build (and race to export) the same image
@@ -31,7 +31,6 @@ x-head: &head
   <<: *beeline-image
   command: ["serve", "--config", "config/cluster.json"]
   environment:
-    BEELINE_MATRIX_BACKEND_MODE: postgres
     BEELINE_MATRIX_BACKEND_POSTGRES_URL: postgres://beeline:beeline@postgres:5432/beeline?sslmode=disable
     BEELINE_MATRIX_BACKEND_HOT_STORE: redis
     BEELINE_MATRIX_BACKEND_REDIS_ADDR: redis:6379
@@ -138,4 +137,4 @@ services:
 
 networks:
   default:
-    name: beeline-fulldemo
+    name: beeline-demo

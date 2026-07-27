@@ -347,7 +347,7 @@ the prototype they are unauthenticated; a real deploy would gate them.
   the claim; a failed sync fails the claim so pairs are never computed with
   engines the leader no longer intends (the leases just expire back into the
   queue). Provider configuration therefore lives in exactly one place — the
-  leader's `/_config_/providers` registry (SQLite-backed; a legacy
+  head's `/_config_/providers` registry (Postgres-backed; a legacy
   `matrix.providers` config block seeds an empty table once) — and repointing
   the whole cluster at a different OSRM instance is one control-plane call that
   propagates to every follower within one claim cycle. A follower needs nothing
@@ -410,15 +410,23 @@ like a local worker. The follower's only HTTP surface is `/_ops_/live` and
 leader started with `refreshWorkers: 0` computes nothing itself — a pure
 coordinator; `make demo-cluster` stages exactly that.
 
-### 8.2 Distributed mode: stateless heads over shared Postgres
+### 8.2 Stateless heads over shared Postgres
 
 This is the scale-out of the *leader* itself, and it is deliberately **not a
-consensus pool**. Every piece of mutable coordination state moves out of the
-process into shared storage, after which "leader" stops being a role: every
-`serve` instance is an identical, disposable request head, and there is nothing
-left to elect a leader *of* except two singleton chores. Opt in via
-`matrix.backend` (`mode: "postgres"`); the zero-value config keeps the
-single-node in-memory/SQLite behavior and `make demo` stays dependency-free.
+consensus pool**. Every piece of mutable coordination state lives outside the
+process in shared storage, which is why "leader" is not a role: every `serve`
+instance is an identical, disposable request head, and there is nothing left to
+elect a leader *of* except two singleton chores.
+
+This is no longer opt-in — it is the only mode. The zero-dependency single-node
+build (in-memory index and store, SQLite operator config) has been **deleted**,
+along with `matrix.backend.mode`, so `matrix.backend.postgres.url` is required and
+`make demo` needs Docker. That trade is deliberate: keeping a per-head in-memory
+backend alive meant every design conversation carried a second set of operational
+semantics, and "how does this degrade without Postgres?" was a question about a
+deployment nobody ran. One backend, one set of semantics, one deployment story.
+The in-memory implementations survive as **test doubles only**, unwired from the
+CLI and pinned to the real backends by conformance suites.
 
 Where the state went:
 
@@ -426,8 +434,9 @@ Where the state went:
   §5.3 shape verbatim: `SELECT … ORDER BY bumped DESC, computed_at ASC NULLS
   FIRST LIMIT n FOR UPDATE SKIP LOCKED`, then stamp `lease_until` — the leased
   queue with the same due-ness, priority, and per-area TTL/lease semantics as
-  the memory index (one conformance suite, `internal/freshness/freshnesstest`,
-  runs against both so they cannot drift). The read path's per-query `Access`
+  the in-memory test double (one conformance suite,
+  `internal/freshness/freshnesstest`, runs against both, so the double cannot lie
+  about the backend that ships). The read path's per-query `Access`
   stamps coalesce in a bounded in-process buffer and flush in batches;
   `MarkComputed` flushes its own keys first, inside its transaction, so the
   demand-fill commit's Access→Mark ordering holds.
@@ -438,8 +447,8 @@ Where the state went:
   sub-second contract — so **Postgres is the blessed default** (one shared
   dependency); Redis remains a config flip for deployments that want the batch
   headroom.
-- **Operator config → Postgres** (`internal/store/postgres` repositories; the
-  SQLite `databasePath` is ignored in this mode). Derived projections —
+- **Operator config → Postgres** (`internal/store/postgres` repositories).
+  Derived projections —
   polyfilled cell sets, built engines, the provider catalog — stay per-head
   in-process, converged by a `config_version` generation counter bumped in the
   same transaction as every mutation and polled every

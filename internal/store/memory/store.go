@@ -1,7 +1,17 @@
-// Package memory is an in-memory beeline.Store: a mutex-guarded map. It is the
-// prototype's hot read path, standing in for Redis/DynamoDB/Aerospike. Because the
-// Store interface is deliberately tiny (batch get/put, no ordering), this
-// implementation is a few lines and a production KV drops in behind the same seam.
+// Package memory holds in-memory implementations of the estimate Store and the
+// control-plane Repository.
+//
+// These are **test doubles, not a deployable backend.** Nothing here is wired
+// into the CLI: a `serve` process always runs against shared Postgres, because
+// per-head in-memory state would make heads disagree. What these exist for is the
+// packages above the storage seams (control, httpapi, query, refresh, follower),
+// which need somewhere to put fixtures without a database.
+//
+// A double is only worth having if it cannot lie about the thing it stands in
+// for, so both are pinned to the real backends by conformance suites:
+// internal/store/storetest for the Store, internal/control/repositorytest for the
+// Repository. Change behavior here and those suites are what tell you whether the
+// change was a fix or a divergence.
 package memory
 
 import (

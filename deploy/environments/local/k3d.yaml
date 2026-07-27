@@ -1,0 +1,35 @@
+# The cluster the local environment runs on: k3s in Docker, via k3d. Not a
+# kustomize resource — `scripts/demo.sh` feeds this to `k3d cluster create`.
+#
+# One server plus two agents. Each agent is a full k3s container, so more than two
+# is pure overhead on a laptop while still being enough for the head pool's
+# anti-affinity to spread across nodes.
+#
+# k3s bundles both things the demo depends on: metrics-server (the head HPA's CPU
+# source) and Traefik (the ingress controller behind deploy/base/ingress.yaml).
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+
+metadata:
+  name: beeline-local
+
+servers: 1
+agents: 2
+
+# Inside KEDA 2.20's tested window (Kubernetes 1.33-1.35) and inside the +/-1
+# minor version skew a 1.36 kubectl supports. k3d's own hardcoded default is
+# 1.32; if a create ever misbehaves, dropping this line and taking that default is
+# the first thing to try.
+image: rancher/k3s:v1.35.6-k3s1
+
+options:
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    # Never steal whatever context the operator is on. `make demo` names its
+    # context explicitly on every command instead.
+    switchCurrentContext: false
+
+# The host port mapping is passed on the command line rather than set here, so
+# PORT stays overridable without templating this file. See scripts/demo.sh:
+#   k3d cluster create --config deploy/environments/local/k3d.yaml \
+#     --port "${PORT}:80@loadbalancer"

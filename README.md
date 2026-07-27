@@ -15,7 +15,8 @@ subcommand. A long-running worker? Add a subcommand. An HTTP service? Add a
 ## Quickstart
 
 Requires **Go 1.26+**. [Docker](https://www.docker.com/) is used for linting and
-shellcheck.
+shellcheck. The demo additionally needs `kubectl` and [k3d](https://k3d.io)
+(`brew install k3d`) — it runs on a real Kubernetes cluster.
 
 ```bash
 make setup                  # create artifacts/ and download the module cache
@@ -32,80 +33,140 @@ make run ARGS="version"
 
 ## Demo: the matrix service
 
-The `serve` subcommand is the prototype. It tessellates a service area into H3
-cells, keeps origin→destination travel-time estimates fresh in the background, and
-serves the read path plus an embedded operator console over HTTP. The routing
-engine is a Haversine stand-in (great-circle distance ÷ per-profile speed) behind
-the same interface a real engine (OSRM/Valhalla) would implement, so the whole
-pipeline runs with **no external routing dependency**.
+The `serve` subcommand runs a **stateless head**: coordination state — the freshness index,
+operator config, and singleton-job election — lives in shared Postgres, so any number of
+identical heads run at once and none of them is special. A head keeps origin→destination
+travel-time estimates fresh in the background for every **enabled** service area, and serves
+the read path plus an embedded operator console over HTTP. The routing engine is a Haversine
+stand-in (great-circle distance ÷ per-profile speed) behind the same interface a real engine
+(OSRM/Valhalla) would implement, so the whole pipeline runs with **no external routing
+dependency**.
+
+There is one demo, because there is one deployment shape. **`make demo`** brings up a local
+**k3s cluster** (via [k3d](https://k3d.io)) running shared Postgres (the freshness index,
+operator config, and singleton election), Redis (the hot estimate store), an **autoscaling pool
+of `serve` heads** behind one Service, an **autoscaling pool of `work` followers**, and a k6 load
+generator aimed at the heads. It seeds the three Austin service areas (downtown at res 9, the
+city at res 8, the metro at res 7+6 — ~1.1M pairs) and then tails the freshness contract next to
+live replica counts:
+
+```
+  debt=1087054  achieved=213    required=3635    heads=2/2    workers=1/1
+  debt= 481907  achieved=4820   required=3635    heads=2/3    workers=2/2
+  debt=  56681  achieved=11940  required=3635    heads=3/3    workers=8/8
+  debt=      0  achieved=9310   required=3635    heads=3/3    workers=0/0
+```
+
+**Both pools scale on their own, and that is the point.**
+
+- The **head pool** scales on CPU — the read path is CPU-bound, so a `HorizontalPodAutoscaler`
+  over the metrics-server k3s already ships is the honest signal. The bundled load generator is
+  what moves it. Heads also serve `/_work_/claim` and `/_work_/submit` for the follower pool, so
+  the two autoscalers visibly couple.
+- The **follower pool** scales on **freshness debt** — the §3 contract read straight off
+  `GET /_ops_/freshness` by KEDA's `metrics-api` scaler, with no metrics pipeline in between. The
+  cache's own health is the scaling metric. It scales **to zero**: no enabled areas means no debt
+  means no reason to run a compute pool at all.
+
+Because the seeded areas carry a 5-minute `targetTTL`, the whole working set re-stales at once
+every five minutes — so the pool wakes, burns ~1.1M pairs of debt down to zero in about ninety
+seconds, and goes back to sleep. Just leave it running and watch the sawtooth.
+
+```bash
+make demo                                    # or RPS=250 WORKER_MAX=16 make demo
+kubectl --context k3d-beeline-local -n beeline-local get hpa,scaledobject,deploy -w
+
+# turn the read load up; the head pool follows. Cost per request matters more than
+# rate — a bigger /table grid is what pushes head CPU past the 60% target.
+kubectl --context k3d-beeline-local -n beeline-local \
+  set env deploy/beeline-loadgen RPS=250 TABLE_GRID=48 TABLE_RATIO=0.6
+
+# kill ONE head; the survivors keep the contract. (Deleting them all with
+# -l role=head is an outage, not a demo: a PDB gates evictions, never a delete.)
+kubectl --context k3d-beeline-local -n beeline-local delete pod --wait=false \
+  "$(kubectl --context k3d-beeline-local -n beeline-local get pod -l role=head -o name | head -1)"
+curl 'localhost:8080/estimate?origin=30.27,-97.745&dest=30.275,-97.74'
+```
+
+Then open **http://localhost:8080** for the operator console.
+
+It needs Docker, `kubectl` and k3d, and no local binary. It never reads or changes your current
+kubectl context — every command above names the demo's context explicitly, and the cluster is
+created with `switchCurrentContext: false`. Postgres is not optional: there is no single-node
+mode, which is what makes every head disposable and every endpoint answer the same regardless of
+which head you ask.
+
+The manifests are split the way you would split them for a real deployment. `deploy/base/` is
+what beeline *is* — two roles, how they are exposed, and the shape of both autoscalers.
+`deploy/environments/local/` is what makes it a laptop demo — in-cluster Postgres and Redis,
+throwaway credentials, the load generator, laptop-sized bounds. Base names its dependencies and
+the environment supplies them, so pointing a new environment at managed Postgres is an overlay
+change and nothing else.
+
+The compute side is the `work` subcommand: the same binary pointed at a running head becomes a
+stateless **follower** that claims pending pairs, computes them locally, and submits the results
+back. A head started with `refreshWorkers: 0` does no computing of its own, which is the shape
+`config/cluster.json` and `config/production.json` both use: heads coordinate and serve reads,
+the follower pool computes. Followers hold no state at all — a dead one just lets its leases
+expire — which is what makes handing the replica count to an autoscaler safe.
+
+```bash
+./artifacts/beeline work --config config/cluster.json --leader http://localhost:8080
+```
+
+To run a head against your own Postgres instead of the demo cluster's:
 
 ```bash
 make build
-make run ARGS="serve --config config/localdev.json"   # or ./artifacts/beeline serve --config config/localdev.json
+BEELINE_MATRIX_BACKEND_POSTGRES_URL=postgres://…  ./artifacts/beeline serve
 ```
 
-Then open **http://localhost:8080**.
+Started with plain `serve`, a fresh database has **no areas** — nothing refreshes
+until you configure one. In the
+console: click **+ New**, give it a name, upload a **GeoJSON polygon** (required —
+it is the area's canonical geometry), and create it. The area starts **disabled**.
+Flip it **On** and the refresh loop begins filling it with H3 cells. An area carries
+one or more **precision layers** (H3 resolutions, DoorDash-style); each layer's cell
+set is derived from the polygon and precomputed independently. The console creates
+one-layer areas; add more layers via the HTTP API. Each layer's row carries an
+**Invalidate** button that re-queues just that layer's cached pairs for refresh (the
+cached values are not dropped; reads keep being answered from them until recomputed).
+Multiple areas can be enabled at once; the progress overlay paints the selected one.
 
-The demo area is **Lake Travis** in the Austin, TX metro. As the background refresh
-loop computes estimates, the console fills the service area with H3 cells — and the
-reservoir stays **carved out**: cells over open water are pruned because they have
-no roads (design §7, "road-aware tessellation"). The startup log shows it:
-
-```
-road mask loaded; pruning roadless cells   cells=1421 resolution=9
-service area tessellated ...                cells=488  pairs=43848
-```
-
-488 cells are seeded out of the full 631-cell disk — the 143 roadless water cells
-(~23%) are dropped. (The basemap tiles need internet; the cells and markers render
-regardless.)
-
-Poke at it while it runs:
+Everything the console does is a plain HTTP call — drive it with curl too:
 
 ```bash
-curl 'localhost:8080/_ops_/freshness'    # §3 debt/throughput contract (watch it drain)
-curl 'localhost:8080/_ops_/cells'        # per-origin-cell freshness rollup (the console's overlay)
-curl 'localhost:8080/estimate?origin=30.3428,-98.0274&dest=30.35,-98.00&profile=car'
+# create an area from a GeoJSON polygon (starts disabled), then enable it. layers is
+# the ordered list of precision layers: per layer, maxRadiusMeters is the per-origin
+# travel-radius bound (0 = full mesh) and minDistanceMeters is recorded for future
+# distance-based layer selection; warmStrategy is eager | lazy | hybrid;
+# demandIdleTTL evicts cold demand-filled pairs (blank = never).
+curl -sX POST localhost:8080/_config_/areas -H content-type:application/json -d '{
+  "name":"downtown","warmStrategy":"hybrid","demandIdleTTL":"1h",
+  "layers":[{"resolution":8,"minDistanceMeters":0,"maxRadiusMeters":3000,"coreRadiusMeters":1500}],
+  "geojson":{"type":"Polygon","coordinates":[[[-98.05,30.32],[-97.99,30.32],[-97.99,30.37],[-98.05,30.37],[-98.05,30.32]]]}}'
+curl -sX POST localhost:8080/_config_/areas/1/enable
+
+curl 'localhost:8080/_ops_/freshness?area=1'   # §3 debt/throughput contract (watch it drain)
+curl 'localhost:8080/_ops_/cells?area=1'       # per-origin-cell freshness rollup (the console's overlay)
+curl 'localhost:8080/estimate?origin=30.34,-98.02&dest=30.35,-98.00&profile=car'
+
+# invalidate a cache: re-enqueue pairs at the front of the refresh queue. scope it to
+# one precision layer with ?resolution= (and/or one profile with ?profile=); no query
+# string invalidates the whole area. cached estimates are not dropped — reads keep being
+# answered from them until a worker recomputes — so this spends refresh throughput, not
+# read latency. watch it land in /_ops_/freshness.
+curl -sX POST 'localhost:8080/_config_/areas/1/invalidate?resolution=8'
+
+curl -sX POST localhost:8080/_config_/areas/1/disable   # stop refreshing it; its pairs leave the working set
 ```
 
-You can also redraw the boundary, move the center, or change the H3 resolution at
-runtime from the console (or `POST /_config_/area`) and watch the cache reload. The
-road mask follows resolution changes through the H3 hierarchy — pruning stays exact
-at or below the mask's resolution and approximate (edge only as sharp as the mask)
-when you zoom finer. The console warns under the resolution slider when you've zoomed
-past the mask's resolution; rebuild the mask at that resolution for a crisp edge.
-
-### The road mask
-
-The road mask (`config/masks/austin-res9.cells`) is **committed**, so the demo
-needs neither the network nor DuckDB — it loads the cell set from disk. Point
-`serve` at your own mask with the `roadMaskPath` config key (env
-`BEELINE_MATRIX_ROAD_MASK_PATH`); an empty path disables pruning (full geometric
-disk).
-
-To rebuild the mask, or build one for a different area, use `make mask`. It reads
-[Overture Maps](https://overturemaps.org/) road data via the
-[DuckDB](https://duckdb.org/) CLI — pinned in `mise.toml`, so `mise install`
-provisions it:
-
-```bash
-mise install                 # provides the duckdb CLI
-make mask                    # rebuild the demo mask (pulls from Overture's public S3, then caches)
-
-# build a mask for a different area — matches the config's area spec:
-make mask MASK_LAT=30.2672 MASK_LNG=-97.7431 MASK_RESOLUTION=8 \
-          MASK_AREA_RINGS=6 MASK_OUT=config/masks/myarea.cells
-```
-
-`make mask` prints how much it prunes for the configured area (e.g. `488/631 disk
-cells have roads, 143 pruned`) and caches the S3 pull under `artifacts/`, so
-re-runs are offline unless the area changes or you pass `--refetch`.
-
-> **Note:** the mask is resolution-specific, and how much it prunes depends
-> entirely on the area. A wide water body at a fine resolution (like the Lake
-> Travis demo) drops a big fraction of the disk; a dense urban area (e.g. downtown
-> Austin, ~`30.27, -97.74`) is fully road-covered and prunes almost nothing — the
-> mask still loads, it just has little to remove.
+Area definitions persist in the shared Postgres (point at it with
+`BEELINE_MATRIX_BACKEND_POSTGRES_URL`), so an enabled area re-seeds and re-warms on
+restart — on *every* head, not just the one it was created through — and a disabled
+one stays idle. Cells are derived data: every layer's cell set is
+re-polyfilled from the area's GeoJSON at seed time, so replacing the polygon
+(PUT …/geojson) reshapes the whole area.
 
 ## What's included
 

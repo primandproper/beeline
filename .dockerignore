@@ -1,0 +1,21 @@
+# Keep the build context small and reproducible. Version metadata reaches the
+# image through build args (see Dockerfile), not through .git.
+.git
+.github
+artifacts/
+vendor/
+
+# Runtime state that must never be baked into an image.
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.jsonl
+.env
+
+# Docs and tooling the build does not need.
+*.md
+.golangci.yml
+sqlc.yaml
+Dockerfile
+deploy/

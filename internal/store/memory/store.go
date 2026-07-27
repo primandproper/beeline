@@ -1,7 +1,17 @@
-// Package memory is an in-memory beeline.Store: a mutex-guarded map. It is the
-// prototype's hot read path, standing in for Redis/DynamoDB/Aerospike. Because the
-// Store interface is deliberately tiny (batch get/put, no ordering), this
-// implementation is a few lines and a production KV drops in behind the same seam.
+// Package memory holds in-memory implementations of the estimate Store and the
+// control-plane Repository.
+//
+// These are **test doubles, not a deployable backend.** Nothing here is wired
+// into the CLI: a `serve` process always runs against shared Postgres, because
+// per-head in-memory state would make heads disagree. What these exist for is the
+// packages above the storage seams (control, httpapi, query, refresh, follower),
+// which need somewhere to put fixtures without a database.
+//
+// A double is only worth having if it cannot lie about the thing it stands in
+// for, so both are pinned to the real backends by conformance suites:
+// internal/store/storetest for the Store, internal/control/repositorytest for the
+// Repository. Change behavior here and those suites are what tell you whether the
+// change was a fix or a divergence.
 package memory
 
 import (
@@ -60,6 +70,38 @@ func (s *Store) Reset() {
 	defer s.mu.Unlock()
 
 	s.data = make(map[beeline.PairKey]beeline.Stored)
+}
+
+// DeleteArea drops every stored estimate belonging to one service area, leaving
+// other areas untouched. The control plane calls it when an area is disabled (or its
+// geometry changes) so the shared store keeps only enabled areas' cached values. The
+// prototype scans the map, which is fine because disable is a rare, operator-driven
+// event; a production store would key by area or maintain a secondary index.
+func (s *Store) DeleteArea(_ context.Context, area beeline.AreaID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for k := range s.data {
+		if k.Area == area {
+			delete(s.data, k)
+		}
+	}
+
+	return nil
+}
+
+// Delete drops the given keys from the store, ignoring any that are absent. The
+// demand-decay janitor calls it with the keys the freshness index swept, so a cold
+// demand pair's cached estimate leaves the hot store together with its index entry.
+func (s *Store) Delete(_ context.Context, keys []beeline.PairKey) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range keys {
+		delete(s.data, keys[i])
+	}
+
+	return nil
 }
 
 // Len reports how many pairs are currently stored (useful for tests and metrics).

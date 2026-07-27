@@ -1,0 +1,82 @@
+# The `work` follower: the compute half of the leader/follower split (design §8).
+# Fully stateless — no database, no store, no index, just claim → compute →
+# submit against whichever head the Service hands it, plus health probes. A
+# follower that dies lets its leases expire and another picks the batch up, so
+# these pods are safely SIGKILL-able and make good spot capacity.
+#
+# The environment supplies the `beeline-worker-env` ConfigMap (leader URL,
+# per-pod thread count, log level). Deliberately NOT the Postgres Secret:
+# followers never open a database, and handing them a DSN would be wiring that
+# lies about the architecture.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beeline-worker
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: worker
+    role: worker
+spec:
+  # No `replicas:` field — the KEDA ScaledObject owns it. See head.yaml.
+  selector:
+    matchLabels:
+      role: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: beeline
+        app.kubernetes.io/component: worker
+        role: worker
+    spec:
+      terminationGracePeriodSeconds: 30
+      # No initContainer, unlike the head: a follower tolerates an absent leader
+      # by design (retry policy behind a circuit breaker, falling back to the
+      # pool's idle backoff), and KEDA holds this deployment at zero until there
+      # is debt to burn anyway.
+      containers:
+        - name: worker
+          image: beeline
+          imagePullPolicy: IfNotPresent
+          args: ["work", "--config", "config/cluster.json"]
+          envFrom:
+            - configMapRef:
+                name: beeline-worker-env
+          ports:
+            - name: health
+              containerPort: 8081
+          livenessProbe:
+            httpGet:
+              path: /_ops_/live
+              port: health
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            # A follower's readiness IS the leader's reachability — it pings
+            # {leaderURL}/_ops_/live. That is the honest signal ("this worker can
+            # actually do work"), but it couples the whole fleet to a head
+            # rollout, so the failure threshold is generous.
+            #
+            # Consequence worth knowing: never `kubectl rollout status` this
+            # deployment. KEDA holds it at zero replicas, and readiness depends on
+            # the heads, so the wait would hang rather than fail.
+            httpGet:
+              path: /_ops_/ready
+              port: health
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 300m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 384Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault

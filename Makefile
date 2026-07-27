@@ -15,14 +15,16 @@ COVERAGE_OUT  := $(ARTIFACTS_DIR)/coverage.out
 TOTAL_PACKAGE_LIST := `go list $(THIS)/...`
 
 # CONTAINER VERSIONS
-LINTER_IMAGE     := golangci/golangci-lint:v2.10.1
-SHELLCHECK_IMAGE := koalaman/shellcheck:stable
+LINTER_IMAGE        := golangci/golangci-lint:v2.10.1
+SHELLCHECK_IMAGE    := koalaman/shellcheck:stable
+SQL_GENERATOR_IMAGE := sqlc/sqlc:1.26.0
 
 # COMMANDS
 CONTAINER_RUNNER      := docker
 RUN_CONTAINER         := $(CONTAINER_RUNNER) run --rm --volume $(PWD):$(PWD) --workdir=$(PWD) --network=host
 RUN_CONTAINER_AS_USER := $(RUN_CONTAINER) --user $(MYSELF):$(MY_GROUP)
 LINTER                := $(RUN_CONTAINER) $(LINTER_IMAGE) golangci-lint
+SQL_GENERATOR         := $(RUN_CONTAINER_AS_USER) $(SQL_GENERATOR_IMAGE)
 
 ## non-PHONY folders/files
 
@@ -104,23 +106,12 @@ lint: golang_lint shellcheck
 configs:
 	$(SCRIPTS_DIR)/configs.sh $(THIS)
 
-# mask builds the road mask (design §7) for a service area from Overture Maps and
-# writes the H3 cell set `serve` loads via BEELINE_MATRIX_ROAD_MASK_PATH. Requires
-# the duckdb CLI on PATH (`mise install` provides it). The defaults build the demo
-# Austin mask; override the MASK_* variables to build one for another area. The S3
-# pull is cached under artifacts/, so re-runs are offline unless you pass --refetch.
-MASK_LAT        ?= 30.34284460447388
-MASK_LNG        ?= -98.02736352689148
-MASK_RESOLUTION ?= 9
-MASK_AREA_RINGS ?= 14
-MASK_OUT        ?= config/masks/austin-res9.cells
-MASK_CACHE      ?= $(ARTIFACTS_DIR)/overture/austin-res9.csv
-
-.PHONY: mask
-mask:
-	mise exec -- go run $(THIS)/cmd/tools/maskgen \
-		--lat $(MASK_LAT) --lng $(MASK_LNG) --resolution $(MASK_RESOLUTION) \
-		--area-rings $(MASK_AREA_RINGS) --cache $(MASK_CACHE) --out $(MASK_OUT)
+# sqlc regenerates the typed queries under internal/store/postgres/generated from
+# sqlc_queries + migrations. Edit the .sql, then re-run this; commit the
+# generated Go so it stays reviewable and in lockstep.
+.PHONY: sqlc
+sqlc:
+	$(SQL_GENERATOR) generate
 
 ## EXECUTION
 
@@ -136,6 +127,82 @@ build: $(ARTIFACTS_DIR)
 run:
 	go run $(CMD_PACKAGE) $(ARGS)
 
+## IMAGES
+
+# docker-build produces the one image every role runs from: `serve` (a head) and
+# `work` (a follower) are the same binary with different arguments. Version
+# metadata rides in as build args because .dockerignore keeps .git out of the
+# build context. `make demo` calls this for you; the target exists so you can
+# build without standing a cluster up.
+IMAGE ?= beeline:demo
+.PHONY: docker-build
+docker-build:
+	IMAGE=$(IMAGE) CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/docker_build.sh
+
+## DEMO
+#
+# demo runs the deployment on a local k3s cluster (k3d): shared Postgres
+# (coordination state) and Redis (hot estimate store), an autoscaling pool of
+# `serve` heads behind one Service, an autoscaling pool of `work` followers, and
+# a bundled k6 load generator aimed at the heads. Seeded with the three Austin
+# service areas (scripts/seed_demo_areas.sh).
+#
+# Both pools scale, which is the point:
+#
+#   * heads on CPU, via a HorizontalPodAutoscaler over the metrics-server k3s
+#     already ships — the read path is CPU-bound, and the load generator is what
+#     moves it;
+#   * followers on freshness DEBT, read straight off GET /_ops_/freshness by
+#     KEDA's metrics-api scaler with no metrics pipeline in between, all the way
+#     down to zero when nothing is stale.
+#
+# The seeded areas carry a 5m targetTTL, so the whole working set re-stales at
+# once every five minutes and both pools cycle unattended. Leave it running.
+#
+# Manifests live in deploy/base (what beeline is) plus deploy/environments/local
+# (what makes it a laptop demo). Needs Docker, kubectl and k3d
+# (`brew install k3d`); it never reads or changes your current kubectl context.
+#
+# This is the only demo, because it is the only deployment shape. PORT publishes
+# the ingress; WORKER_MAX bounds the follower pool (its size is KEDA's call, not
+# a fixed count); RPS drives the load generator.
+ENVIRONMENT ?= local
+PORT ?= 8080
+WORKER_MAX ?= 8
+RPS ?= 25
+KEEP_CLUSTER ?= false
+.PHONY: demo
+demo:
+	ENVIRONMENT=$(ENVIRONMENT) PORT=$(PORT) WORKER_MAX=$(WORKER_MAX) RPS=$(RPS) \
+		IMAGE=$(IMAGE) KEEP_CLUSTER=$(KEEP_CLUSTER) CONTAINER_RUNNER=$(CONTAINER_RUNNER) \
+		$(SCRIPTS_DIR)/demo.sh
+
+# demo-down deletes a cluster left behind by KEEP_CLUSTER=true.
+.PHONY: demo-down
+demo-down:
+	k3d cluster delete beeline-$(ENVIRONMENT)
+
+# test runs the whole suite against real Postgres and Redis. The suite
+# provisions its own containers, so nothing silently skips; this target starts
+# one server of each kind up front so the four container-backed package binaries
+# share them instead of starting one apiece. Needs Docker, like lint and sqlc.
+# FAILFAST=false reports every failing package instead of stopping at the first.
 .PHONY: test
 test: $(ARTIFACTS_DIR)
-	$(SCRIPTS_DIR)/test.sh
+	CONTAINER_RUNNER=$(CONTAINER_RUNNER) $(SCRIPTS_DIR)/test.sh
+
+# test-short is the Docker-free fast loop: -short makes the container-backed
+# tests skip explicitly. It leaves the Postgres and Redis backends untested, so
+# run `make test` before pushing.
+.PHONY: test-short
+test-short: $(ARTIFACTS_DIR)
+	$(SCRIPTS_DIR)/test_short.sh
+
+# bench-store runs the hot-store benchmark gate: 300k-key BatchGet p50/p95 for
+# the in-memory baseline, Postgres, and Redis. The numbers decide the blessed
+# distributed-mode hot store (postgres p95 < 1s keeps the single-dependency
+# default). The benchmarks provision their own containers, so this needs Docker
+# unless BEELINE_TEST_POSTGRES_DSN / BEELINE_TEST_REDIS_ADDR are exported.
+.PHONY: bench-store
+bench-store:
+	$(SCRIPTS_DIR)/bench_store.sh

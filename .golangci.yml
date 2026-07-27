@@ -146,6 +146,14 @@ linters:
       - linters:
           - contextcheck
         path: internal/cli/
+      # Typed-router handlers report failures through the wire escape hatch
+      # (fail/commitJSON, see internal/httpapi/wire.go) and then return a nil
+      # error on purpose: a returned error would be re-encoded by the framework
+      # in the platform envelope shape and logged at error level for every bad
+      # request. nilerr stays enabled everywhere else.
+      - linters:
+          - nilerr
+        path: internal/httpapi/
       - linters:
           - bodyclose
           - errcheck

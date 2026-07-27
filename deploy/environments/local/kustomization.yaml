@@ -1,0 +1,71 @@
+# The local environment: everything that makes deploy/base a laptop demo rather
+# than a deployment. In-cluster Postgres and Redis, throwaway credentials, a load
+# generator, a locally-built image, and laptop-sized autoscaler bounds.
+#
+#   kubectl apply -k deploy/environments/local
+#
+# though `make demo` is the supported path — it also creates the k3d cluster
+# (k3d.yaml), installs KEDA, side-loads the image, and seeds the demo areas.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: beeline-local
+
+resources:
+  - ../../base
+  - namespace.yaml
+  - postgres.yaml
+  - redis.yaml
+  - loadgen.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/instance: local
+
+images:
+  # Built by scripts/docker_build.sh and side-loaded with `k3d image import`; it
+  # exists in no registry, which is why base pins imagePullPolicy: IfNotPresent.
+  - name: beeline
+    newTag: demo
+
+configMapGenerator:
+  # The head's environment. Redis as the hot store is a local choice — the
+  # blessed default is Postgres — so it belongs here rather than in base.
+  - name: beeline-head-env
+    literals:
+      - BEELINE_MATRIX_BACKEND_HOT_STORE=redis
+      - BEELINE_MATRIX_BACKEND_REDIS_ADDR=beeline-redis:6379
+      - BEELINE_MATRIX_SERVER_PORT=8080
+      # NOT BEELINE_LOG_LEVEL. The root flags are seeded from the environment only
+      # on the flag/default path; with --config set, LoadFromFile ignores them
+      # entirely, so BEELINE_LOG_LEVEL is silently inert. This nested variable
+      # goes through the env overlay that runs after the file loads, so it works.
+      - BEELINE_OBSERVABILITY_LOGGING_LEVEL=info
+
+  # The follower's environment. No Postgres DSN: followers never open a database.
+  - name: beeline-worker-env
+    literals:
+      # Replaces compose's `--leader` flag and its shared `heads` DNS alias;
+      # kube-proxy now does the spreading.
+      - BEELINE_MATRIX_FOLLOWER_LEADER_URL=http://beeline-head:8080
+      - BEELINE_MATRIX_FOLLOWER_WORKERS=4
+      - BEELINE_OBSERVABILITY_LOGGING_LEVEL=info
+
+  - name: beeline-loadgen-script
+    files:
+      - loadgen.js
+
+secretGenerator:
+  # Throwaway credentials for a database that lives in an emptyDir and dies with
+  # the cluster — this is a Secret for the wiring shape, not for secrecy. That
+  # shape is the point: base reads its DSN from a secretRef, so pointing a
+  # different environment at managed Postgres changes this block and nothing else.
+  - name: beeline-postgres
+    literals:
+      - POSTGRES_USER=beeline
+      - POSTGRES_PASSWORD=beeline
+      - POSTGRES_DB=beeline
+      - "BEELINE_MATRIX_BACKEND_POSTGRES_URL=postgres://beeline:beeline@beeline-postgres:5432/beeline?sslmode=disable"
+
+patches:
+  - path: autoscaling-patch.yaml

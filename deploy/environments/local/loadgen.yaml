@@ -1,0 +1,87 @@
+# The read-load generator. Local-only by construction: a load generator is a demo
+# device, not part of what beeline is, so it never appears in base.
+#
+# The script (loadgen.js) explains the two choices that matter — open-model
+# arrival rate, and `fill: false` on /table. Read it before tuning anything here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beeline-loadgen
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: loadgen
+    role: loadgen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      role: loadgen
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: beeline
+        app.kubernetes.io/component: loadgen
+        role: loadgen
+    spec:
+      terminationGracePeriodSeconds: 5
+      initContainers:
+        # k6 has no retry-until-up mode; without this its first iterations are
+        # connection refusals against a head pool that has not finished booting.
+        - name: wait-for-head
+          image: beeline
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until wget --quiet --spider http://beeline-head:8080/_ops_/ready; do
+                echo "waiting for a ready head"
+                sleep 2
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      containers:
+        - name: k6
+          image: grafana/k6:0.58.0
+          imagePullPolicy: IfNotPresent
+          # --no-summary and --no-thresholds keep k6 from retaining samples for an
+          # end-of-test report nobody reads; together with the bounded duration in
+          # the script they are what stop this pod OOMKilling itself.
+          command:
+            - k6
+            - run
+            - --no-usage-report
+            - --no-summary
+            - --no-thresholds
+            - --quiet
+            - /scripts/loadgen.js
+          env:
+            - name: BASE
+              value: "http://beeline-head:8080"
+            - name: RPS
+              value: "25"
+            - name: TABLE_GRID
+              value: "24"
+            - name: TABLE_RATIO
+              value: "0.25"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              # Headroom over the bounded 30m run. If this pod starts OOMKilling
+              # again, shorten `duration` in loadgen.js rather than raising this —
+              # the memory grows with run length, not with RPS.
+              cpu: "2"
+              memory: 1Gi
+      volumes:
+        - name: script
+          configMap:
+            name: beeline-loadgen-script

@@ -12,46 +12,180 @@
     <aside id="sidebar">
       <div class="brand">
         <h1><span class="bee">◆</span> Beeline Console</h1>
-        <p>Draw the service area, then watch the cache load.</p>
+        <p>Configure service areas, enable them, watch the cache load.</p>
       </div>
 
-      <div class="section" id="config-section">
-        <h2>Boundary &amp; tessellation</h2>
-
-        <div class="field">
-          <label>Center <span class="val" id="center-val">—</span></label>
-          <div class="coords" id="center-coords">click the map to move</div>
-          <div class="hint">Click the map or drag the marker to set the center.</div>
+      <!-- Areas list -->
+      <div class="section">
+        <div class="section-head">
+          <h2>Service areas</h2>
+          <button class="ghost" id="new-area-btn">+ New</button>
         </div>
-
-        <div class="field">
-          <label>H3 resolution <span class="val" id="res-val">8</span></label>
-          <input type="range" id="res" min="4" max="12" step="1" value="8" />
-          <div class="hint" id="res-hint"></div>
-          <div class="mask-warn" id="mask-warn" hidden></div>
+        <div id="areas-list" class="areas-list"></div>
+        <div class="empty" id="areas-empty" hidden>
+          No areas yet. Create one, then enable it to start refreshing.
         </div>
+      </div>
 
+      <!-- Create form (hidden until +New) -->
+      <div class="section" id="create-section" hidden>
+        <h2>New area</h2>
+        <div class="field">
+          <label for="new-name">Name</label>
+          <input type="text" id="new-name" class="text" placeholder="e.g. downtown" />
+        </div>
         <div class="row">
           <div class="field">
-            <label>Area rings <span class="val" id="area-rings-val">6</span></label>
-            <input type="range" id="area-rings" min="0" max="16" step="1" value="6" />
+            <label for="new-res">H3 resolution <span class="val" id="new-res-val">8</span></label>
+            <input type="range" id="new-res" min="4" max="12" step="1" value="8" />
           </div>
           <div class="field">
-            <label>Radius rings <span class="val" id="radius-rings-val">3</span></label>
-            <input type="range" id="radius-rings" min="1" max="8" step="1" value="3" />
+            <label for="new-radius">Max radius (m) <span class="val" id="new-radius-val">3000</span></label>
+            <input type="range" id="new-radius" min="0" max="20000" step="500" value="3000" />
+            <div class="hint">Per-origin travel-radius bound. 0 = full mesh (every in-area pair).</div>
           </div>
         </div>
-        <div class="hint">Area rings set how far the boundary reaches from center. Radius rings bound how far each origin routes (the travel-radius prune, §7).</div>
-
-        <div class="preview-stats">
-          <div class="stat"><span class="n" id="preview-cells">—</span><span class="k">cells</span></div>
-          <div class="stat"><span class="n" id="preview-pairs">—</span><span class="k">pairs</span></div>
+        <div class="row">
+          <div class="field">
+            <label for="new-strategy">Warm strategy</label>
+            <select id="new-strategy" class="text">
+              <option value="eager">eager — pin the whole bound</option>
+              <option value="lazy">lazy — demand only</option>
+              <option value="hybrid">hybrid — pin core, fill tail</option>
+            </select>
+          </div>
+          <div class="field" id="new-core-field" hidden>
+            <label for="new-core">Core radius (m) <span class="val" id="new-core-val">1500</span></label>
+            <input type="range" id="new-core" min="0" max="20000" step="500" value="1500" />
+            <div class="hint">Hybrid only: near field pinned fresh (≤ max radius).</div>
+          </div>
         </div>
-
-        <button class="apply" id="apply">Apply &amp; rebuild cache</button>
+        <div class="field">
+          <label for="new-provider">Routing provider</label>
+          <select id="new-provider" class="text"></select>
+          <div class="hint">Which engine serves this area. Populated from server config.</div>
+        </div>
+        <div class="field">
+          <label for="new-ttl">Demand idle TTL</label>
+          <input type="text" id="new-ttl" class="text" placeholder="e.g. 1h (blank = never decay)" />
+          <div class="hint">Demand-filled pairs unqueried for this long are evicted. Blank / 0 disables decay.</div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="new-target-ttl">Target TTL</label>
+            <input type="text" id="new-target-ttl" class="text" placeholder="blank = default" />
+            <div class="hint">Freshness window: a pair older than this is refreshed.</div>
+          </div>
+          <div class="field">
+            <label for="new-lease">Lease</label>
+            <input type="text" id="new-lease" class="text" placeholder="blank = default" />
+            <div class="hint">Refresh claim visibility timeout.</div>
+          </div>
+          <div class="field">
+            <label for="new-sweep">Sweep interval</label>
+            <input type="text" id="new-sweep" class="text" placeholder="blank = default" />
+            <div class="hint">Demand-decay cadence for this area.</div>
+          </div>
+        </div>
+        <div class="field">
+          <label for="new-geojson">GeoJSON polygon</label>
+          <input type="file" id="new-geojson" accept=".json,.geojson,application/geo+json,application/json" required />
+          <div class="hint">Required. Upload a Polygon / MultiPolygon (Feature or FeatureCollection) — the area's canonical geometry; every layer derives its cells from it.</div>
+        </div>
+        <div class="preview-stats" id="create-preview" hidden>
+          <div class="stat"><span class="n" id="preview-cells">—</span><span class="k">cells (preview)</span></div>
+        </div>
+        <div class="btn-row">
+          <button class="apply" id="create-btn">Create area</button>
+          <button class="ghost" id="create-cancel">Cancel</button>
+        </div>
       </div>
 
-      <div class="section">
+      <!-- Selected area detail -->
+      <div class="section" id="detail-section" hidden>
+        <div class="section-head">
+          <h2 id="detail-name">—</h2>
+          <span class="badge" id="detail-badge">disabled</span>
+        </div>
+        <div class="detail-grid">
+          <div><span class="dk">warm</span><span class="dv" id="detail-strategy">—</span></div>
+          <div><span class="dk">provider</span><span class="dv" id="detail-provider">—</span></div>
+          <div><span class="dk">demand TTL</span><span class="dv" id="detail-ttl">—</span></div>
+          <div><span class="dk">target TTL</span><span class="dv" id="detail-target-ttl">—</span></div>
+          <div><span class="dk">lease</span><span class="dv" id="detail-lease">—</span></div>
+          <div><span class="dk">sweep</span><span class="dv" id="detail-sweep">—</span></div>
+        </div>
+
+        <!-- Precision layers (display-only; multi-layer areas are shaped via the API). -->
+        <table class="layers-table" id="detail-layers">
+          <thead>
+            <tr><th>res</th><th>min dist</th><th>max radius</th><th>core</th><th>cells</th><th>cache</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="btn-row">
+          <button class="apply" id="toggle-enable">Enable</button>
+          <button class="ghost" id="edit-settings-btn">Edit settings</button>
+        </div>
+
+        <!-- Edit settings: PATCH the area's metadata. Layers are display-only here
+             (passed through unchanged); reshape them via the API. -->
+        <div class="edit-form" id="edit-settings" hidden>
+          <div class="field">
+            <label for="edit-name">Name</label>
+            <input type="text" id="edit-name" class="text" />
+          </div>
+          <div class="field">
+            <label for="edit-strategy">Warm strategy</label>
+            <select id="edit-strategy" class="text">
+              <option value="eager">eager — pin the whole bound</option>
+              <option value="lazy">lazy — demand only</option>
+              <option value="hybrid">hybrid — pin per-layer core, fill tail</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="edit-provider">Routing provider</label>
+            <select id="edit-provider" class="text"></select>
+          </div>
+          <div class="field">
+            <label for="edit-ttl">Demand idle TTL</label>
+            <input type="text" id="edit-ttl" class="text" placeholder="e.g. 1h (blank = never decay)" />
+            <div class="hint">Demand-filled pairs unqueried for this long are evicted. Blank / 0 disables decay.</div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label for="edit-target-ttl">Target TTL</label>
+              <input type="text" id="edit-target-ttl" class="text" placeholder="blank = default" />
+              <div class="hint">Freshness window: a pair older than this is refreshed.</div>
+            </div>
+            <div class="field">
+              <label for="edit-lease">Lease</label>
+              <input type="text" id="edit-lease" class="text" placeholder="blank = default" />
+              <div class="hint">Refresh claim visibility timeout.</div>
+            </div>
+            <div class="field">
+              <label for="edit-sweep">Sweep interval</label>
+              <input type="text" id="edit-sweep" class="text" placeholder="blank = default" />
+              <div class="hint">Demand-decay cadence for this area.</div>
+            </div>
+          </div>
+          <div class="hint" id="edit-reconverge-hint" hidden>Saving re-seeds this enabled area — its cache reloads from zero.</div>
+          <div class="btn-row">
+            <button class="apply" id="edit-save">Save settings</button>
+            <button class="ghost" id="edit-cancel">Cancel</button>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <label class="ghost file-btn">Replace GeoJSON
+            <input type="file" id="replace-geojson" accept=".json,.geojson,application/geo+json,application/json" hidden />
+          </label>
+          <button class="ghost danger" id="delete-area">Delete</button>
+        </div>
+      </div>
+
+      <!-- Cache load (selected area) -->
+      <div class="section" id="progress-section" hidden>
         <h2>Cache load</h2>
         <div class="progress-head">
           <span class="pct" id="pct">0%</span>
@@ -73,14 +207,9 @@
         </div>
       </div>
 
-      <div class="section pill-section">
-        <h2>Profiles</h2>
-        <div class="pill-row" id="profiles"></div>
-      </div>
-
       <div class="spacer"></div>
       <div class="foot">
-        Reads: <code>GET /estimate</code> · Freshness: <code>/_ops_/freshness</code>
+        Areas: <code>/_config_/areas</code> · Reads: <code>GET /estimate</code>
       </div>
     </aside>
 

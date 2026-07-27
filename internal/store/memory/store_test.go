@@ -12,28 +12,53 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStore(t *testing.T) {
+// The Store contract itself lives in conformance_test.go, which runs the shared
+// storetest suite. What remains here is the memory store's own surface: Len and
+// Reset are not part of beeline.Store, so no shared suite can cover them.
+
+func put(t *testing.T, store *memory.Store, area beeline.AreaID, origin beeline.H3Cell) {
+	t.Helper()
+
+	require.NoError(t, store.Put(context.Background(), []beeline.Entry{{
+		Key:    beeline.PairKey{Area: area, Origin: origin, Dest: origin + 1, Profile: "car", Res: 8},
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1, Distance: 1}, ComputedAt: time.Now()},
+	}}))
+}
+
+func TestStoreLenTracksStoredPairs(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
 	store := memory.New()
+	assert.Equal(t, 0, store.Len(), "a fresh store is empty")
 
-	key := beeline.PairKey{Origin: 1, Dest: 2, Profile: "car", Res: 8}
-	miss := beeline.PairKey{Origin: 9, Dest: 9, Profile: "car", Res: 8}
+	put(t, store, 1, 10)
+	put(t, store, 1, 11)
+	put(t, store, 2, 20)
+	assert.Equal(t, 3, store.Len())
 
-	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 120, Distance: 1500}, ComputedAt: time.Now()},
-	}}))
+	// Re-putting a key already present must not inflate the count.
+	put(t, store, 1, 10)
+	assert.Equal(t, 3, store.Len(), "an overwrite is not a new pair")
 
-	got, err := store.BatchGet(ctx, []beeline.PairKey{key, miss})
+	require.NoError(t, store.DeleteArea(context.Background(), 1))
+	assert.Equal(t, 1, store.Len(), "only area 2's estimate remains")
+}
+
+func TestStoreResetDropsEverything(t *testing.T) {
+	t.Parallel()
+
+	store := memory.New()
+	put(t, store, 1, 10)
+	put(t, store, 2, 20)
+	require.Equal(t, 2, store.Len())
+
+	store.Reset()
+
+	assert.Equal(t, 0, store.Len(), "a re-tessellation drops every cached estimate")
+
+	got, err := store.BatchGet(context.Background(), []beeline.PairKey{
+		{Area: 1, Origin: 10, Dest: 11, Profile: "car", Res: 8},
+	})
 	require.NoError(t, err)
-	require.Len(t, got, 2)
-
-	require.NotNil(t, got[0])
-	assert.InDelta(t, 120, got[0].Duration, 1e-9)
-	assert.InDelta(t, 1500, got[0].Distance, 1e-9)
-
-	assert.Nil(t, got[1], "miss should be a nil element")
-	assert.Equal(t, 1, store.Len())
+	assert.Nil(t, got[0], "and the dropped keys read as misses")
 }

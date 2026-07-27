@@ -1,0 +1,32 @@
+# Host access to the head pool.
+#
+# A single catch-all rule is required, not a stylistic choice: the embedded
+# operator console is mounted at `/` and `/assets/*` (internal/webui/embed.go),
+# so any narrower path prefix serves the API and breaks the UI.
+#
+# SECURITY NOTE, deliberately left loud: this publishes the whole surface,
+# including the *unauthenticated* control plane — POST /_config_/areas,
+# PUT /_config_/providers/{name}, POST /_ops_/warm are all cluster-mutating, as
+# the source says throughout ("a real deploy would gate these"). That is fine for
+# a local demo on localhost. It is the reason this rule lives in base rather than
+# being assumed: an environment that is not somebody's laptop is expected to
+# patch or replace it with something that authenticates, or to split the read
+# path onto its own route.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: beeline
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: head
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: beeline-head
+                port:
+                  name: http

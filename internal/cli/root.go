@@ -14,8 +14,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v4/observability"
-	"github.com/primandproper/platform-go/v4/observability/logging"
+	"github.com/primandproper/platform-go/v7/clock"
+	"github.com/primandproper/platform-go/v7/observability"
+	"github.com/primandproper/platform-go/v7/observability/logging"
 
 	"github.com/spf13/cobra"
 )
@@ -35,12 +36,13 @@ type application struct {
 	pillars *observability.Pillars
 	logger  logging.Logger
 	cfg     *config.Config
+	clock   clock.Clock
 }
 
 // Execute builds the root command, runs it, and tears down the observability
 // suite afterwards so buffered telemetry is flushed even when a command fails.
 func Execute(ctx context.Context) error {
-	app := &application{}
+	app := &application{clock: clock.NewClock()}
 
 	rootCmd := app.newRootCommand()
 	err := rootCmd.ExecuteContext(ctx)
@@ -78,6 +80,7 @@ func (a *application) newRootCommand() *cobra.Command {
 
 	rootCmd.AddCommand(a.newVersionCommand())
 	rootCmd.AddCommand(a.newServeCommand())
+	rootCmd.AddCommand(a.newWorkCommand())
 
 	return rootCmd
 }

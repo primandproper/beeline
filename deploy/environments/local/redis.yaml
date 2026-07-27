@@ -1,0 +1,71 @@
+# Redis for the local environment only: the hot estimate store. Only cached
+# scalars live here, never coordination state, so losing it costs a recompute and
+# nothing else — hence no volume at all and persistence switched off outright.
+#
+# The hot store is the one remaining backend choice (matrix.backend.hotStore);
+# Postgres is the blessed default and Redis is the batch-read headroom option,
+# which is what the demo runs to exercise the less-travelled path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beeline-redis
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: redis
+    role: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      role: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: beeline
+        app.kubernetes.io/component: redis
+        role: redis
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["redis-server", "--save", "", "--appendonly", "no"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beeline-redis
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  selector:
+    role: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

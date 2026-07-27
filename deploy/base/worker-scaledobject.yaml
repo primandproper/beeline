@@ -1,0 +1,66 @@
+# The follower pool scales on freshness debt — the §3 contract used directly as a
+# scaling metric, with no metrics pipeline in between. KEDA's metrics-api scaler
+# polls a head's GET /_ops_/freshness and reads the top-level `debt` field of
+# beeline.DebtStats: the number of pairs older than their target TTL, including
+# never-computed ones. That is precisely "how much work is queued", which is the
+# thing a work pool should size itself against.
+#
+# Why this is safe to read off any single head: every head reads one shared
+# Postgres index and one shared throughput counter, so they all report the same
+# aggregate. The value is memoized ~500ms per head, so polling faster than 2Hz
+# buys nothing.
+#
+# Do NOT add a HorizontalPodAutoscaler for beeline-worker — KEDA creates
+# `keda-hpa-beeline-worker` itself, and two autoscalers on one Deployment fight.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: beeline-worker
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: worker
+spec:
+  scaleTargetRef:
+    name: beeline-worker
+  # The default 30s is too slow to watch a burn-down; the head's 500ms memo means
+  # this costs at most one debt scan per interval.
+  pollingInterval: 5
+  # Governs only the N->0 transition. The behavior block below governs N->M; both
+  # need shortening or the pool looks frozen.
+  cooldownPeriod: 60
+  fallback:
+    # If every head goes NotReady the scaler errors out. Hold a working pool
+    # rather than thrashing to zero and back.
+    failureThreshold: 3
+    replicas: 2
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Percent
+              value: 100
+              periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - type: Percent
+              value: 50
+              periodSeconds: 30
+  triggers:
+    - type: metrics-api
+      metadata:
+        # MUST be namespace-qualified: keda-operator resolves this from the `keda`
+        # namespace, so a bare `http://beeline-head:8080` resolves to nothing and
+        # the ScaledObject fails quietly. The overlay patches the real FQDN.
+        url: "http://beeline-head.beeline.svc.cluster.local:8080/_ops_/freshness"
+        format: "json"
+        valueLocation: "debt"
+        # KEDA external metrics are AverageValue targets, so this is debt *per
+        # replica*: replicas = ceil(debt / targetValue). The overlay sizes it.
+        targetValue: "50000"
+        # Activation compares the RAW metric, not the per-replica one — this is the
+        # threshold below which the pool is allowed to reach zero.
+        activationTargetValue: "5000"
+        timeout: "5s"

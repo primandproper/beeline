@@ -1,0 +1,190 @@
+# The `serve` head: a stateless request head (design §8.2). Every replica is
+# identical and disposable — the freshness index, operator config and singleton
+# election all live in shared Postgres, so "leader" is not a role and there is
+# nothing here to elect, promote or drain into. Scale it, kill it, roll it.
+#
+# The environment supplies the two things this file only names: the
+# `beeline-postgres` Secret (the DSN) and the `beeline-head-env` ConfigMap (hot
+# store, port, log level). That is the whole seam between "what beeline is" and
+# "where it is running".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beeline-head
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: head
+    role: head
+spec:
+  # No `replicas:` field on purpose — the HorizontalPodAutoscaler owns it. Pinning
+  # it here means every `kubectl apply -k` stomps whatever the autoscaler decided,
+  # which reads as an intermittent bug rather than a config mistake.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      role: head
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: beeline
+        app.kubernetes.io/component: head
+        role: head
+    spec:
+      # 10s HTTP drain + 5s freshness-index drain + 5s pillars flush ~= 20s worst
+      # case (internal/cli/serve.go, internal/cli/backend.go), plus margin.
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    role: head
+      # `serve` exits non-zero when Postgres is unreachable at startup
+      # (internal/cli/backend.go), so without this the pool spends its first minute
+      # paying CrashLoopBackOff's exponential penalty. This is the Kubernetes answer
+      # to compose's `depends_on: {condition: service_healthy}`. It reuses the
+      # beeline image so no second image has to reach the node.
+      initContainers:
+        - name: wait-for-backends
+          image: beeline
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nc -z beeline-postgres 5432 && nc -z beeline-redis 6379; do
+                echo "waiting for postgres + redis"
+                sleep 1
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      containers:
+        - name: head
+          image: beeline
+          # The tag exists only in the local daemon (side-loaded with `k3d image
+          # import`), so this must never resolve to a registry pull. Never tag this
+          # image `:latest` either — that flips the default policy to Always.
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--config", "config/cluster.json"]
+          envFrom:
+            - configMapRef:
+                name: beeline-head-env
+            - secretRef:
+                name: beeline-postgres
+          ports:
+            - name: http
+              containerPort: 8080
+          lifecycle:
+            preStop:
+              # /_ops_/ready does NOT flip on SIGTERM — the listener keeps answering
+              # 200 until srv.Shutdown closes it. Without this pause the endpoints
+              # controller deregisters after the socket is gone, which is a 502
+              # window on every rollout.
+              sleep:
+                seconds: 3
+          startupProbe:
+            httpGet:
+              path: /_ops_/live
+              port: http
+            periodSeconds: 2
+            # 120s: the head that wins the advisory lock runs the migrations, and
+            # the first head up also seeds the working set from enabled areas.
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /_ops_/live
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            # Runs the healthcheck registry: a Postgres ping always, plus a Redis
+            # ping when that hot store is selected. The registry's per-checker
+            # budget is 5s, so the probe timeout has to exceed it.
+            httpGet:
+              path: /_ops_/ready
+              port: http
+            periodSeconds: 3
+            timeoutSeconds: 6
+            failureThreshold: 3
+          resources:
+            requests:
+              # The CPU request is the HPA's denominator: utilization is measured
+              # against it, so this is load-bearing config, not a hint.
+              cpu: 250m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              # A head idles around 75Mi, but the debt/cells aggregates scan the
+              # whole pair_freshness table — measured OOMKills at 512Mi against a
+              # ~1.1M-pair working set, so the ceiling has to clear the scan, not
+              # the steady state.
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            # Matches `adduser -D -H -u 10001 beeline` in the Dockerfile. runAsGroup
+            # is deliberately unset: busybox adduser picks the gid itself, and
+            # asserting one we haven't verified would just fail the pod.
+            runAsUser: 10001
+            # Nothing is written at runtime — all state lives in Postgres/Redis.
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+# One Service, three jobs: the followers' leader URL, KEDA's poll target for the
+# freshness debt metric, and the ingress backend.
+#
+# It balances per *connection*, and the follower's HTTP client keeps connections
+# alive, so each follower effectively pins to one head — exactly as it did with
+# compose's shared `heads` DNS alias. That is fine (every head reads one Postgres
+# index and answers identically), but don't expect per-request fan-out.
+apiVersion: v1
+kind: Service
+metadata:
+  name: beeline-head
+  labels:
+    app.kubernetes.io/name: beeline
+    app.kubernetes.io/component: head
+spec:
+  type: ClusterIP
+  selector:
+    role: head
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# Heads are disposable, but "all of them at once" is still a read-path outage.
+# One survivor keeps the freshness contract answerable during voluntary
+# disruption (drains, node upgrades).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: beeline-head
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      role: head

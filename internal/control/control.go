@@ -691,9 +691,11 @@ var (
 	ErrProviderReserved = errors.New("control: provider name is reserved for a built-in engine")
 )
 
-// ErrProviderNotFound marks a delete of a provider that does not exist. The message
-// ends in "not found" so the HTTP layer's not-found mapping applies.
-var ErrProviderNotFound = errors.New("control: provider not found")
+// ErrProviderNotFound marks a delete of a provider that does not exist. It wraps
+// beeline.ErrNotFound so the HTTP layer's 404 mapping applies via errors.Is —
+// this used to rely on the message ending in "not found", which made the status
+// code a property of the wording.
+var ErrProviderNotFound = fmt.Errorf("control: provider %w", beeline.ErrNotFound)
 
 // ProviderInfo is one registry entry for the control-plane surface: the full spec
 // plus whether it is a synthesized built-in (immutable through the API).

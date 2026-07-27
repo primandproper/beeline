@@ -13,8 +13,10 @@ import (
 	"github.com/primandproper/platform-go/v7/clock"
 )
 
-// ErrNotFound is returned when an area id does not exist.
-var ErrNotFound = errors.New("sqlite: area not found")
+// ErrNotFound is returned when an area id does not exist. It wraps
+// beeline.ErrNotFound, so callers branch on errors.Is(err, beeline.ErrNotFound)
+// rather than on this package or on the message text.
+var ErrNotFound = fmt.Errorf("sqlite: area %w", beeline.ErrNotFound)
 
 // timeFormat is the on-disk representation of created_at/updated_at.
 const timeFormat = time.RFC3339Nano

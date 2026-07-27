@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"testing"
 
+	"github.com/primandproper/beeline/internal/control/repositorytest"
 	"github.com/primandproper/beeline/internal/store/postgres"
 	"github.com/primandproper/beeline/internal/store/postgres/pgtest"
 	"github.com/primandproper/beeline/internal/store/storetest"
@@ -18,5 +19,19 @@ func TestConformance(t *testing.T) {
 		tb.Helper()
 
 		return postgres.NewEstimateStore(pgtest.Open(tb))
+	})
+}
+
+// TestRepositoryConformance runs the shared control-plane repository suite — the
+// same one the SQLite repository runs — against the Postgres repository. The
+// schema-per-subtest isolation is what supplies the empty repository the suite
+// requires.
+func TestRepositoryConformance(t *testing.T) {
+	t.Parallel()
+
+	repositorytest.Run(t, func(tb testing.TB) repositorytest.Repository {
+		tb.Helper()
+
+		return postgres.NewRepository(pgtest.Open(tb), nil)
 	})
 }

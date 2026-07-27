@@ -16,9 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ErrNotFound is returned when an area id does not exist. The message ends in
-// "not found" — the HTTP layer's not-found mapping matches on that.
-var ErrNotFound = errors.New("postgres: area not found")
+// ErrNotFound is returned when an area id does not exist. It wraps
+// beeline.ErrNotFound, so callers branch on errors.Is(err, beeline.ErrNotFound)
+// rather than on this package or on the message text.
+var ErrNotFound = fmt.Errorf("postgres: area %w", beeline.ErrNotFound)
 
 // Config-version kinds: the convergence channels heads poll (see
 // config_version in migrations). Every mutating repository method bumps its

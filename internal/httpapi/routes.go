@@ -1149,11 +1149,13 @@ func writeAreaError(ctx context.Context, logger logging.Logger, err error) {
 	fail(ctx, logger, http.StatusBadRequest, err.Error())
 }
 
-// isNotFound reports whether err signals a missing area. The SQLite store's ErrNotFound
-// message ends in "area not found"; matching on that keeps httpapi free of a direct
-// dependency on the store package.
+// isNotFound reports whether err signals a missing area. Every store's
+// ErrNotFound wraps beeline.ErrNotFound, so this needs no dependency on a
+// concrete store package — and unlike the substring match it replaces, the
+// status code no longer depends on two independent stores wording their errors
+// the same way.
 func isNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "not found")
+	return errors.Is(err, beeline.ErrNotFound)
 }
 
 // cellStrings renders a cell set as hex strings.

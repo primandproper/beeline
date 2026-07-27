@@ -15,12 +15,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func newRepo(t *testing.T) *sqlite.Repository {
-	t.Helper()
+// newRepo opens a migrated, private in-memory database and wraps it. It takes
+// testing.TB so the conformance suite's factory can share it.
+func newRepo(tb testing.TB) *sqlite.Repository {
+	tb.Helper()
 
 	db, err := sqlite.Open(":memory:")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(tb, err)
+	tb.Cleanup(func() { _ = db.Close() })
 
 	return sqlite.NewRepository(db, nil)
 }

@@ -12,59 +12,53 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestStore(t *testing.T) {
-	t.Parallel()
+// The Store contract itself lives in conformance_test.go, which runs the shared
+// storetest suite. What remains here is the memory store's own surface: Len and
+// Reset are not part of beeline.Store, so no shared suite can cover them.
 
-	ctx := context.Background()
-	store := memory.New()
+func put(t *testing.T, store *memory.Store, area beeline.AreaID, origin beeline.H3Cell) {
+	t.Helper()
 
-	key := beeline.PairKey{Origin: 1, Dest: 2, Profile: "car", Res: 8}
-	miss := beeline.PairKey{Origin: 9, Dest: 9, Profile: "car", Res: 8}
-
-	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 120, Distance: 1500}, ComputedAt: time.Now()},
+	require.NoError(t, store.Put(context.Background(), []beeline.Entry{{
+		Key:    beeline.PairKey{Area: area, Origin: origin, Dest: origin + 1, Profile: "car", Res: 8},
+		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1, Distance: 1}, ComputedAt: time.Now()},
 	}}))
-
-	got, err := store.BatchGet(ctx, []beeline.PairKey{key, miss})
-	require.NoError(t, err)
-	require.Len(t, got, 2)
-
-	require.NotNil(t, got[0])
-	assert.InDelta(t, 120, got[0].Duration, 1e-9)
-	assert.InDelta(t, 1500, got[0].Distance, 1e-9)
-
-	assert.Nil(t, got[1], "miss should be a nil element")
-	assert.Equal(t, 1, store.Len())
 }
 
-func TestStoreDeleteArea(t *testing.T) {
+func TestStoreLenTracksStoredPairs(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
 	store := memory.New()
+	assert.Equal(t, 0, store.Len(), "a fresh store is empty")
 
-	put := func(area beeline.AreaID, origin beeline.H3Cell) {
-		require.NoError(t, store.Put(ctx, []beeline.Entry{{
-			Key:    beeline.PairKey{Area: area, Origin: origin, Dest: origin + 1, Profile: "car", Res: 8},
-			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1, Distance: 1}, ComputedAt: time.Now()},
-		}}))
-	}
+	put(t, store, 1, 10)
+	put(t, store, 1, 11)
+	put(t, store, 2, 20)
+	assert.Equal(t, 3, store.Len())
 
-	put(1, 10)
-	put(1, 11)
-	put(2, 20)
-	require.Equal(t, 3, store.Len())
+	// Re-putting a key already present must not inflate the count.
+	put(t, store, 1, 10)
+	assert.Equal(t, 3, store.Len(), "an overwrite is not a new pair")
 
-	require.NoError(t, store.DeleteArea(ctx, 1))
+	require.NoError(t, store.DeleteArea(context.Background(), 1))
 	assert.Equal(t, 1, store.Len(), "only area 2's estimate remains")
+}
 
-	// Area 2's estimate is still retrievable; area 1's is gone.
-	got, err := store.BatchGet(ctx, []beeline.PairKey{
-		{Area: 2, Origin: 20, Dest: 21, Profile: "car", Res: 8},
+func TestStoreResetDropsEverything(t *testing.T) {
+	t.Parallel()
+
+	store := memory.New()
+	put(t, store, 1, 10)
+	put(t, store, 2, 20)
+	require.Equal(t, 2, store.Len())
+
+	store.Reset()
+
+	assert.Equal(t, 0, store.Len(), "a re-tessellation drops every cached estimate")
+
+	got, err := store.BatchGet(context.Background(), []beeline.PairKey{
 		{Area: 1, Origin: 10, Dest: 11, Profile: "car", Res: 8},
 	})
 	require.NoError(t, err)
-	assert.NotNil(t, got[0])
-	assert.Nil(t, got[1])
+	assert.Nil(t, got[0], "and the dropped keys read as misses")
 }

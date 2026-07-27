@@ -27,10 +27,28 @@ type EngineResolver interface {
 // Store is the hot read path: a minimal batch key/value surface so "bring your own
 // datastore" is actually true (§5.2). No range queries, no ordering — any KV that
 // can batch-get qualifies.
+//
+// Implementations are pinned to one behavioral contract by
+// internal/store/storetest, which every backend runs as a conformance suite.
 type Store interface {
 	// BatchGet returns one result per key, positionally aligned; a nil element
-	// marks a miss.
+	// marks a miss. A key repeated in keys is answered at each of its positions.
 	BatchGet(ctx context.Context, keys []PairKey) ([]*Stored, error)
+	// Put writes each entry, overwriting any prior value for the same key.
+	//
+	// Entry.ComputedAt is advisory: a backend with its own clock authority
+	// (Postgres stamps computed_at = now()) substitutes its own timestamp, so
+	// distributed heads never compare process clocks — the same rule
+	// FreshnessIndex.MarkComputed follows. Whatever BatchGet returns is
+	// authoritative for staleness; callers must not assume they read back the
+	// instant they wrote. A store may also lose sub-millisecond precision, the
+	// monotonic reading, and the time.Location (Redis packs computed_at into a
+	// fixed-width millisecond field), so compare with Time.Equal and tolerances,
+	// never for exact identity.
+	//
+	// The practical consequence, and it is intended: staleness is measured from
+	// the write, not from the computation, so a follower's compute-to-Put latency
+	// is invisible to the freshness contract.
 	Put(ctx context.Context, entries []Entry) error
 }
 

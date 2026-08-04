@@ -5,8 +5,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/routing"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/routing"
 )
 
 // The typed router serializes any error a handler returns as the platform

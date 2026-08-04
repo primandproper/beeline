@@ -15,12 +15,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v7/database"
-	"github.com/primandproper/platform-go/v7/database/migrate"
-	pgclient "github.com/primandproper/platform-go/v7/database/postgres"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/observability/metrics"
-	"github.com/primandproper/platform-go/v7/observability/tracing"
+	"github.com/primandproper/platform-go/v9/database"
+	"github.com/primandproper/platform-go/v9/database/migrate"
+	pgclient "github.com/primandproper/platform-go/v9/database/postgres"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/observability/metrics"
+	"github.com/primandproper/platform-go/v9/observability/tracing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -51,7 +51,11 @@ func Open(
 	tracerProvider tracing.TracerProvider,
 	metricsProvider metrics.Provider,
 ) (database.Client, error) {
-	client, err := pgclient.NewDatabaseClient(ctx, logger, tracerProvider, cfg, metricsProvider)
+	client, err := pgclient.NewDatabaseClient(ctx, cfg,
+		pgclient.WithLogger(logger),
+		pgclient.WithTracerProvider(tracerProvider),
+		pgclient.WithMetricsProvider(metricsProvider),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: building database client: %w", err)
 	}
@@ -107,7 +111,7 @@ func applyMigrations(
 		return fmt.Errorf("postgres: database client does not expose a database/sql handle for migrations")
 	}
 
-	migrator, err := migrate.New(migrate.DialectPostgres, sub,
+	migrator, err := migrate.New(client.Dialect(), sub,
 		migrate.WithLockKey("beeline-migrations:"+pool.Config().ConnConfig.RuntimeParams["search_path"]),
 		migrate.WithLockTimeout(migrationLockProbe, migrationLockTimeout),
 		migrate.WithUnlockTimeout(migrationLockProbe, migrationUnlockTimeout),

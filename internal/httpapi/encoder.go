@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v9/observability/logging"
 )
 
 // wireEncoder is beeline's encoding.ServerEncoderDecoder: plain JSON with this
@@ -19,6 +19,10 @@ type wireEncoder struct {
 
 func newWireEncoder(logger logging.Logger) *wireEncoder {
 	return &wireEncoder{logger: logging.EnsureLogger(logger)}
+}
+
+func (e *wireEncoder) RespondWithData(ctx context.Context, res http.ResponseWriter, val any) {
+	e.EncodeResponseWithStatus(ctx, res, val, http.StatusOK)
 }
 
 func (e *wireEncoder) EncodeResponseWithStatus(_ context.Context, res http.ResponseWriter, val any, statusCode int) {

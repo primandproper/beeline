@@ -8,11 +8,11 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v7/cache"
-	cachememory "github.com/primandproper/platform-go/v7/cache/memory"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/observability/metrics"
-	"github.com/primandproper/platform-go/v7/observability/tracing"
+	"github.com/primandproper/platform-go/v9/cache"
+	cachememory "github.com/primandproper/platform-go/v9/cache/memory"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/observability/metrics"
+	"github.com/primandproper/platform-go/v9/observability/tracing"
 )
 
 // statsCache memoizes the aggregate observability reads per head: the console
@@ -44,12 +44,18 @@ func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider trac
 		return nil, nil //nolint:nilnil // a nil cache IS the "caching disabled" value
 	}
 
-	debt, err := cachememory.NewInMemoryCache[beeline.DebtStats](ttl, logger, tracerProvider, metricsProvider)
+	opts := []cachememory.Option{
+		cachememory.WithLogger(logger),
+		cachememory.WithTracerProvider(tracerProvider),
+		cachememory.WithMetricsProvider(metricsProvider),
+	}
+
+	debt, err := cachememory.NewInMemoryCache[beeline.DebtStats](ttl, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("freshness: building debt stats cache: %w", err)
 	}
 
-	cells, err := cachememory.NewInMemoryCache[[]beeline.CellState](ttl, logger, tracerProvider, metricsProvider)
+	cells, err := cachememory.NewInMemoryCache[[]beeline.CellState](ttl, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("freshness: building cell states cache: %w", err)
 	}

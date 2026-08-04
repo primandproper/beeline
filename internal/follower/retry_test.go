@@ -13,8 +13,8 @@ import (
 	"github.com/primandproper/beeline/internal/engine/registry"
 	"github.com/primandproper/beeline/internal/follower"
 
-	"github.com/primandproper/platform-go/v7/circuitbreaking"
-	"github.com/primandproper/platform-go/v7/retry"
+	"github.com/primandproper/platform-go/v9/circuitbreaking"
+	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +29,7 @@ func retryingFollower(t *testing.T, leaderURL string) *follower.Follower {
 		LeaderURL:    leaderURL,
 		Fallback:     testFallback(),
 		BuildEngines: registry.BuildAll,
-		Retry: retry.NewExponentialBackoffPolicy(retry.Config{
+		Retry: retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{
 			MaxAttempts:  3,
 			InitialDelay: time.Millisecond,
 			MaxDelay:     2 * time.Millisecond,
@@ -166,7 +166,7 @@ func TestClaimShedsLoadWhenBreakerIsOpen(t *testing.T) {
 		Fallback:     testFallback(),
 		BuildEngines: registry.BuildAll,
 		Breaker:      breaker,
-		Retry: retry.NewExponentialBackoffPolicy(retry.Config{
+		Retry: retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{
 			MaxAttempts:  5,
 			InitialDelay: time.Millisecond,
 			MaxDelay:     2 * time.Millisecond,

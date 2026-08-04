@@ -13,8 +13,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v7/clock"
-	"github.com/primandproper/platform-go/v7/observability/logging"
+	"github.com/primandproper/platform-go/v9/clock"
+	"github.com/primandproper/platform-go/v9/observability/logging"
 )
 
 // defaultSubmitDivisor derives the default flush size as a fraction of the claim

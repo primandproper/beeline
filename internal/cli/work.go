@@ -12,10 +12,11 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/refresh"
 
-	circuitbreakingcfg "github.com/primandproper/platform-go/v7/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v7/retry"
-	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
-	serverhttp "github.com/primandproper/platform-go/v7/server/http"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v9/circuitbreaking/config"
+	"github.com/primandproper/platform-go/v9/httpclient"
+	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
+	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
+	serverhttp "github.com/primandproper/platform-go/v9/server/http"
 
 	"github.com/spf13/cobra"
 )
@@ -89,15 +90,17 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 	// fail immediately and every worker falls back to its idle backoff rather
 	// than spending a full retry budget each cycle against a sick leader.
 	breaker, err := circuitbreakingcfg.NewCircuitBreaker(ctx,
-		&circuitbreakingcfg.Config{Name: "follower_leader"}, a.logger, a.pillars.MetricsProvider)
+		&circuitbreakingcfg.Config{Name: "follower_leader"},
+		circuitbreakingcfg.WithLogger(a.logger),
+		circuitbreakingcfg.WithMetricsProvider(a.pillars.MetricsProvider))
 	if err != nil {
 		return err
 	}
 
 	f, err := follower.New(&follower.Config{
 		LeaderURL:    leaderURL,
-		Client:       httpCfg.BuildClient(),
-		Retry:        retry.NewExponentialBackoffPolicy(fcfg.Retry),
+		Client:       httpclient.NewHTTPClient(httpCfg.Options()...),
+		Retry:        retrycfg.NewExponentialBackoffPolicy(fcfg.Retry),
 		Breaker:      breaker,
 		Fallback:     fallback,
 		BuildEngines: engines.BuildAll,
@@ -148,11 +151,12 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 	}
 
 	srv, err := serverhttp.NewHTTPServer(
-		serverhttp.Config{Port: fcfg.Port, StartupDeadline: 5 * time.Second},
-		a.logger,
+		ctx,
+		&serverhttp.Config{Port: fcfg.Port, StartupDeadline: 5 * time.Second},
 		router,
-		a.pillars.TracerProvider,
-		a.cfg.Observability.Logging.ServiceName,
+		serverhttp.WithLogger(a.logger),
+		serverhttp.WithTracerProvider(a.pillars.TracerProvider),
+		serverhttp.WithServiceName(a.cfg.Observability.Logging.ServiceName),
 	)
 	if err != nil {
 		return err
@@ -168,13 +172,28 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 	}).Info("starting follower work loop")
 
 	go pool.Run(ctx)
-	go srv.Serve()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ctx) }()
 
-	<-ctx.Done()
-	a.log().Info("shutdown signal received; stopping follower")
+	// A Serve failure (a bind error, most likely) must stop the process just as a
+	// signal does — swallowing it would leave a follower with no health probes.
+	var srvFailure error
+	select {
+	case <-ctx.Done():
+		a.log().Info("shutdown signal received; stopping follower")
+	case srvFailure = <-serveErr:
+		a.log().Error("health server failed; stopping follower", srvFailure)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serveShutdownTimeout)
 	defer cancel()
 
-	return srv.Shutdown(shutdownCtx)
+	// Drain regardless, but report the Serve failure that got us here in
+	// preference to a shutdown error, since it is the actual cause.
+	err = srv.Shutdown(shutdownCtx)
+	if srvFailure != nil {
+		return srvFailure
+	}
+
+	return err
 }

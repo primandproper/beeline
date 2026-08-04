@@ -6,12 +6,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v7/database"
-	"github.com/primandproper/platform-go/v7/distributedlock"
-	dlpostgres "github.com/primandproper/platform-go/v7/distributedlock/postgres"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/observability/metrics"
-	"github.com/primandproper/platform-go/v7/observability/tracing"
+	"github.com/primandproper/platform-go/v9/database"
+	"github.com/primandproper/platform-go/v9/distributedlock"
+	dlpostgres "github.com/primandproper/platform-go/v9/distributedlock/postgres"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/observability/metrics"
+	"github.com/primandproper/platform-go/v9/observability/tracing"
 )
 
 // Advisory-lock names. The platform locker hashes them into the advisory-lock
@@ -48,10 +48,10 @@ func NewAdvisoryLocker(
 	scoped, err := dlpostgres.NewPostgresScopedLocker(
 		&dlpostgres.Config{},
 		db,
-		logger,
-		tracerProvider,
-		metricsProvider,
 		nil, // no breaker: losing the database is already fatal to every caller here
+		dlpostgres.WithLogger(logger),
+		dlpostgres.WithTracerProvider(tracerProvider),
+		dlpostgres.WithMetricsProvider(metricsProvider),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: building advisory locker: %w", err)

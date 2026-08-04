@@ -20,10 +20,10 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v7/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v7/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	metricsnoop "github.com/primandproper/platform-go/v9/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v9/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

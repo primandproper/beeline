@@ -16,9 +16,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v7/eventcapture"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/observability/metrics"
+	"github.com/primandproper/platform-go/v9/eventcapture"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/observability/metrics"
 )
 
 // Source values for FetchEvent.Source. They mirror the read path's query.Source
@@ -73,27 +73,27 @@ type Recorder = eventcapture.Recorder[FetchEvent]
 // Start it with `go r.Run()` and stop it with Close once the HTTP server has
 // drained.
 func NewRecorder(sink eventcapture.Sink, cfg Config, logger logging.Logger, metricsProvider metrics.Provider) (*Recorder, error) {
-	opts := []eventcapture.Option[FetchEvent]{
-		eventcapture.WithBufferSize[FetchEvent](cfg.BufferSize),
-		eventcapture.WithFlushInterval[FetchEvent](cfg.FlushInterval),
-		eventcapture.WithLogger[FetchEvent](logger),
-		eventcapture.WithMetricsProvider[FetchEvent](metricsProvider),
+	opts := []eventcapture.Option{
+		eventcapture.WithBufferSize(cfg.BufferSize),
+		eventcapture.WithFlushInterval(cfg.FlushInterval),
+		eventcapture.WithLogger(logger),
+		eventcapture.WithMetricsProvider(metricsProvider),
 	}
 
 	if cfg.RawEnabled {
 		opts = append(opts, eventcapture.WithTransform(newFetchLine))
 	} else {
-		opts = append(opts, eventcapture.WithoutRawRecords[FetchEvent]())
+		opts = append(opts, eventcapture.WithoutRawRecords())
 	}
 
 	if cfg.AggregateEnabled {
-		agg := eventcapture.NewAggregator(
+		agg := eventcapture.NewAggregator[beeline.PairKey, demandCounts](
 			cfg.AggregateBucket,
 			cfg.AggregateMaxKeys,
 			// Origin-then-dest ties the same-window bucket order to the old
 			// aggregator's sort, keeping flushed output byte-identical for
 			// downstream diffing.
-			eventcapture.WithKeyOrder[beeline.PairKey, demandCounts](func(a, b beeline.PairKey) int {
+			eventcapture.WithKeyOrder(func(a, b beeline.PairKey) int {
 				if c := cmp.Compare(a.Origin, b.Origin); c != 0 {
 					return c
 				}
@@ -105,16 +105,16 @@ func NewRecorder(sink eventcapture.Sink, cfg Config, logger logging.Logger, metr
 			eventcapture.WithObserver(func(ev *FetchEvent) {
 				agg.Observe(ev.Key, ev.At, func(c *demandCounts) { c.fold(ev) })
 			}),
-			eventcapture.WithOnFlush[FetchEvent](func(now time.Time, final bool, emit func(record any)) {
+			eventcapture.WithOnFlush(func(now time.Time, final bool, emit func(record any)) {
 				for _, b := range agg.Flush(now, final) {
 					emit(newAggregateLine(b))
 				}
 			}),
-			eventcapture.WithOverflowSource[FetchEvent](agg.TakeOverflow),
+			eventcapture.WithOverflowSource(agg.TakeOverflow),
 		)
 	}
 
-	return eventcapture.NewRecorder(sink, opts...)
+	return eventcapture.NewRecorder[FetchEvent](sink, opts...)
 }
 
 // demandCounts is the running tally for one (pair, time bucket) aggregation cell.

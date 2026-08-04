@@ -18,10 +18,10 @@ import (
 	latencyengine "github.com/primandproper/beeline/internal/engine/latency"
 	osrmengine "github.com/primandproper/beeline/internal/engine/osrm"
 
-	"github.com/primandproper/platform-go/v7/circuitbreaking"
-	circuitbreakingcfg "github.com/primandproper/platform-go/v7/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/observability/metrics"
+	"github.com/primandproper/platform-go/v9/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v9/circuitbreaking/config"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/observability/metrics"
 )
 
 // BuiltinSpecs returns the specs of the always-synthesized providers: the raw
@@ -105,7 +105,9 @@ func (b Builder) breakerFor(name string) circuitbreaking.CircuitBreaker {
 	}
 
 	cb, err := circuitbreakingcfg.NewCircuitBreaker(ctx,
-		&circuitbreakingcfg.Config{Name: "osrm_" + name}, b.Logger, b.Metrics)
+		&circuitbreakingcfg.Config{Name: "osrm_" + name},
+		circuitbreakingcfg.WithLogger(b.Logger),
+		circuitbreakingcfg.WithMetricsProvider(b.Metrics))
 	if err != nil {
 		logging.EnsureLogger(b.Logger).Error("building circuit breaker for routing provider", err)
 

@@ -10,7 +10,7 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v7/clock"
+	"github.com/primandproper/platform-go/v9/clock"
 )
 
 // ErrNotFound is returned when an area id does not exist. Like the persistent

@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/primandproper/platform-go/v7 v7.0.0
+	github.com/primandproper/platform-go/v9 v9.1.0
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1

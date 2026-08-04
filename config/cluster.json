@@ -1,18 +1,10 @@
 {
 	"observability": {
-		"profiling": {
-			"serviceName": ""
-		},
 		"logging": {
 			"serviceName": "beeline",
 			"level": "info",
 			"provider": "slog"
-		},
-		"metrics": {
-			"serviceName": "",
-			"enabled": false
-		},
-		"tracing": {}
+		}
 	},
 	"matrix": {
 		"profiles": {
@@ -23,8 +15,7 @@
 		"defaultProfile": "car",
 		"server": {
 			"startupDeadline": 5000000000,
-			"port": 8080,
-			"debug": false
+			"port": 8080
 		},
 		"backend": {
 			"postgres": {
@@ -33,12 +24,6 @@
 			"configPollInterval": 2000000000
 		},
 		"follower": {
-			"http": {
-				"timeout": 10000000000,
-				"maxIdleConns": 0,
-				"maxIdleConnsPerHost": 0,
-				"enableTracing": false
-			},
 			"retry": {
 				"maxAttempts": 3,
 				"initialDelay": 100000000,
@@ -46,9 +31,12 @@
 				"multiplier": 2,
 				"useJitter": true
 			},
+			"http": {
+				"timeout": 10000000000
+			},
 			"idleBackoff": 1000000000,
-			"port": 8081,
-			"workers": 4
+			"workers": 4,
+			"port": 8081
 		},
 		"engineLatency": {
 			"min": 25000000,

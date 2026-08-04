@@ -8,9 +8,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v7/httpclient"
-	"github.com/primandproper/platform-go/v7/retry"
-	serverhttp "github.com/primandproper/platform-go/v7/server/http"
+	"github.com/primandproper/platform-go/v9/httpclient"
+	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
+	serverhttp "github.com/primandproper/platform-go/v9/server/http"
 )
 
 // MatrixConfig is the configuration for the travel-time/distance matrix service
@@ -66,25 +66,14 @@ type EngineLatencyConfig struct {
 // paces itself like a local worker unless tuned otherwise (remote workers may want
 // a longer lease to cover network latency).
 type FollowerConfig struct {
-	// LeaderURL is the base URL of the leader instance (e.g. http://host:8080).
-	LeaderURL string `env:"LEADER_URL" json:"leaderURL,omitempty"`
-	// HTTP tunes the outbound client used for claim/submit calls.
-	HTTP httpclient.Config `envPrefix:"HTTP_" json:"http,omitzero"`
-	// Retry governs re-attempts of a failed claim/submit round trip. A leader
-	// that is restarting or briefly unreachable costs a short backoff instead of
-	// a wasted claim cycle; a rejected request (4xx) is never retried.
-	Retry retry.Config `envPrefix:"RETRY_" json:"retry,omitzero"`
-	// Lease is the visibility timeout requested per claim; 0 uses LeaseDuration.
-	Lease time.Duration `env:"LEASE" json:"lease,omitempty"`
-	// IdleBackoff is how long a worker sleeps when the leader has no due work or
-	// is unreachable.
-	IdleBackoff time.Duration `env:"IDLE_BACKOFF" json:"idleBackoff,omitempty"`
-	// Port serves the follower's own health probes (/_ops_/live, /_ops_/ready).
-	Port uint16 `env:"PORT" json:"port,omitempty"`
-	// Workers is the number of concurrent claim→compute→submit loops.
-	Workers int `env:"WORKERS" json:"workers,omitempty"`
-	// Batch is the max pairs requested per claim; 0 uses RefreshBatch.
-	Batch int `env:"BATCH" json:"batch,omitempty"`
+	LeaderURL   string            `env:"LEADER_URL"   json:"leaderURL,omitempty"`
+	Retry       retrycfg.Config   `envPrefix:"RETRY_" json:"retry,omitzero"`
+	HTTP        httpclient.Config `envPrefix:"HTTP_"  json:"http,omitzero"`
+	Lease       time.Duration     `env:"LEASE"        json:"lease,omitempty"`
+	IdleBackoff time.Duration     `env:"IDLE_BACKOFF" json:"idleBackoff,omitempty"`
+	Workers     int               `env:"WORKERS"      json:"workers,omitempty"`
+	Batch       int               `env:"BATCH"        json:"batch,omitempty"`
+	Port        uint16            `env:"PORT"         json:"port,omitempty"`
 }
 
 // validate constrains the follower knobs only when a leader URL is set (the
@@ -334,7 +323,7 @@ func defaultMatrixConfig() MatrixConfig {
 			// The ceiling stays well under a claim cycle: a retried claim should
 			// ride out a leader restart, not stall a worker that could be idling
 			// and re-claiming instead.
-			Retry: retry.Config{
+			Retry: retrycfg.Config{
 				MaxAttempts:  3,
 				InitialDelay: 100 * time.Millisecond,
 				MaxDelay:     2 * time.Second,
@@ -387,6 +376,14 @@ func (m *MatrixConfig) validate(ctx context.Context) error {
 	}
 	if err := m.Follower.validate(); err != nil {
 		return err
+	}
+	// platform-go v9 stopped requiring a port, because port 0 legitimately means
+	// "ask the OS for an ephemeral one". beeline is stricter on purpose: every
+	// deployment shape reaches a head at a fixed, known port (the k8s Service
+	// targets 8080, the demo ingress forwards to it), so a head that binds
+	// somewhere unpredictable is unreachable rather than flexible.
+	if m.Server.Port == 0 {
+		return fmt.Errorf("server port is required")
 	}
 	for name := range m.Providers {
 		if name == DefaultProviderName {

@@ -21,9 +21,9 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	"github.com/primandproper/beeline/internal/tessellate"
 
-	"github.com/primandproper/platform-go/v7/healthcheck"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/routing"
+	"github.com/primandproper/platform-go/v9/healthcheck"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/routing"
 
 	"github.com/uber/h3-go/v4"
 )

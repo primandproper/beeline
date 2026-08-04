@@ -12,7 +12,7 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/telemetry"
 
-	"github.com/primandproper/platform-go/v7/eventcapture/jsonl"
+	"github.com/primandproper/platform-go/v9/eventcapture/jsonl"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

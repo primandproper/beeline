@@ -15,9 +15,9 @@ import (
 	"github.com/primandproper/beeline/internal/telemetry"
 	"github.com/primandproper/beeline/internal/webui"
 
-	"github.com/primandproper/platform-go/v7/eventcapture/jsonl"
-	chibackend "github.com/primandproper/platform-go/v7/routing/backends/chi"
-	serverhttp "github.com/primandproper/platform-go/v7/server/http"
+	"github.com/primandproper/platform-go/v9/eventcapture/jsonl"
+	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
+	serverhttp "github.com/primandproper/platform-go/v9/server/http"
 
 	"github.com/spf13/cobra"
 )
@@ -223,21 +223,23 @@ func (a *application) serve(ctx context.Context) error {
 	}
 
 	srv, err := serverhttp.NewHTTPServer(
-		mcfg.Server,
-		a.logger,
+		ctx,
+		&mcfg.Server,
 		router,
-		a.pillars.TracerProvider,
-		a.cfg.Observability.Logging.ServiceName,
+		serverhttp.WithLogger(a.logger),
+		serverhttp.WithTracerProvider(a.pillars.TracerProvider),
+		serverhttp.WithServiceName(a.cfg.Observability.Logging.ServiceName),
 	)
 	if err != nil {
 		return err
 	}
 
-	// Start the background refresh loop and the HTTP server. Serve() blocks and
-	// panics on a bind/serve error, so run it in its own goroutine and coordinate
-	// shutdown through the signal-cancellable context. With RefreshWorkers 0 the
-	// local pool never starts and this instance is a pure coordinator: it seeds and
-	// serves work over /_work_/ and relies on followers for all compute.
+	// Start the background refresh loop and the HTTP server. Serve(ctx) blocks and
+	// returns a bind/serve failure, so run it in its own goroutine and fold its
+	// error into the same select as the signal-cancellable context. With
+	// RefreshWorkers 0 the local pool never starts and this instance is a pure
+	// coordinator: it seeds and serves work over /_work_/ and relies on followers
+	// for all compute.
 	if mcfg.RefreshWorkers > 0 {
 		pool := refresh.NewPool(coordinator, refresh.NewLocalSource(index, store), a.logger, refresh.Config{
 			Workers: mcfg.RefreshWorkers,
@@ -248,7 +250,8 @@ func (a *application) serve(ctx context.Context) error {
 	} else {
 		a.log().Info("local refresh pool disabled; coordinator-only mode (followers do the computing)")
 	}
-	go srv.Serve()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ctx) }()
 
 	// The telemetry flusher is deliberately not tied to ctx: it must keep consuming
 	// while srv.Shutdown drains in-flight requests (which still record events), and
@@ -269,13 +272,23 @@ func (a *application) serve(ctx context.Context) error {
 	// interval.
 	go a.runConfigWatcher(ctx, coordinator, backend.configSource, mcfg.Backend.ConfigPollInterval)
 
-	<-ctx.Done()
-	a.log().Info("shutdown signal received; draining HTTP server")
+	// A Serve failure (a bind error, most likely) must stop the process just as a
+	// signal does — swallowing it would leave a head that answers nothing.
+	var srvFailure error
+	select {
+	case <-ctx.Done():
+		a.log().Info("shutdown signal received; draining HTTP server")
+	case srvFailure = <-serveErr:
+		a.log().Error("HTTP server failed; shutting down", srvFailure)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), serveShutdownTimeout)
 	defer cancel()
 
 	err = srv.Shutdown(shutdownCtx)
+	if srvFailure != nil {
+		err = srvFailure
+	}
 
 	// Only after the server has drained (no more requests can record events): drain
 	// the telemetry buffer, flush the aggregator, and close the sink, within what

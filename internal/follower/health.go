@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/primandproper/platform-go/v7/healthcheck"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	"github.com/primandproper/platform-go/v7/routing"
+	"github.com/primandproper/platform-go/v9/healthcheck"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v9/routing"
 )
 
 // readyProbeTimeout bounds the leader liveness probe behind /_ops_/ready, so a

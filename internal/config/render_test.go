@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/primandproper/platform-go/v7/observability"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v7/observability/logging/config"
+	"github.com/primandproper/platform-go/v9/observability"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	loggingcfg "github.com/primandproper/platform-go/v9/observability/logging/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

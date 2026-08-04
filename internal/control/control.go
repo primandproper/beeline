@@ -23,8 +23,8 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/tessellate"
 
-	"github.com/primandproper/platform-go/v7/distributedlock"
-	"github.com/primandproper/platform-go/v7/distributedlock/noop"
+	"github.com/primandproper/platform-go/v9/distributedlock"
+	"github.com/primandproper/platform-go/v9/distributedlock/noop"
 )
 
 // AreasRepository persists service-area definitions. The SQLite store satisfies it;

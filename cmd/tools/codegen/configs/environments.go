@@ -5,12 +5,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v7/httpclient"
-	"github.com/primandproper/platform-go/v7/observability"
-	"github.com/primandproper/platform-go/v7/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v7/observability/logging/config"
-	"github.com/primandproper/platform-go/v7/retry"
-	serverhttp "github.com/primandproper/platform-go/v7/server/http"
+	"github.com/primandproper/platform-go/v9/httpclient"
+	"github.com/primandproper/platform-go/v9/observability"
+	"github.com/primandproper/platform-go/v9/observability/logging"
+	loggingcfg "github.com/primandproper/platform-go/v9/observability/logging/config"
+	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
+	serverhttp "github.com/primandproper/platform-go/v9/server/http"
 )
 
 // Each builder returns a fully-formed *config.Config for one environment. The
@@ -114,7 +114,7 @@ func buildLocalDevConfig() *config.Config {
 				HTTP:        httpclient.Config{Timeout: 10 * time.Second},
 				// A leader restart costs a short backoff instead of a wasted
 				// claim cycle; a 4xx is never retried.
-				Retry: retry.Config{
+				Retry: retrycfg.Config{
 					MaxAttempts:  3,
 					InitialDelay: 100 * time.Millisecond,
 					MaxDelay:     2 * time.Second,
@@ -177,7 +177,7 @@ func buildClusterConfig() *config.Config {
 				HTTP:        httpclient.Config{Timeout: 10 * time.Second},
 				// A leader restart costs a short backoff instead of a wasted
 				// claim cycle; a 4xx is never retried.
-				Retry: retry.Config{
+				Retry: retrycfg.Config{
 					MaxAttempts:  3,
 					InitialDelay: 100 * time.Millisecond,
 					MaxDelay:     2 * time.Second,

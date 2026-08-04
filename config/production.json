@@ -1,18 +1,10 @@
 {
 	"observability": {
-		"profiling": {
-			"serviceName": ""
-		},
 		"logging": {
 			"serviceName": "beeline",
 			"level": "info",
 			"provider": "slog"
-		},
-		"metrics": {
-			"serviceName": "",
-			"enabled": false
-		},
-		"tracing": {}
+		}
 	},
 	"matrix": {
 		"profiles": {
@@ -23,8 +15,7 @@
 		"defaultProfile": "car",
 		"server": {
 			"startupDeadline": 5000000000,
-			"port": 8080,
-			"debug": false
+			"port": 8080
 		},
 		"backend": {
 			"postgres": {

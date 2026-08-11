@@ -15,12 +15,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v9/database"
-	"github.com/primandproper/platform-go/v9/database/migrate"
-	pgclient "github.com/primandproper/platform-go/v9/database/postgres"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/observability/metrics"
-	"github.com/primandproper/platform-go/v9/observability/tracing"
+	"github.com/primandproper/platform-go/v10/database"
+	"github.com/primandproper/platform-go/v10/database/migrate"
+	pgclient "github.com/primandproper/platform-go/v10/database/postgres"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/platform-go/v10/observability/tracing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -48,7 +48,7 @@ func Open(
 	ctx context.Context,
 	cfg *config.PostgresConfig,
 	logger logging.Logger,
-	tracerProvider tracing.TracerProvider,
+	tracerProvider tracing.Provider,
 	metricsProvider metrics.Provider,
 ) (database.Client, error) {
 	client, err := pgclient.NewDatabaseClient(ctx, cfg,
@@ -62,7 +62,9 @@ func Open(
 
 	// NewDatabaseClient does not ping, so boot would otherwise defer the failure
 	// to the first query. Fail here instead, as the hand-rolled pool used to.
-	if ready, ok := client.(interface{ IsReady(context.Context) bool }); ok && !ready.IsReady(ctx) {
+	// v10's constructor returns the concrete *postgres.Client, so IsReady is a
+	// direct call rather than an optional-capability assertion.
+	if !client.IsReady(ctx) {
 		return nil, fmt.Errorf("postgres: database is not ready: %w", database.ErrDatabaseNotReady)
 	}
 
@@ -93,7 +95,7 @@ func applyMigrations(
 	ctx context.Context,
 	client database.Client,
 	logger logging.Logger,
-	tracerProvider tracing.TracerProvider,
+	tracerProvider tracing.Provider,
 	metricsProvider metrics.Provider,
 ) error {
 	sub, err := fs.Sub(migrationFS, "migrations")

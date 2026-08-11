@@ -8,11 +8,11 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v9/cache"
-	cachememory "github.com/primandproper/platform-go/v9/cache/memory"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/observability/metrics"
-	"github.com/primandproper/platform-go/v9/observability/tracing"
+	"github.com/primandproper/platform-go/v10/cache"
+	cachememory "github.com/primandproper/platform-go/v10/cache/memory"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/platform-go/v10/observability/tracing"
 )
 
 // statsCache memoizes the aggregate observability reads per head: the console
@@ -39,7 +39,7 @@ func areaKey(area beeline.AreaID) string {
 }
 
 // newStatsCache builds the memo caches, or returns nil when caching is off.
-func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider tracing.TracerProvider, metricsProvider metrics.Provider) (*statsCache, error) {
+func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider tracing.Provider, metricsProvider metrics.Provider) (*statsCache, error) {
 	if ttl <= 0 {
 		return nil, nil //nolint:nilnil // a nil cache IS the "caching disabled" value
 	}

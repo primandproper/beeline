@@ -33,7 +33,7 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	redisstore "github.com/primandproper/beeline/internal/store/redis"
 
-	platformredistest "github.com/primandproper/platform-go/v9/testutils/containers/redistest"
+	platformredistest "github.com/primandproper/platform-go/v10/testutils/containers/redistest"
 
 	"github.com/stretchr/testify/require"
 )

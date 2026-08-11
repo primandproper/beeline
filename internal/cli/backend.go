@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
@@ -11,8 +12,8 @@ import (
 	pgstore "github.com/primandproper/beeline/internal/store/postgres"
 	redisstore "github.com/primandproper/beeline/internal/store/redis"
 
-	"github.com/primandproper/platform-go/v9/database"
-	"github.com/primandproper/platform-go/v9/healthcheck"
+	"github.com/primandproper/platform-go/v10/database"
+	"github.com/primandproper/platform-go/v10/healthcheck"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -66,7 +67,13 @@ type backendHandles struct {
 // locker, and whichever hot store is selected. Callers defer handles.close().
 func (a *application) buildBackend(ctx context.Context, mcfg *config.MatrixConfig) (*backendHandles, error) {
 	bcfg := &mcfg.Backend
-	handles := &backendHandles{close: func() {}, health: healthcheck.NewRegistry()}
+
+	registry, err := healthcheck.NewRegistry(healthcheck.WithLogger(a.logger))
+	if err != nil {
+		return nil, fmt.Errorf("building the readiness registry: %w", err)
+	}
+
+	handles := &backendHandles{close: func() {}, health: registry}
 
 	db, err := pgstore.Open(ctx, &bcfg.Postgres, a.logger, a.pillars.TracerProvider, a.pillars.MetricsProvider)
 	if err != nil {

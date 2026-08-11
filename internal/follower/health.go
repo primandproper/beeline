@@ -3,12 +3,13 @@ package follower
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/primandproper/platform-go/v9/healthcheck"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/routing"
+	"github.com/primandproper/platform-go/v10/healthcheck"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/routing"
 )
 
 // readyProbeTimeout bounds the leader liveness probe behind /_ops_/ready, so a
@@ -41,10 +42,14 @@ func (c leaderChecker) Check(ctx context.Context) error {
 // typed model. The registry's aggregate status is mapped back onto the flat
 // {"status": …} body rather than serialized directly — that body is the frozen
 // wire contract with orchestrators already probing followers.
-func RegisterHealth(router *routing.Router, f *Follower, logger logging.Logger) {
+func RegisterHealth(router *routing.Router, f *Follower, logger logging.Logger) error {
 	logger = logging.EnsureLogger(logger)
 
-	registry := healthcheck.NewRegistry()
+	registry, err := healthcheck.NewRegistry(healthcheck.WithLogger(logger))
+	if err != nil {
+		return fmt.Errorf("building the follower health registry: %w", err)
+	}
+
 	registry.Register(leaderChecker{follower: f})
 
 	router.Handle(http.MethodGet, "/_ops_/live", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -62,6 +67,8 @@ func RegisterHealth(router *routing.Router, f *Follower, logger logging.Logger) 
 
 		writeStatus(w, logger, http.StatusOK, "up")
 	}))
+
+	return nil
 }
 
 func writeStatus(w http.ResponseWriter, logger logging.Logger, status int, state string) {

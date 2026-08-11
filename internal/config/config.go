@@ -26,14 +26,13 @@ import (
 	"log/slog"
 	"strings"
 
-	platformconfig "github.com/primandproper/platform-go/v9/config"
-	"github.com/primandproper/platform-go/v9/observability"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v9/observability/logging/config"
-	"github.com/primandproper/platform-go/v9/observability/logging/otelgrpc"
-	metricsnoop "github.com/primandproper/platform-go/v9/observability/metrics/noop"
-	profilingnoop "github.com/primandproper/platform-go/v9/observability/profiling/noop"
-	tracingnoop "github.com/primandproper/platform-go/v9/observability/tracing/noop"
+	platformconfig "github.com/primandproper/platform-go/v10/config"
+	"github.com/primandproper/platform-go/v10/observability"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	loggingcfg "github.com/primandproper/platform-go/v10/observability/logging/config"
+	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
+	profilingnoop "github.com/primandproper/platform-go/v10/observability/profiling/noop"
+	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
 )
 
 // DefaultServiceName is the service name reported by the observability suite
@@ -144,7 +143,7 @@ func Load(ctx context.Context, opts Options) (*Config, error) {
 // use it once a deployment has a real config file to mount. The result is
 // validated before it is returned.
 func LoadFromFile(ctx context.Context, path string) (*Config, error) {
-	cfg, err := platformconfig.LoadFromJSONFile[Config](path, envVarOptions()...)
+	cfg, err := platformconfig.LoadFromJSONFile[Config](ctx, path, envVarOptions()...)
 	if err != nil {
 		return nil, fmt.Errorf("loading configuration file: %w", err)
 	}
@@ -158,33 +157,11 @@ func LoadFromFile(ctx context.Context, path string) (*Config, error) {
 
 // Validate confirms the assembled configuration is internally consistent.
 func (c *Config) Validate(ctx context.Context) error {
-	normalizeLoggingConfig(&c.Observability.Logging)
-
 	if err := c.Observability.ValidateWithContext(ctx); err != nil {
 		return err
 	}
 
 	return c.Matrix.validate(ctx)
-}
-
-// normalizeLoggingConfig releases the OtelSlog sub-config that platform-go's
-// env parsing allocated (its `env:",init"` tag) and nothing filled in.
-//
-// This works around an upstream omission in platform-go v9.1.0: the sibling
-// observability configs (metrics, tracing, profiling) all normalize their
-// `,init`-allocated sub-configs with internal/cfgnorm.ZeroToNil before
-// validating, but observability/logging/config does not. Because ozzo
-// validates any non-nil pointer to a Validatable — regardless of the
-// `validation.When(Provider == "otelslog", ...)` guard on the field — a zero
-// otelgrpc.Config fails with "endpointURL: cannot be blank" for every service
-// that logs with slog, which is every beeline deployment. That makes any
-// env-overlaid load unbootable, so it is corrected here rather than worked
-// around per call site. Drop this once the fix lands upstream; cfgnorm itself
-// is an internal package, hence the local zero check.
-func normalizeLoggingConfig(cfg *loggingcfg.Config) {
-	if cfg.OtelSlog != nil && *cfg.OtelSlog == (otelgrpc.Config{}) {
-		cfg.OtelSlog = nil
-	}
 }
 
 // NewPillars builds the observability pillars for the application.

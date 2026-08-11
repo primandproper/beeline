@@ -12,7 +12,7 @@ import (
 	"github.com/primandproper/beeline/internal/geo"
 	"github.com/primandproper/beeline/internal/telemetry"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/logging"
 )
 
 // AreaRouter resolves a coordinate to the enabled service area that contains it. The

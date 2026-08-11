@@ -3,11 +3,11 @@ package httpapi
 import (
 	"github.com/primandproper/beeline/version"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/observability/metrics"
-	"github.com/primandproper/platform-go/v9/observability/tracing"
-	"github.com/primandproper/platform-go/v9/routing"
-	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/platform-go/v10/observability/tracing"
+	"github.com/primandproper/platform-go/v10/routing"
+	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
 )
 
 // NewRouter builds beeline's router: the chi backend under the typed OpenAPI
@@ -16,7 +16,7 @@ import (
 // router.Err() before serving.
 func NewRouter(
 	logger logging.Logger,
-	tracerProvider tracing.TracerProvider,
+	tracerProvider tracing.Provider,
 	metricsProvider metrics.Provider,
 	cfg *chibackend.Config,
 	opts ...routing.RouterOption,

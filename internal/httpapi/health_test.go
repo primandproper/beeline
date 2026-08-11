@@ -10,10 +10,10 @@ import (
 
 	"github.com/primandproper/beeline/internal/httpapi"
 
-	"github.com/primandproper/platform-go/v9/healthcheck"
-	metricsnoop "github.com/primandproper/platform-go/v9/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v9/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
+	"github.com/primandproper/platform-go/v10/healthcheck"
+	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -32,7 +32,9 @@ func (c stubChecker) Check(context.Context) error { return c.err }
 func healthHandler(t *testing.T, checkers ...healthcheck.Checker) http.Handler {
 	t.Helper()
 
-	registry := healthcheck.NewRegistry()
+	registry, err := healthcheck.NewRegistry()
+	require.NoError(t, err)
+
 	for _, c := range checkers {
 		registry.Register(c)
 	}

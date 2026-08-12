@@ -91,17 +91,20 @@ func New(pool *pgxpool.Pool, cfg *Config, log logging.Logger) (*Index, error) {
 
 	log = logging.EnsureLogger(log)
 
-	stats, err := newStatsCache(cfg.StatsCacheTTL, log, cfg.TracerProvider, cfg.MetricsProvider)
+	i := &Index{
+		pool: pool,
+		log:  log,
+		cfg:  *cfg,
+	}
+
+	// After the Index exists: the memo reads through to i's own scans, so the
+	// loaders have to close over it.
+	stats, err := newStatsCache(i, cfg.StatsCacheTTL, log, cfg.TracerProvider, cfg.MetricsProvider)
 	if err != nil {
 		return nil, err
 	}
+	i.stats = stats
 
-	i := &Index{
-		pool:  pool,
-		log:   log,
-		cfg:   *cfg,
-		stats: stats,
-	}
 	i.access = newAccessBuffer(i, cfg.Clock, cfg.AccessFlushInterval, cfg.AccessFlushLimit)
 	i.bumps = newBumpBatcher(i)
 

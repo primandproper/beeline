@@ -33,6 +33,7 @@ func NewRouter(
 			routing.WithTitle("Beeline"),
 			routing.WithVersion(version.CommitHash),
 			routing.WithDefaultEnvelope(false),
+			routing.WithErrorEncoder(encodeError),
 		}, opts...)...)
 
 	// The escape hatch every typed handler's error path depends on; must precede

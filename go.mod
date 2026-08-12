@@ -174,5 +174,3 @@ tool (
 	golang.org/x/tools/cmd/goimports
 	golang.org/x/tools/go/analysis/passes/fieldalignment/cmd/fieldalignment
 )
-
-replace github.com/primandproper/platform-go/v10 => /Users/jeffrey/src/github.com/primandproper/platform-go

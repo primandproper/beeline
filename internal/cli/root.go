@@ -14,9 +14,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v9/clock"
-	"github.com/primandproper/platform-go/v9/observability"
-	"github.com/primandproper/platform-go/v9/observability/logging"
+	"github.com/primandproper/platform-go/v10/clock"
+	"github.com/primandproper/platform-go/v10/observability"
+	"github.com/primandproper/platform-go/v10/observability/logging"
 
 	"github.com/spf13/cobra"
 )

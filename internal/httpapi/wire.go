@@ -5,16 +5,24 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/routing"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/routing"
 )
 
-// The typed router serializes any error a handler returns as the platform
-// APIError envelope, whose body shape and status map (no 409) don't match this
-// API's flat {"error": "..."} contract. So handlers never return errors:
+// The escape hatch handlers use to answer without returning an error:
 // wireMiddleware smuggles a committable ResponseWriter into the request
-// context, fail/commitJSON write the legacy bytes through it, and the wire
+// context, fail/commitJSON write this API's bytes through it, and the wire
 // drops the framework's follow-up success write.
+//
+// The body shape is no longer why it exists — routing.WithErrorEncoder renders
+// returned errors flat too (see errors.go), and server failures now take that
+// path. What keeps the hatch is that the router acknowledges every returned
+// error at ERROR level, so client 4xx still answer through fail rather than
+// letting an unauthenticated caller write the log. See Register for the rule.
+//
+// It also carries the two responses the typed model cannot express: the ready
+// probe's dynamic 200/503, and the raw *http.Request the geojson handler reads
+// its document body from.
 
 // wireKey carries the *wire through the request context.
 type wireKey struct{}

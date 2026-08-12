@@ -21,9 +21,9 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	"github.com/primandproper/beeline/internal/tessellate"
 
-	"github.com/primandproper/platform-go/v9/healthcheck"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/routing"
+	"github.com/primandproper/platform-go/v10/healthcheck"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/routing"
 
 	"github.com/uber/h3-go/v4"
 )
@@ -54,9 +54,22 @@ type Deps struct {
 }
 
 // Register attaches all routes to the router. Every route is typed — the input
-// structs below double as the generated OpenAPI request schemas — but handlers
-// report failures through the wire escape hatch (see wire.go), never by
-// returning an error, so error bodies keep this API's flat {"error": …} shape.
+// structs below double as the generated OpenAPI request schemas.
+//
+// Handlers report failures two ways, and which one is correct depends on whose
+// fault the failure is:
+//
+//   - The service's fault (a store read failed, the engine errored): return an
+//     internalError. The router renders it through encodeError, logs it, and
+//     attaches it to the request span — all of which a 500 deserves.
+//   - The caller's fault (an unparseable coordinate, an unknown area): write it
+//     with fail and return a nil error. Returning it would be tidier, but the
+//     router acknowledges every returned error at ERROR level, and an
+//     unauthenticated caller must not be able to fill the log with 400s.
+//
+// Both paths produce the same flat {"error": …} body — fail writes it directly,
+// encodeError renders it — so the shape does not depend on the choice.
+//
 // POST routes that answer 200 say so explicitly: the router's POST default is 201.
 func Register(router *routing.Router, deps *Deps) {
 	logger := logging.EnsureLogger(deps.Logger)
@@ -137,9 +150,7 @@ func estimateHandler(deps *Deps, logger logging.Logger) routing.Handler[estimate
 
 		result, err := deps.Handler.Estimate(ctx, origin, dest, profile)
 		if err != nil {
-			logger.Error("computing estimate", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return zero, nil
+			return zero, internalError("computing estimate", err)
 		}
 
 		return estimateResponse{
@@ -235,9 +246,7 @@ func tableHandler(deps *Deps, logger logging.Logger) routing.Handler[tableReques
 			Fill:         fill,
 		})
 		if err != nil {
-			logger.Error("computing table", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return zero, nil
+			return zero, internalError("computing table", err)
 		}
 
 		return toTableResponse(result, string(profile)), nil
@@ -337,9 +346,7 @@ func freshnessHandler(deps *Deps, logger logging.Logger) routing.Handler[areaQue
 
 			stats, statErr := deps.Coordinator.DebtForArea(ctx, id)
 			if statErr != nil {
-				logger.Error("reading area freshness debt", statErr)
-				fail(ctx, logger, http.StatusInternalServerError, statErr.Error())
-				return zero, nil
+				return zero, internalError("reading area freshness debt", statErr)
 			}
 
 			return stats, nil
@@ -347,9 +354,7 @@ func freshnessHandler(deps *Deps, logger logging.Logger) routing.Handler[areaQue
 
 		stats, err := deps.Index.Debt(ctx)
 		if err != nil {
-			logger.Error("reading freshness debt", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return zero, nil
+			return zero, internalError("reading freshness debt", err)
 		}
 
 		return stats, nil
@@ -398,9 +403,7 @@ func cellsHandler(deps *Deps, logger logging.Logger) routing.Handler[areaQueryIn
 		for _, id := range ids {
 			states, err := deps.Coordinator.CellStatesForArea(ctx, id)
 			if err != nil {
-				logger.Error("reading cell states", err)
-				fail(ctx, logger, http.StatusInternalServerError, err.Error())
-				return zero, nil
+				return zero, internalError("reading cell states", err)
 			}
 
 			for i := range states {
@@ -513,9 +516,7 @@ func pairsHandler(deps *Deps, logger logging.Logger) routing.Handler[pairsReques
 
 		stored, err := deps.Store.BatchGet(ctx, keys)
 		if err != nil {
-			logger.Error("reading cached pairs", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return zero, nil
+			return zero, internalError("reading cached pairs", err)
 		}
 
 		pairs := make([]pairEstimateResponse, 0, len(stored))
@@ -639,9 +640,7 @@ func warmHandler(deps *Deps, logger logging.Logger) routing.Handler[warmRequest,
 				fail(ctx, logger, http.StatusBadRequest, err.Error())
 				return zero, nil
 			}
-			logger.Error("warming pairs", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return zero, nil
+			return zero, internalError("warming pairs", err)
 		}
 
 		return warmResponse{Accepted: accepted, Mode: mode}, nil
@@ -838,9 +837,7 @@ func areasListHandler(deps *Deps, logger logging.Logger) routing.Handler[routing
 	return func(ctx context.Context, _ routing.Empty) ([]areaResponse, error) {
 		areas, err := deps.Coordinator.List(ctx)
 		if err != nil {
-			logger.Error("listing areas", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return nil, nil
+			return nil, internalError("listing areas", err)
 		}
 
 		out := make([]areaResponse, 0, len(areas))
@@ -1082,8 +1079,7 @@ func areaGeoJSONHandler(deps *Deps, logger logging.Logger) routing.Handler[areaI
 
 		r, ok := requestFrom(ctx)
 		if !ok {
-			fail(ctx, logger, http.StatusInternalServerError, "request unavailable")
-			return zero, nil
+			return zero, internalMessage("request unavailable")
 		}
 
 		raw, err := io.ReadAll(io.LimitReader(r.Body, maxGeoJSONBytes))
@@ -1153,10 +1149,7 @@ func areaInvalidateHandler(deps *Deps, logger logging.Logger) routing.Handler[ar
 				fail(ctx, logger, http.StatusBadRequest, err.Error())
 				return zero, nil
 			}
-			logger.Error("invalidating area pairs", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-
-			return zero, nil
+			return zero, internalError("invalidating area pairs", err)
 		}
 
 		logger.WithValues(map[string]any{"invalidated": n}).Info("service area pairs invalidated")

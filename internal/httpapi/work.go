@@ -8,8 +8,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/routing"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/routing"
 )
 
 // The /_work_/ endpoints are the leader side of the leader/follower split (design
@@ -102,9 +102,7 @@ func claimHandler(deps *Deps, logger logging.Logger) routing.Handler[claimReques
 
 		keys, err := deps.Index.Claim(ctx, batch, lease)
 		if err != nil {
-			logger.Error("claiming work for follower", err)
-			fail(ctx, logger, http.StatusInternalServerError, err.Error())
-			return zero, nil
+			return zero, internalError("claiming work for follower", err)
 		}
 
 		resp := claimResponse{
@@ -232,14 +230,10 @@ func submitHandler(deps *Deps, logger logging.Logger) routing.Handler[submitRequ
 
 		if len(entries) > 0 {
 			if err := deps.Store.Put(ctx, entries); err != nil {
-				logger.Error("writing follower estimates", err)
-				fail(ctx, logger, http.StatusInternalServerError, err.Error())
-				return zero, nil
+				return zero, internalError("writing follower estimates", err)
 			}
 			if err := deps.Index.MarkComputed(ctx, keys, now); err != nil {
-				logger.Error("marking follower estimates computed", err)
-				fail(ctx, logger, http.StatusInternalServerError, err.Error())
-				return zero, nil
+				return zero, internalError("marking follower estimates computed", err)
 			}
 		}
 

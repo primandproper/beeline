@@ -13,12 +13,29 @@ import (
 	"github.com/primandproper/beeline/internal/engine/registry"
 	"github.com/primandproper/beeline/internal/follower"
 
-	"github.com/primandproper/platform-go/v9/circuitbreaking"
-	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
+	"github.com/primandproper/platform-go/v10/circuitbreaking"
+	"github.com/primandproper/platform-go/v10/retry"
+	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// fastPolicy builds a millisecond-scale backoff policy, so a retry budget is
+// observable without the test waiting on real delays.
+func fastPolicy(t *testing.T, maxAttempts uint) retry.Policy {
+	t.Helper()
+
+	policy, err := retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{
+		MaxAttempts:  maxAttempts,
+		InitialDelay: time.Millisecond,
+		MaxDelay:     2 * time.Millisecond,
+		Multiplier:   2,
+	})
+	require.NoError(t, err)
+
+	return policy
+}
 
 // retryingFollower points at leaderURL with a fast three-attempt policy, so the
 // classification is observable without the test waiting on real backoff.
@@ -29,12 +46,7 @@ func retryingFollower(t *testing.T, leaderURL string) *follower.Follower {
 		LeaderURL:    leaderURL,
 		Fallback:     testFallback(),
 		BuildEngines: registry.BuildAll,
-		Retry: retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{
-			MaxAttempts:  3,
-			InitialDelay: time.Millisecond,
-			MaxDelay:     2 * time.Millisecond,
-			Multiplier:   2,
-		}),
+		Retry:        fastPolicy(t, 3),
 	}, nil)
 	require.NoError(t, err)
 
@@ -166,12 +178,7 @@ func TestClaimShedsLoadWhenBreakerIsOpen(t *testing.T) {
 		Fallback:     testFallback(),
 		BuildEngines: registry.BuildAll,
 		Breaker:      breaker,
-		Retry: retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{
-			MaxAttempts:  5,
-			InitialDelay: time.Millisecond,
-			MaxDelay:     2 * time.Millisecond,
-			Multiplier:   2,
-		}),
+		Retry:        fastPolicy(t, 5),
 	}, nil)
 	require.NoError(t, err)
 

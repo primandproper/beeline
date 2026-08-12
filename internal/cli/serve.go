@@ -15,9 +15,9 @@ import (
 	"github.com/primandproper/beeline/internal/telemetry"
 	"github.com/primandproper/beeline/internal/webui"
 
-	"github.com/primandproper/platform-go/v9/eventcapture/jsonl"
-	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
-	serverhttp "github.com/primandproper/platform-go/v9/server/http"
+	"github.com/primandproper/platform-go/v10/eventcapture/jsonl"
+	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	serverhttp "github.com/primandproper/platform-go/v10/server/http"
 
 	"github.com/spf13/cobra"
 )

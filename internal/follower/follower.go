@@ -27,11 +27,11 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v9/circuitbreaking"
-	circuitbreakingcfg "github.com/primandproper/platform-go/v9/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/retry"
-	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
+	"github.com/primandproper/platform-go/v10/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v10/circuitbreaking/config"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/retry"
+	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
 
 	"github.com/uber/h3-go/v4"
 )
@@ -101,7 +101,12 @@ func New(cfg *Config, logger logging.Logger) (*Follower, error) {
 
 	policy := cfg.Retry
 	if policy == nil {
-		policy = retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{MaxAttempts: 1})
+		fallbackPolicy, err := retrycfg.NewExponentialBackoffPolicy(retrycfg.Config{MaxAttempts: 1})
+		if err != nil {
+			return nil, fmt.Errorf("follower: building the default retry policy: %w", err)
+		}
+
+		policy = fallbackPolicy
 	}
 
 	return &Follower{

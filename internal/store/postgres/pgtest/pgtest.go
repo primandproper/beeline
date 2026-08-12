@@ -40,8 +40,8 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/store/postgres"
 
-	"github.com/primandproper/platform-go/v9/database"
-	"github.com/primandproper/platform-go/v9/testutils/containers"
+	"github.com/primandproper/platform-go/v10/database"
+	"github.com/primandproper/platform-go/v10/testutils/containers"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"

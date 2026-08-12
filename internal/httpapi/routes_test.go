@@ -20,10 +20,10 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v9/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v9/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,6 +141,50 @@ func TestTableEndpointCacheOnlyLeavesMissesNull(t *testing.T) {
 	assert.Nil(t, env.Durations[0][0], "a cache-only miss is null")
 	assert.Equal(t, 1, env.Meta.Misses)
 	assert.Zero(t, env.Meta.Filled, "cache-only fills nothing")
+}
+
+// TestErrorBodyIsFlatForEveryFailure pins the one shape this API sends for an
+// error: {"error": "<string>"}. The interesting case is the malformed body,
+// which the typed router rejects during binding and so never reaches a handler
+// or its fail() call. Before routing.WithErrorEncoder that path answered in the
+// platform envelope — {"error": {"message": …, "code": …}, "details": …} — so
+// "error" was an object on exactly one of this API's error paths, while the
+// console and the follower client both read it as a string.
+func TestErrorBodyIsFlatForEveryFailure(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		body string
+		want string
+	}{
+		"rejected by the router's binding": {
+			body: `{"sources":`,
+			want: "could not decode request body",
+		},
+		"rejected by the handler": {
+			body: `{"sources": [], "destinations": ["37.7,-122.4"]}`,
+			want: "sources and destinations must both be non-empty",
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			h, _ := newTestRouter(t)
+			rec := postTable(t, h, tc.body)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+
+			// Decoding into a string-valued field is the assertion: an envelope
+			// body fails here, which is the regression worth catching.
+			var got struct {
+				Error string `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got),
+				"error body must decode with a string error field, got %s", rec.Body.String())
+			assert.Equal(t, tc.want, got.Error)
+		})
+	}
 }
 
 func TestTableEndpointRejectsBadInput(t *testing.T) {

@@ -12,8 +12,8 @@ import (
 	"io/fs"
 	"net/http"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/routing"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/routing"
 )
 
 //go:embed static

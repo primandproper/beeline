@@ -12,11 +12,11 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/refresh"
 
-	circuitbreakingcfg "github.com/primandproper/platform-go/v9/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v9/httpclient"
-	retrycfg "github.com/primandproper/platform-go/v9/retry/config"
-	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
-	serverhttp "github.com/primandproper/platform-go/v9/server/http"
+	circuitbreakingcfg "github.com/primandproper/platform-go/v10/circuitbreaking/config"
+	"github.com/primandproper/platform-go/v10/httpclient"
+	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
+	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	serverhttp "github.com/primandproper/platform-go/v10/server/http"
 
 	"github.com/spf13/cobra"
 )
@@ -97,10 +97,20 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 		return err
 	}
 
+	outbound, err := httpclient.NewHTTPClient(httpCfg.Options()...)
+	if err != nil {
+		return err
+	}
+
+	retryPolicy, err := retrycfg.NewExponentialBackoffPolicy(fcfg.Retry)
+	if err != nil {
+		return err
+	}
+
 	f, err := follower.New(&follower.Config{
 		LeaderURL:    leaderURL,
-		Client:       httpclient.NewHTTPClient(httpCfg.Options()...),
-		Retry:        retrycfg.NewExponentialBackoffPolicy(fcfg.Retry),
+		Client:       outbound,
+		Retry:        retryPolicy,
 		Breaker:      breaker,
 		Fallback:     fallback,
 		BuildEngines: engines.BuildAll,
@@ -144,7 +154,9 @@ func (a *application) work(ctx context.Context, leaderURL string) error {
 			SilenceRouteLogging:    mcfg.SilenceRouteLogging,
 		},
 	)
-	follower.RegisterHealth(router, f, a.logger)
+	if err = follower.RegisterHealth(router, f, a.logger); err != nil {
+		return err
+	}
 
 	if err = router.Err(); err != nil {
 		return err

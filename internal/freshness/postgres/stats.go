@@ -2,17 +2,18 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v9/cache"
-	cachememory "github.com/primandproper/platform-go/v9/cache/memory"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/observability/metrics"
-	"github.com/primandproper/platform-go/v9/observability/tracing"
+	"github.com/primandproper/platform-go/v10/cache"
+	cachememory "github.com/primandproper/platform-go/v10/cache/memory"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/platform-go/v10/observability/tracing"
 )
 
 // statsCache memoizes the aggregate observability reads per head: the console
@@ -39,7 +40,20 @@ func areaKey(area beeline.AreaID) string {
 }
 
 // newStatsCache builds the memo caches, or returns nil when caching is off.
-func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider tracing.TracerProvider, metricsProvider metrics.Provider) (*statsCache, error) {
+//
+// Both caches read through to the index's own scans, so a miss runs exactly one
+// scan no matter how many callers raced into it. That matters more than it
+// looks: the memo exists because the console polls twice a second, and without
+// read-through every expiry let each concurrent poller start its own aggregate
+// scan of the shared table — one expiry, N scans, which is the load the memo
+// was added to remove.
+func newStatsCache(
+	i *Index,
+	ttl time.Duration,
+	logger logging.Logger,
+	tracerProvider tracing.Provider,
+	metricsProvider metrics.Provider,
+) (*statsCache, error) {
 	if ttl <= 0 {
 		return nil, nil //nolint:nilnil // a nil cache IS the "caching disabled" value
 	}
@@ -50,12 +64,28 @@ func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider trac
 		cachememory.WithMetricsProvider(metricsProvider),
 	}
 
-	debt, err := cachememory.NewInMemoryCache[beeline.DebtStats](ttl, opts...)
+	debt, err := cachememory.NewInMemoryCache[beeline.DebtStats](ttl, append(opts,
+		cachememory.WithLoader(func(ctx context.Context, key string) (*beeline.DebtStats, error) {
+			return i.loadDebt(ctx, key)
+		}))...)
 	if err != nil {
 		return nil, fmt.Errorf("freshness: building debt stats cache: %w", err)
 	}
 
-	cells, err := cachememory.NewInMemoryCache[[]beeline.CellState](ttl, opts...)
+	cells, err := cachememory.NewInMemoryCache[[]beeline.CellState](ttl, append(opts,
+		cachememory.WithLoader(func(ctx context.Context, key string) (*[]beeline.CellState, error) {
+			area, parseErr := parseAreaKey(key)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+
+			states, scanErr := i.scanCellStatesForArea(ctx, area)
+			if scanErr != nil {
+				return nil, &scanError{err: scanErr}
+			}
+
+			return &states, nil
+		}))...)
 	if err != nil {
 		return nil, fmt.Errorf("freshness: building cell states cache: %w", err)
 	}
@@ -63,50 +93,85 @@ func newStatsCache(ttl time.Duration, logger logging.Logger, tracerProvider trac
 	return &statsCache{debt: debt, cells: cells}, nil
 }
 
-// cachedDebt returns a memoized DebtStats, if one is live.
-func (c *statsCache) cachedDebt(ctx context.Context, key string) (beeline.DebtStats, bool) {
+// scanError carries a scan's own error out through the cache's loader
+// wrapper. cache/memory wraps whatever a loader returns with `loading "<key>"`,
+// and the key is a memo implementation detail: without this, a database outage
+// answered /_ops_/freshness with `loading "all": freshness: reading debt: …`,
+// naming an internal cache entry in a body a client reads. unwrapScan recovers
+// the error the scan actually produced, whatever the wrapper did.
+type scanError struct{ err error }
+
+func (e *scanError) Error() string { return e.err.Error() }
+func (e *scanError) Unwrap() error { return e.err }
+
+// unwrapScan strips the loader wrapper from err, leaving the scan's own error.
+// Anything that is not a scan error (a context cancellation, a type
+// mismatch) is returned untouched.
+func unwrapScan(err error) error {
+	if failure, ok := errors.AsType[*scanError](err); ok {
+		return failure.err
+	}
+
+	return err
+}
+
+// loadDebt resolves either debt key: the aggregate entry, or one area's.
+func (i *Index) loadDebt(ctx context.Context, key string) (*beeline.DebtStats, error) {
+	if key == debtAllKey {
+		stats, err := i.scanDebt(ctx)
+		if err != nil {
+			return nil, &scanError{err: err}
+		}
+
+		return &stats, nil
+	}
+
+	area, err := parseAreaKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	stats, err := i.scanDebtForArea(ctx, area)
+	if err != nil {
+		return nil, &scanError{err: err}
+	}
+
+	return &stats, nil
+}
+
+// parseAreaKey reverses areaKey. A key this cannot parse is a bug in this file,
+// not bad input, since nothing outside it ever names an entry.
+func parseAreaKey(key string) (beeline.AreaID, error) {
+	id, err := strconv.ParseInt(key, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("freshness: unroutable stats cache key %q: %w", key, err)
+	}
+
+	return beeline.AreaID(id), nil
+}
+
+// debtEntry serves one debt key through the memo, or runs scan directly when
+// the memo is off (TTL <= 0). The loader behind the cache resolves the same key
+// to the same scan; scan is taken as an argument so the caller that already
+// knows which one it wants does not round-trip through key parsing.
+func (c *statsCache) debtEntry(
+	ctx context.Context,
+	key string,
+	scan func(context.Context) (beeline.DebtStats, error),
+) (beeline.DebtStats, error) {
 	if c == nil {
-		return beeline.DebtStats{}, false
+		return scan(ctx)
 	}
 
 	stats, err := c.debt.Get(ctx, key)
-	if err != nil || stats == nil {
-		return beeline.DebtStats{}, false
+	if err != nil {
+		return beeline.DebtStats{}, unwrapScan(err)
+	}
+	if stats == nil {
+		return beeline.DebtStats{}, nil
 	}
 
-	return *stats, true
-}
-
-// putDebt memoizes a DebtStats. A cache write failure only costs a future scan.
-func (c *statsCache) putDebt(ctx context.Context, key string, stats beeline.DebtStats) {
-	if c == nil {
-		return
-	}
-
-	_ = c.debt.Set(ctx, key, &stats) //nolint:errcheck // memoization is best-effort
-}
-
-// cachedCells returns memoized cell states, if any are live.
-func (c *statsCache) cachedCells(ctx context.Context, key string) ([]beeline.CellState, bool) {
-	if c == nil {
-		return nil, false
-	}
-
-	states, err := c.cells.Get(ctx, key)
-	if err != nil || states == nil {
-		return nil, false
-	}
-
-	return *states, true
-}
-
-// putCells memoizes cell states.
-func (c *statsCache) putCells(ctx context.Context, key string, states []beeline.CellState) {
-	if c == nil {
-		return
-	}
-
-	_ = c.cells.Set(ctx, key, &states) //nolint:errcheck // memoization is best-effort
+	return *stats, nil
 }
 
 // purge drops every memoized aggregate on this head. It is for the operator
@@ -133,10 +198,11 @@ func (c *statsCache) purge(ctx context.Context) {
 // throughput. Required sums each area's workingSet/TTL; achieved comes from
 // the shared global counter, so every head reports the same number.
 func (i *Index) Debt(ctx context.Context) (beeline.DebtStats, error) {
-	if stats, ok := i.stats.cachedDebt(ctx, debtAllKey); ok {
-		return stats, nil
-	}
+	return i.stats.debtEntry(ctx, debtAllKey, i.scanDebt)
+}
 
+// scanDebt is Debt's uncached scan; the memo reads through to it.
+func (i *Index) scanDebt(ctx context.Context) (beeline.DebtStats, error) {
 	start := time.Now()
 	defer func() {
 		if elapsed := time.Since(start); elapsed > slowQueryThreshold {
@@ -175,8 +241,6 @@ func (i *Index) Debt(ctx context.Context) (beeline.DebtStats, error) {
 		return beeline.DebtStats{}, fmt.Errorf("freshness: reading debt: %w", err)
 	}
 
-	i.stats.putDebt(ctx, debtAllKey, stats)
-
 	return stats, nil
 }
 
@@ -184,10 +248,13 @@ func (i *Index) Debt(ctx context.Context) (beeline.DebtStats, error) {
 // from the area's own baseline (reset when it was last seeded), so a freshly
 // enabled area's progress reads from zero.
 func (i *Index) DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.DebtStats, error) {
-	if stats, ok := i.stats.cachedDebt(ctx, areaKey(area)); ok {
-		return stats, nil
-	}
+	return i.stats.debtEntry(ctx, areaKey(area), func(ctx context.Context) (beeline.DebtStats, error) {
+		return i.scanDebtForArea(ctx, area)
+	})
+}
 
+// scanDebtForArea is DebtForArea's uncached scan; the memo reads through to it.
+func (i *Index) scanDebtForArea(ctx context.Context, area beeline.AreaID) (beeline.DebtStats, error) {
 	var stats beeline.DebtStats
 	var ttlSeconds float64
 	err := i.pool.QueryRow(ctx, `
@@ -218,8 +285,6 @@ func (i *Index) DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.D
 		stats.RequiredThroughput = float64(stats.WorkingSet) / ttlSeconds
 	}
 
-	i.stats.putDebt(ctx, areaKey(area), stats)
-
 	return stats, nil
 }
 
@@ -227,10 +292,24 @@ func (i *Index) DebtForArea(ctx context.Context, area beeline.AreaID) (beeline.D
 // console's progress map: total outgoing pairs, currently-fresh pairs, and the
 // oldest computed age. The result is unordered.
 func (i *Index) CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error) {
-	if states, ok := i.stats.cachedCells(ctx, areaKey(area)); ok {
-		return states, nil
+	if i.stats == nil {
+		return i.scanCellStatesForArea(ctx, area)
 	}
 
+	states, err := i.stats.cells.Get(ctx, areaKey(area))
+	if err != nil {
+		return nil, unwrapScan(err)
+	}
+	if states == nil {
+		return nil, nil
+	}
+
+	return *states, nil
+}
+
+// scanCellStatesForArea is CellStatesForArea's uncached scan; the memo reads
+// through to it.
+func (i *Index) scanCellStatesForArea(ctx context.Context, area beeline.AreaID) ([]beeline.CellState, error) {
 	rows, err := i.pool.Query(ctx, `
 		SELECT origin,
 		       count(*)::int,
@@ -257,8 +336,6 @@ func (i *Index) CellStatesForArea(ctx context.Context, area beeline.AreaID) ([]b
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("freshness: reading cell states: %w", err)
 	}
-
-	i.stats.putCells(ctx, areaKey(area), states)
 
 	return states, nil
 }

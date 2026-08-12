@@ -18,10 +18,10 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v9/clock"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/observability/metrics"
-	"github.com/primandproper/platform-go/v9/observability/tracing"
+	"github.com/primandproper/platform-go/v10/clock"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/platform-go/v10/observability/tracing"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -42,7 +42,7 @@ type Config struct {
 	Clock clock.Clock
 	// TracerProvider and MetricsProvider instrument the stats memo caches. Nil
 	// values become noops.
-	TracerProvider  tracing.TracerProvider
+	TracerProvider  tracing.Provider
 	MetricsProvider metrics.Provider
 	TargetTTL       time.Duration
 	// StatsCacheTTL memoizes Debt/DebtForArea/CellStatesForArea per head — the
@@ -91,17 +91,20 @@ func New(pool *pgxpool.Pool, cfg *Config, log logging.Logger) (*Index, error) {
 
 	log = logging.EnsureLogger(log)
 
-	stats, err := newStatsCache(cfg.StatsCacheTTL, log, cfg.TracerProvider, cfg.MetricsProvider)
+	i := &Index{
+		pool: pool,
+		log:  log,
+		cfg:  *cfg,
+	}
+
+	// After the Index exists: the memo reads through to i's own scans, so the
+	// loaders have to close over it.
+	stats, err := newStatsCache(i, cfg.StatsCacheTTL, log, cfg.TracerProvider, cfg.MetricsProvider)
 	if err != nil {
 		return nil, err
 	}
+	i.stats = stats
 
-	i := &Index{
-		pool:  pool,
-		log:   log,
-		cfg:   *cfg,
-		stats: stats,
-	}
 	i.access = newAccessBuffer(i, cfg.Clock, cfg.AccessFlushInterval, cfg.AccessFlushLimit)
 	i.bumps = newBumpBatcher(i)
 

@@ -6,12 +6,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v9/database"
-	"github.com/primandproper/platform-go/v9/distributedlock"
-	dlpostgres "github.com/primandproper/platform-go/v9/distributedlock/postgres"
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	"github.com/primandproper/platform-go/v9/observability/metrics"
-	"github.com/primandproper/platform-go/v9/observability/tracing"
+	"github.com/primandproper/platform-go/v10/database"
+	"github.com/primandproper/platform-go/v10/distributedlock"
+	dlpostgres "github.com/primandproper/platform-go/v10/distributedlock/postgres"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/platform-go/v10/observability/tracing"
 )
 
 // Advisory-lock names. The platform locker hashes them into the advisory-lock
@@ -42,7 +42,7 @@ type AdvisoryLocker struct {
 func NewAdvisoryLocker(
 	db database.Client,
 	logger logging.Logger,
-	tracerProvider tracing.TracerProvider,
+	tracerProvider tracing.Provider,
 	metricsProvider metrics.Provider,
 ) (*AdvisoryLocker, error) {
 	scoped, err := dlpostgres.NewPostgresScopedLocker(

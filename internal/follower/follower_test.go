@@ -18,10 +18,10 @@ import (
 	"github.com/primandproper/beeline/internal/refresh"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v9/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v9/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v9/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v9/routing/backends/chi"
+	"github.com/primandproper/platform-go/v10/observability/logging"
+	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
+	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -267,7 +267,7 @@ func TestHealthEndpoints(t *testing.T) {
 		metricsnoop.NewMetricsProvider(),
 		&chibackend.Config{ServiceName: "test"},
 	)
-	follower.RegisterHealth(router, f, nil)
+	require.NoError(t, follower.RegisterHealth(router, f, nil))
 	h := router.Handler()
 
 	get := func(path string) *httptest.ResponseRecorder {

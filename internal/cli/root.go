@@ -1,5 +1,5 @@
 // Package cli wires the command-line interface together and bootstraps the
-// platform-go observability suite that the rest of the application builds on.
+// primitives-go observability suite that the rest of the application builds on.
 //
 // The CLI is the template's single entrypoint: whether you are building a
 // one-off tool, a long-running worker, or an HTTP service, you start here and
@@ -14,9 +14,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v10/clock"
-	"github.com/primandproper/platform-go/v10/observability"
-	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/primitives-go/v2/clock"
+	"github.com/primandproper/primitives-go/v2/observability"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
 
 	"github.com/spf13/cobra"
 )
@@ -62,7 +62,7 @@ func (a *application) newRootCommand() *cobra.Command {
 
 	rootCmd := &cobra.Command{
 		Use:          config.DefaultServiceName,
-		Short:        "A Go application template built on primandproper/platform-go.",
+		Short:        "A Go application template built on primandproper/primitives-go.",
 		SilenceUsage: true,
 		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
 			return a.bootstrap(cmd.Context(), config.Options{ServiceName: serviceName, LogLevel: logLevel}, configPath)

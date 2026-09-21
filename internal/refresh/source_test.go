@@ -58,8 +58,8 @@ func TestLocalSourceClaimAndSubmit(t *testing.T) {
 	entries := make([]beeline.Entry, 0, len(claimed))
 	for _, key := range claimed {
 		entries = append(entries, beeline.Entry{
-			Key:    key,
-			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 60, Distance: 500}, ComputedAt: now},
+			Key:      key,
+			Duration: 60, Distance: 500, ComputedAt: now,
 		})
 	}
 	require.NoError(t, source.Submit(ctx, entries))
@@ -102,8 +102,8 @@ func TestLocalSourceSubmitStoreErrorLeavesLease(t *testing.T) {
 		require.Len(t, claimed, 1)
 
 		entries := []beeline.Entry{{
-			Key:    claimed[0],
-			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1}, ComputedAt: time.Now()},
+			Key:      claimed[0],
+			Duration: 1, ComputedAt: time.Now(),
 		}}
 		require.Error(t, source.Submit(ctx, entries), "the store failure surfaces")
 

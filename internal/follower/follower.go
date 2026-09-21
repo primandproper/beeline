@@ -27,11 +27,11 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/circuitbreaking"
-	circuitbreakingcfg "github.com/primandproper/platform-go/v10/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/retry"
-	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
+	"github.com/primandproper/primitives-go/v2/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/primitives-go/v2/circuitbreaking/config"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/retry"
+	retrycfg "github.com/primandproper/primitives-go/v2/retry/config"
 
 	"github.com/uber/h3-go/v4"
 )
@@ -341,7 +341,7 @@ func (f *Follower) Ping(ctx context.Context) error {
 		return fmt.Errorf("follower: building ping request: %w", err)
 	}
 
-	httpResp, err := f.client.Do(httpReq) //nolint:gosec // G704: leader URL is trusted operator configuration.
+	httpResp, err := f.client.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("follower: pinging leader: %w", err)
 	}
@@ -400,7 +400,7 @@ func (f *Follower) roundTrip(httpReq *http.Request, path string, out any) error 
 
 	// The URL is the operator-configured leader base plus a fixed path, never
 	// end-user input, so it is not an SSRF vector.
-	httpResp, err := f.client.Do(httpReq) //nolint:gosec // G704: leader URL is trusted operator configuration.
+	httpResp, err := f.client.Do(httpReq)
 	if err != nil {
 		f.breaker.Failed()
 

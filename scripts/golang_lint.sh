@@ -5,7 +5,7 @@ set -euo pipefail
 # Usage: golang_lint.sh <container_runner> <linter_image> <linter_command>
 
 CONTAINER_RUNNER="${1:-docker}"
-LINTER_IMAGE="${2:-golangci/golangci-lint:v2.10.1}"
+LINTER_IMAGE="${2:-golangci/golangci-lint:v2.13.1}"
 LINTER="${3}"
 
 "${CONTAINER_RUNNER}" pull --quiet "${LINTER_IMAGE}"

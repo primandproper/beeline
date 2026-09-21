@@ -36,6 +36,13 @@ type Repository interface {
 // factory must hand back an empty repository.
 type Factory func(tb testing.TB) Repository
 
+// carProfile and drivingMode are the profile name every provider fixture maps
+// and the OSRM profile it maps to.
+const (
+	carProfile  = "car"
+	drivingMode = "driving"
+)
+
 // polygon is a syntactically valid GeoJSON polygon. The repositories store
 // geometry as opaque bytes — polyfilling and validation happen above them — so
 // its shape only has to survive a round trip.
@@ -341,27 +348,27 @@ func Run(t *testing.T, factory Factory) {
 
 		spec := beeline.ProviderSpec{
 			Name:     "aliasing",
-			Type:     "osrm",
+			Type:     beeline.ProviderTypeOSRM,
 			BaseURL:  "http://one.invalid",
-			Profiles: map[string]string{"car": "driving"},
+			Profiles: map[string]string{carProfile: drivingMode},
 		}
 		require.NoError(t, repo.UpsertProvider(ctx, &spec))
 
 		// The profile map is the reference field a fake is most likely to share.
-		spec.Profiles["car"] = "mutated"
+		spec.Profiles[carProfile] = "mutated"
 		spec.Profiles["added"] = "later"
 
 		listed, err := repo.ListProviders(ctx)
 		require.NoError(t, err)
 		require.Len(t, listed, 1)
-		assert.Equal(t, map[string]string{"car": "driving"}, listed[0].Profiles,
+		assert.Equal(t, map[string]string{carProfile: drivingMode}, listed[0].Profiles,
 			"the stored profile map is independent of the caller's")
 
 		// And what ListProviders hands back is independent too.
-		listed[0].Profiles["car"] = "mutated-again"
+		listed[0].Profiles[carProfile] = "mutated-again"
 		again, err := repo.ListProviders(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, map[string]string{"car": "driving"}, again[0].Profiles)
+		assert.Equal(t, map[string]string{carProfile: drivingMode}, again[0].Profiles)
 	})
 
 	t.Run("provider upsert inserts then updates under one name", func(t *testing.T) {
@@ -376,11 +383,11 @@ func Run(t *testing.T, factory Factory) {
 		// Every field populated, so one dropped on the way through shows up.
 		spec := beeline.ProviderSpec{
 			Name:         "osrm-a",
-			Type:         "osrm",
+			Type:         beeline.ProviderTypeOSRM,
 			BaseURL:      "http://one.invalid",
 			TimeoutMs:    2500,
 			MaxTableSize: 4096,
-			Profiles:     map[string]string{"car": "driving", "bike": "cycling"},
+			Profiles:     map[string]string{carProfile: drivingMode, "bike": "cycling"},
 		}
 		require.NoError(t, repo.UpsertProvider(ctx, &spec))
 
@@ -392,7 +399,7 @@ func Run(t *testing.T, factory Factory) {
 		// Same name again: an update, not a second row.
 		spec.BaseURL = "http://two.invalid"
 		spec.TimeoutMs = 7000
-		spec.Profiles = map[string]string{"car": "driving"}
+		spec.Profiles = map[string]string{carProfile: drivingMode}
 		require.NoError(t, repo.UpsertProvider(ctx, &spec))
 
 		listed, err = repo.ListProviders(ctx)
@@ -407,7 +414,7 @@ func Run(t *testing.T, factory Factory) {
 
 		// Inserted out of order so an implementation echoing insertion order fails.
 		for _, name := range []string{"zulu", "alpha", "mike"} {
-			spec := beeline.ProviderSpec{Name: name, Type: "osrm", BaseURL: "http://" + name + ".invalid"}
+			spec := beeline.ProviderSpec{Name: name, Type: beeline.ProviderTypeOSRM, BaseURL: "http://" + name + ".invalid"}
 			require.NoError(t, repo.UpsertProvider(ctx, &spec))
 		}
 
@@ -425,8 +432,8 @@ func Run(t *testing.T, factory Factory) {
 		t.Parallel()
 		repo := factory(t)
 
-		keep := beeline.ProviderSpec{Name: "keep", Type: "osrm", BaseURL: "http://keep.invalid"}
-		drop := beeline.ProviderSpec{Name: "drop", Type: "osrm", BaseURL: "http://drop.invalid"}
+		keep := beeline.ProviderSpec{Name: "keep", Type: beeline.ProviderTypeOSRM, BaseURL: "http://keep.invalid"}
+		drop := beeline.ProviderSpec{Name: "drop", Type: beeline.ProviderTypeOSRM, BaseURL: "http://drop.invalid"}
 		require.NoError(t, repo.UpsertProvider(ctx, &keep))
 		require.NoError(t, repo.UpsertProvider(ctx, &drop))
 

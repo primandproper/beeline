@@ -38,7 +38,7 @@ type BackendConfig struct {
 // URL (postgres://user:pass@host:5432/beeline). Conn bounds map onto pgxpool;
 // zero values use the pool's defaults.
 //
-// It satisfies platform-go's database.ClientConfig, so the shared pool is built
+// It satisfies primitives-go's database.ClientConfig, so the shared pool is built
 // by database/postgres rather than by hand. Beeline runs one pool against one
 // URL, so the read side is deliberately empty: an empty read connection string
 // makes the platform client alias its read handles to the write ones instead of

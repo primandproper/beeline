@@ -21,8 +21,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/circuitbreaking"
-	circuitbreakingcfg "github.com/primandproper/platform-go/v10/circuitbreaking/config"
+	"github.com/primandproper/primitives-go/v2/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/primitives-go/v2/circuitbreaking/config"
 )
 
 // defaultTimeout bounds a single /table request so a hung OSRM server cannot stall a
@@ -136,7 +136,7 @@ func (e *Engine) Table(ctx context.Context, req beeline.TableRequest) (beeline.T
 
 	// The request URL is assembled from the operator-configured baseURL plus fixed
 	// path/query structure, not from end-user input, so it is not an SSRF vector.
-	httpResp, err := e.client.Do(httpReq) //nolint:gosec // G704: baseURL is trusted operator configuration.
+	httpResp, err := e.client.Do(httpReq)
 	if err != nil {
 		e.breaker.Failed()
 

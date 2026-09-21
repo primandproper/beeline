@@ -1,5 +1,5 @@
 // Package config assembles the application's configuration, most notably the
-// observability settings that the platform-go observability suite consumes.
+// observability settings that the primitives-go observability suite consumes.
 //
 // The configuration is built in Go with sensible, zero-dependency defaults so
 // the binary boots out of the box: structured slog logging plus noop tracing,
@@ -7,7 +7,7 @@
 // (see Options), which is how the CLI threads its flags and environment into
 // the platform configuration.
 //
-// Two loaders build on those defaults using platform-go's config package:
+// Two loaders build on those defaults using primitives-go's config package:
 //
 //   - Load overlays environment variables (prefixed with EnvVarPrefix) on top of
 //     the defaults, so any field can be tuned without a config file — the
@@ -26,13 +26,13 @@ import (
 	"log/slog"
 	"strings"
 
-	platformconfig "github.com/primandproper/platform-go/v10/config"
-	"github.com/primandproper/platform-go/v10/observability"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v10/observability/logging/config"
-	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
-	profilingnoop "github.com/primandproper/platform-go/v10/observability/profiling/noop"
-	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
+	platformconfig "github.com/primandproper/primitives-go/v2/config"
+	"github.com/primandproper/primitives-go/v2/observability"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	loggingcfg "github.com/primandproper/primitives-go/v2/observability/logging/config"
+	metricsnoop "github.com/primandproper/primitives-go/v2/observability/metrics/noop"
+	profilingnoop "github.com/primandproper/primitives-go/v2/observability/profiling/noop"
+	tracingnoop "github.com/primandproper/primitives-go/v2/observability/tracing/noop"
 )
 
 // DefaultServiceName is the service name reported by the observability suite
@@ -53,10 +53,10 @@ const (
 	LevelError = "error"
 )
 
-// Config is the application configuration. It wraps the platform-go
+// Config is the application configuration. It wraps the primitives-go
 // observability configuration; add your own fields here as the application grows.
 //
-// The struct tags let platform-go's config package populate the config from
+// The struct tags let primitives-go's config package populate the config from
 // environment variables (envPrefix) and JSON files (json). Give new fields both
 // tags so they participate in Load and LoadFromFile.
 type Config struct {
@@ -173,7 +173,7 @@ func (c *Config) Validate(ctx context.Context) error {
 // c.Observability.NewPillars(ctx) instead — it wires OTel/Cloud providers from
 // the same config — or replace the noop constructors below with your own.
 func (c *Config) NewPillars(ctx context.Context) (*observability.Pillars, error) {
-	logger, err := c.Observability.Logging.NewLogger(ctx)
+	logger, err := loggingcfg.NewLogger(ctx, &c.Observability.Logging)
 	if err != nil {
 		return nil, err
 	}

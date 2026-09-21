@@ -13,7 +13,7 @@
 // Never skip silently. A green run that quietly skipped the only backend
 // distributed mode has is worse than a run that fails for want of Docker: that
 // is precisely how the Postgres backend once reached zero CI coverage. This is a
-// deliberate departure from platform-go's RUN_CONTAINER_TESTS convention
+// deliberate departure from primitives-go's RUN_CONTAINER_TESTS convention
 // (testutils/containers), which defaults to skipping because its consumers may
 // have no Docker daemon; beeline is an application whose distributed mode *is*
 // Postgres, so the default here is to actually exercise it.
@@ -40,8 +40,8 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	"github.com/primandproper/beeline/internal/store/postgres"
 
-	"github.com/primandproper/platform-go/v10/database"
-	"github.com/primandproper/platform-go/v10/testutils/containers"
+	"github.com/primandproper/primitives-go/v2/database"
+	"github.com/primandproper/primitives-go/v2/testutils/containers"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"

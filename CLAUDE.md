@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `github.com/primandproper/beeline` — a self-hostable server that precomputes travel-time/distance
 matrices between H3 cells and serves cached scalar estimates under a freshness contract. Built on
-[`github.com/primandproper/platform-go`](https://github.com/primandproper/platform-go). Go 1.26.
+[`github.com/primandproper/primitives-go/v2`](https://github.com/primandproper/primitives-go). Go 1.27.
 See `beeline-design.md` for the full design; section references (§) below point into it.
 
 The application is a **Cobra CLI**. Three subcommands:
@@ -114,7 +114,7 @@ HTTP endpoints (default `:8080`):
   and changes the catalog hash so followers converge on their next claim; deleting is refused (409)
   while any area references the name, and built-ins are immutable. Unauthenticated, like the other
   endpoints; a real deploy would gate these.
-- Health — `/_ops_/live` (process up) + `/_ops_/ready`, which runs a platform-go `healthcheck`
+- Health — `/_ops_/live` (process up) + `/_ops_/ready`, which runs a primitives-go `healthcheck`
   registry populated per backend: a Postgres checker (the client's `IsReady`), a Redis checker when
   that hot store is selected. A failing dependency answers 503 with
   the component named.
@@ -152,14 +152,14 @@ HTTP endpoints (default `:8080`):
   `application.pillars`.
 - `internal/config/` — assembles `observability.Config` and builds the pillars (slog logging + noop
   tracing/metrics/profiling by default). See `Config.NewPillars` for the upgrade path to real telemetry.
-  Two loaders use `platform-go/v10/config`: `Load` overlays `BEELINE_`-prefixed environment
+  Two loaders use `primitives-go/v2/config`: `Load` overlays `BEELINE_`-prefixed environment
   variables on the flag/default-seeded config, and `LoadFromFile` decodes a complete JSON config file
   and then overlays the same environment variables. `Render` goes the other way: it validates typed
   `Config` objects and writes them to disk (see `make configs`). The matrix service is configured by
   `MatrixConfig` (`matrix.go`), a `Config.Matrix` field (env prefix `BEELINE_MATRIX_`, JSON key
   `matrix`): HTTP server, profiles+speeds, the `backend` sub-config
   (`BackendConfig`, env prefix `BEELINE_MATRIX_BACKEND_`: `hotStore` postgres|redis,
-  Postgres/Redis connection blocks — `PostgresConfig` doubles as platform-go's
+  Postgres/Redis connection blocks — `PostgresConfig` doubles as primitives-go's
   `database.ClientConfig` — and `configPollInterval`. The Postgres URL is **required**: validation
   rejects an empty one, and a `hotStore` of `memory` is rejected by name so an upgraded config fails
   loudly instead of silently pointing a head at the default DSN), and freshness knobs (`targetTTL`,
@@ -190,7 +190,7 @@ HTTP endpoints (default `:8080`):
   sync, …) and cell helpers (`Center`, `CellAt`). `H3Cell` aliases `h3.Cell`.
 - `internal/geo/` — pure `Haversine(a, b)` great-circle distance.
 - `internal/telemetry/` — query-event capture for offline demand-model training, composed from
-  platform-go's `eventcapture` (+ `eventcapture/jsonl` sink) rather than hand-rolled. The read path
+  primitives-go's `eventcapture` (+ `eventcapture/jsonl` sink) rather than hand-rolled. The read path
   tees every in-area fetch (cache hit/stale, same-cell, demand — H3 cells only, never coordinates) to
   a `Recorder` over a bounded never-blocking buffer (overflow drops and counts); a flusher goroutine
   writes raw `fetch` events (`WithTransform`) and/or per-(pair, time-bucket) `demand` aggregates
@@ -215,7 +215,7 @@ HTTP endpoints (default `:8080`):
   bound in meters** (`RingsForRadius` converts it to an H3 ring count empirically via `geo.Haversine`;
   `radiusMeters == 0` is the full-mesh sentinel).
 - `internal/store/memory/` — in-memory `Store` (map + RWMutex); `DeleteArea` drops one area's estimates.
-- `internal/store/postgres/` — the distributed-mode backend home (pgx/v5): `Open` (builds platform-go's
+- `internal/store/postgres/` — the distributed-mode backend home (pgx/v5): `Open` (builds primitives-go's
   `database.Client` over the DSN — `config.PostgresConfig` implements `database.ClientConfig`, with an
   empty read connection string so one pool serves both sides — pings once for fail-fast, then applies
   embedded migrations through `database/migrate`, serialized across booting heads by a schema-scoped
@@ -224,18 +224,18 @@ HTTP endpoints (default `:8080`):
   `computed_at`), the control-plane `Repository` (areas/providers via a second sqlc target in
   `generated/`, every mutation bumping its `config_version` generation transactionally),
   `AdvisoryLocker` (beeline's names for per-area mutation locks, janitor try-lock and boot-seed lock
-  over platform-go's `distributedlock` transaction-scoped Postgres `ScopedLocker`), and `pgtest/`
+  over primitives-go's `distributedlock` transaction-scoped Postgres `ScopedLocker`), and `pgtest/`
   (test helper: one random schema per test — `Open` for the pool, `OpenClient` for the
   `database.Client`). `pgtest` **self-provisions**: it uses `BEELINE_TEST_POSTGRES_DSN` when set,
   skips under `go test -short`, and otherwise starts one `testcontainers` Postgres per test binary
-  (via platform-go's `testutils/containers`, reaped by Ryuk at process exit). A missing Docker daemon
+  (via primitives-go's `testutils/containers`, reaped by Ryuk at process exit). A missing Docker daemon
   is a hard failure, never a silent skip — that asymmetry is deliberate and is why the distributed
-  backend can no longer reach zero CI coverage unnoticed. Note this departs from platform-go's
+  backend can no longer reach zero CI coverage unnoticed. Note this departs from primitives-go's
   `RUN_CONTAINER_TESTS` convention, which defaults to skipping.
 - `internal/store/redis/` — the optional Redis hot `Store` (go-redis/v9): pipelined MGET/MSET over
   fixed 24-byte binary values; only cached scalars live here, never coordination state. Its
   `redistest/` helper mirrors `pgtest`'s resolution order (`BEELINE_TEST_REDIS_ADDR` → `-short` skip
-  → container) and wraps platform-go's `testutils/containers/redistest` rather than driving
+  → container) and wraps primitives-go's `testutils/containers/redistest` rather than driving
   testcontainers directly. Isolation is by random area ID, not database, so one server serves every
   parallel test.
 - `internal/store/storebench/` — the shared 300k-key BatchGet benchmark harness behind `make
@@ -262,7 +262,7 @@ HTTP endpoints (default `:8080`):
   scope as a nullable parameter in one statement (area+res rides the primary key's leading column)
   and purges this head's stats memo so the console sees the debt spike it just caused, and
   `Debt`/`CellStates` aggregates memoize
-  ~500ms per head for console polling in platform-go `cache/memory` caches (a nil cache — `StatsCacheTTL`
+  ~500ms per head for console polling in primitives-go `cache/memory` caches (a nil cache — `StatsCacheTTL`
   <= 0 — disables memoization, which the tests rely on). No fencing tokens by design — see §8.2.
 - `internal/freshness/freshnesstest/` — the conformance suite both index implementations run
   (real-clock, window-tolerant), so the backends cannot drift apart.
@@ -312,7 +312,7 @@ HTTP endpoints (default `:8080`):
   also implements `query.AreaRouter` (`Locate` — containment is the finest layer's cell set; the
   returned `RoutedArea` carries the full layer list finest→coarsest). `serve.go` calls
   `ResumeEnabled` at boot.
-- `internal/httpapi/` — HTTP routes on platform-go's typed OpenAPI router over the chi backend
+- `internal/httpapi/` — HTTP routes on primitives-go's typed OpenAPI router over the chi backend
   (read path, freshness, cells, the `/_config_/areas` registry, health). Handlers are typed
   (`routing.Handler[In, Out]`; path/query params bind from struct tags), which generates
   `/openapi.json` + a `/docs` browser UI for free — note `/docs` loads Stoplight Elements from a
@@ -391,7 +391,7 @@ FAILFAST=false scripts/test.sh -run TestConformance
 Linting runs in Docker (`golangci/golangci-lint` image). Formatting runs locally via `go tool` with
 `gci`, `goimports`, `fieldalignment`, `tagalign`, and `gofmt` (declared in the `tool` block of go.mod).
 
-This template does **not** vendor dependencies (platform-go's dependency tree is large); builds and
+This template does **not** vendor dependencies (primitives-go's dependency tree is large); builds and
 tests run against the module cache. Vendoring targets (`make vendor` / `make revendor`) exist for
 consumers who want them.
 
@@ -401,7 +401,7 @@ Import ordering uses `gci` with four sections, separated by blank lines:
 
 1. Standard library
 2. `github.com/primandproper/beeline` (this module)
-3. `github.com/primandproper` (org-level packages, including platform-go)
+3. `github.com/primandproper` (org-level packages, including primitives-go)
 4. Everything else (third-party)
 
 The Makefile `THIS` variable must be the full module path (`github.com/primandproper/beeline`)
@@ -435,7 +435,7 @@ because `format_imports.sh` runs `dirname` on it to derive the org-level prefix.
   `BEELINE_LOG_LEVEL` / `BEELINE_SERVICE_NAME` defaults are silently dropped. Deployments that pass
   `--config` (which is all of them) must use the nested `BEELINE_OBSERVABILITY_LOGGING_LEVEL`.
 - Configuration is layered: defaults (or a JSON file) < `BEELINE_`-prefixed environment variables.
-  Env vars follow platform-go's nested `envPrefix` tags, e.g.
+  Env vars follow primitives-go's nested `envPrefix` tags, e.g.
   `BEELINE_OBSERVABILITY_LOGGING_LEVEL`. Give new `Config` fields both `envPrefix`/`env` and `json`
   tags so they participate in `Load` and `LoadFromFile`.
 - To enable real tracing/metrics/profiling, populate the sub-configs in `internal/config` and call

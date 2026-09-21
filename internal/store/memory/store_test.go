@@ -20,8 +20,8 @@ func put(t *testing.T, store *memory.Store, area beeline.AreaID, origin beeline.
 	t.Helper()
 
 	require.NoError(t, store.Put(context.Background(), []beeline.Entry{{
-		Key:    beeline.PairKey{Area: area, Origin: origin, Dest: origin + 1, Profile: "car", Res: 8},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1, Distance: 1}, ComputedAt: time.Now()},
+		Key:      beeline.PairKey{Area: area, Origin: origin, Dest: origin + 1, Profile: "car", Res: 8},
+		Duration: 1, Distance: 1, ComputedAt: time.Now(),
 	}}))
 }
 

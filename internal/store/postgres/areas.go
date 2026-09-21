@@ -9,7 +9,7 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/store/postgres/generated"
 
-	"github.com/primandproper/platform-go/v10/clock"
+	"github.com/primandproper/primitives-go/v2/clock"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"

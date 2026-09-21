@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"net/http"
 
-	httpx "github.com/primandproper/platform-go/v10/errors/http"
-	"github.com/primandproper/platform-go/v10/routing"
+	httpx "github.com/primandproper/primitives-go/v2/errors/http"
+	"github.com/primandproper/primitives-go/v2/routing"
 )
 
 // errorBody is this API's error shape: a flat {"error": "..."} object. Every

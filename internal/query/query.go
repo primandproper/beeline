@@ -12,7 +12,7 @@ import (
 	"github.com/primandproper/beeline/internal/geo"
 	"github.com/primandproper/beeline/internal/telemetry"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
 )
 
 // AreaRouter resolves a coordinate to the enabled service area that contains it. The
@@ -191,8 +191,8 @@ func (h *Handler) Estimate(ctx context.Context, origin, dest beeline.LatLng, pro
 	}
 
 	h.commitFills(ctx, []beeline.Entry{{
-		Key:    plan.key,
-		Stored: beeline.Stored{Estimate: res.Estimate, ComputedAt: res.ComputedAt},
+		Key:      plan.key,
+		Estimate: res.Estimate, ComputedAt: res.ComputedAt,
 	}}, res.ComputedAt)
 
 	return res, nil
@@ -482,8 +482,8 @@ func (h *Handler) Table(ctx context.Context, q *TableQuery) (TableResult, error)
 				result.Filled++
 				if withinBound(routed[i].ReadLayer().MaxRadiusMeters, q.Sources[i], q.Destinations[t.j]) {
 					fills = append(fills, beeline.Entry{
-						Key:    t.key,
-						Stored: beeline.Stored{Estimate: est, ComputedAt: now},
+						Key:      t.key,
+						Estimate: est, ComputedAt: now,
 					})
 				}
 			}

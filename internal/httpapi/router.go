@@ -3,11 +3,11 @@ package httpapi
 import (
 	"github.com/primandproper/beeline/version"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/observability/metrics"
-	"github.com/primandproper/platform-go/v10/observability/tracing"
-	"github.com/primandproper/platform-go/v10/routing"
-	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/metrics"
+	"github.com/primandproper/primitives-go/v2/observability/tracing"
+	"github.com/primandproper/primitives-go/v2/routing"
+	chibackend "github.com/primandproper/primitives-go/v2/routing/backends/chi"
 )
 
 // NewRouter builds beeline's router: the chi backend under the typed OpenAPI

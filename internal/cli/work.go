@@ -12,11 +12,11 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	"github.com/primandproper/beeline/internal/refresh"
 
-	circuitbreakingcfg "github.com/primandproper/platform-go/v10/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v10/httpclient"
-	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
-	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
-	serverhttp "github.com/primandproper/platform-go/v10/server/http"
+	circuitbreakingcfg "github.com/primandproper/primitives-go/v2/circuitbreaking/config"
+	"github.com/primandproper/primitives-go/v2/httpclient"
+	retrycfg "github.com/primandproper/primitives-go/v2/retry/config"
+	chibackend "github.com/primandproper/primitives-go/v2/routing/backends/chi"
+	serverhttp "github.com/primandproper/primitives-go/v2/server/http"
 
 	"github.com/spf13/cobra"
 )

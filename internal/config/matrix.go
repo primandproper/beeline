@@ -8,9 +8,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/httpclient"
-	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
-	serverhttp "github.com/primandproper/platform-go/v10/server/http"
+	"github.com/primandproper/primitives-go/v2/httpclient"
+	retrycfg "github.com/primandproper/primitives-go/v2/retry/config"
+	serverhttp "github.com/primandproper/primitives-go/v2/server/http"
 )
 
 // MatrixConfig is the configuration for the travel-time/distance matrix service

@@ -1,9 +1,10 @@
 module github.com/primandproper/beeline
 
-go 1.26
+go 1.27
 
 require (
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/primandproper/primitives-go/v2 v2.5.0
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
@@ -11,12 +12,6 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.41.0
 	github.com/uber/h3-go/v4 v4.5.0
 	golang.org/x/sync v0.22.0
-)
-
-require (
-	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
-	github.com/robfig/cron/v3 v3.0.1 // indirect
-	github.com/x448/float16 v0.8.4 // indirect
 )
 
 require (
@@ -55,6 +50,7 @@ require (
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
+	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
 	github.com/getsentry/sentry-go v0.43.0 // indirect
 	github.com/go-chi/chi/v5 v5.2.5 // indirect
 	github.com/go-chi/cors v1.2.2 // indirect
@@ -105,7 +101,6 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/pressly/goose/v3 v3.27.3 // indirect
-	github.com/primandproper/platform-go/v10 v10.0.0
 	github.com/riandyrn/otelchi v0.12.2 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/rs/xid v1.6.0 // indirect
@@ -127,6 +122,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/redis v0.41.0 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/bridges/otelslog v0.17.0 // indirect

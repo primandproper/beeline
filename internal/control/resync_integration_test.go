@@ -13,7 +13,7 @@ import (
 	pgstore "github.com/primandproper/beeline/internal/store/postgres"
 	"github.com/primandproper/beeline/internal/store/postgres/pgtest"
 
-	"github.com/primandproper/platform-go/v10/database"
+	"github.com/primandproper/primitives-go/v2/database"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

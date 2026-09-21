@@ -5,13 +5,16 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v10/httpclient"
-	"github.com/primandproper/platform-go/v10/observability"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	loggingcfg "github.com/primandproper/platform-go/v10/observability/logging/config"
-	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
-	serverhttp "github.com/primandproper/platform-go/v10/server/http"
+	"github.com/primandproper/primitives-go/v2/httpclient"
+	"github.com/primandproper/primitives-go/v2/observability"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	loggingcfg "github.com/primandproper/primitives-go/v2/observability/logging/config"
+	retrycfg "github.com/primandproper/primitives-go/v2/retry/config"
+	serverhttp "github.com/primandproper/primitives-go/v2/server/http"
 )
+
+// carProfile is the profile every environment routes by default.
+const carProfile = "car"
 
 // Each builder returns a fully-formed *config.Config for one environment. The
 // configs are constructed here as real, typed Go objects — the compiler and the
@@ -19,15 +22,15 @@ import (
 // them to the JSON files under config/. Grow a builder as the application's
 // Config grows (database, HTTP server, real telemetry, ...); the leftover
 // observability pillars (tracing, metrics, profiling) stay at their zero values,
-// which platform-go resolves to noop providers.
+// which primitives-go resolves to noop providers.
 
 // defaultProfiles are the routing modes and their constant speeds (m/s) the
 // Haversine engine uses.
 func defaultProfiles() map[string]float64 {
 	return map[string]float64{
-		"car":  13.9, // ~50 km/h
-		"bike": 4.2,  // ~15 km/h
-		"walk": 1.4,  // ~5 km/h
+		carProfile: 13.9, // ~50 km/h
+		"bike":     4.2,  // ~15 km/h
+		"walk":     1.4,  // ~5 km/h
 	}
 }
 
@@ -49,7 +52,7 @@ func buildLocalDevConfig() *config.Config {
 				StartupDeadline: 5 * time.Second,
 			},
 			Profiles:       defaultProfiles(),
-			DefaultProfile: "car",
+			DefaultProfile: carProfile,
 			Backend: config.BackendConfig{
 				// Points at a local Postgres you supply — `make demo` runs its own
 				// in-cluster one. Every serve process is a head over shared
@@ -71,7 +74,7 @@ func buildLocalDevConfig() *config.Config {
 				"osrm-local": {
 					Type:         config.ProviderTypeOSRM,
 					BaseURL:      "http://localhost:5000",
-					Profiles:     map[string]string{"car": "driving", "bike": "cycling", "walk": "foot"},
+					Profiles:     map[string]string{carProfile: "driving", "bike": "cycling", "walk": "foot"},
 					MaxTableSize: 10000,
 					Timeout:      5 * time.Second,
 				},
@@ -156,7 +159,7 @@ func buildClusterConfig() *config.Config {
 				StartupDeadline: 5 * time.Second,
 			},
 			Profiles:       defaultProfiles(),
-			DefaultProfile: "car",
+			DefaultProfile: carProfile,
 			Backend: config.BackendConfig{
 				// Demo credentials for the throwaway in-cluster postgres; every
 				// deployment overrides this via BEELINE_MATRIX_BACKEND_POSTGRES_URL.
@@ -213,7 +216,7 @@ func buildProductionConfig() *config.Config {
 				StartupDeadline: 5 * time.Second,
 			},
 			Profiles:       defaultProfiles(),
-			DefaultProfile: "car",
+			DefaultProfile: carProfile,
 			Backend: config.BackendConfig{
 				// A placeholder DSN: a real deploy overrides it with
 				// BEELINE_MATRIX_BACKEND_POSTGRES_URL from a secret rather than

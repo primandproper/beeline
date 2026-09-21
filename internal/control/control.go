@@ -23,8 +23,8 @@ import (
 	"github.com/primandproper/beeline/internal/beeline"
 	"github.com/primandproper/beeline/internal/tessellate"
 
-	"github.com/primandproper/platform-go/v10/distributedlock"
-	"github.com/primandproper/platform-go/v10/distributedlock/noop"
+	"github.com/primandproper/primitives-go/v2/distributedlock"
+	"github.com/primandproper/primitives-go/v2/distributedlock/noop"
 )
 
 // AreasRepository persists service-area definitions. The SQLite store satisfies it;
@@ -91,7 +91,7 @@ type Locker interface {
 	WithAreaLock(ctx context.Context, id beeline.AreaID, fn func(ctx context.Context) error) error
 }
 
-// noopLocker is the single-node default: it delegates to platform-go's no-op
+// noopLocker is the single-node default: it delegates to primitives-go's no-op
 // scoped locker, which runs fn unguarded. The area id is irrelevant to it, so
 // the key is a constant.
 type noopLocker struct {

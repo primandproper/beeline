@@ -81,10 +81,8 @@ func decode(raw string) (beeline.Stored, error) {
 
 	return beeline.Stored{
 		ComputedAt: time.UnixMilli(int64(binary.LittleEndian.Uint64(b[16:24]))),
-		Estimate: beeline.Estimate{
-			Duration: math.Float64frombits(binary.LittleEndian.Uint64(b[0:8])),
-			Distance: math.Float64frombits(binary.LittleEndian.Uint64(b[8:16])),
-		},
+		Duration:   math.Float64frombits(binary.LittleEndian.Uint64(b[0:8])),
+		Distance:   math.Float64frombits(binary.LittleEndian.Uint64(b[8:16])),
 	}, nil
 }
 

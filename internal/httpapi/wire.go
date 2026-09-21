@@ -5,8 +5,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/routing"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/routing"
 )
 
 // The escape hatch handlers use to answer without returning an error:

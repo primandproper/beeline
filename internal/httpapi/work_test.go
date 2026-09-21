@@ -15,10 +15,10 @@ import (
 	"github.com/primandproper/beeline/internal/httpapi"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	metricsnoop "github.com/primandproper/primitives-go/v2/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/primitives-go/v2/observability/tracing/noop"
+	chibackend "github.com/primandproper/primitives-go/v2/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

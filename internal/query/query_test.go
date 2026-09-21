@@ -99,8 +99,8 @@ func TestEstimateCacheHit(t *testing.T) {
 
 	key := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+		Key:      key,
+		Duration: 42, Distance: 420, ComputedAt: time.Now(),
 	}}))
 
 	res, err := handler.Estimate(ctx, origin, dest, "car")
@@ -292,8 +292,8 @@ func TestTableCacheHitsNeverCallEngine(t *testing.T) {
 			require.NoError(t, dErr)
 			key := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
 			require.NoError(t, store.Put(ctx, []beeline.Entry{{
-				Key:    key,
-				Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+				Key:      key,
+				Duration: 42, Distance: 420, ComputedAt: time.Now(),
 			}}))
 		}
 	}
@@ -325,8 +325,8 @@ func TestTableCacheOnlyLeavesMissesAbsent(t *testing.T) {
 	require.NoError(t, err)
 	seeded := beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9}
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    seeded,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+		Key:      seeded,
+		Duration: 42, Distance: 420, ComputedAt: time.Now(),
 	}}))
 
 	result, err := handler.Table(ctx, &query.TableQuery{
@@ -359,8 +359,8 @@ func TestTableSkipOmitsCells(t *testing.T) {
 	dCell, err := beeline.CellAt(tableDests[0], 9)
 	require.NoError(t, err)
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+		Key:      beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9},
+		Duration: 42, Distance: 420, ComputedAt: time.Now(),
 	}}))
 
 	result, err := handler.Table(ctx, &query.TableQuery{
@@ -501,8 +501,8 @@ func TestTableSpansMultipleAreas(t *testing.T) {
 	dCellA, err := beeline.CellAt(dest, 9)
 	require.NoError(t, err)
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    beeline.PairKey{Area: areaA, Origin: oCellA, Dest: dCellA, Profile: "car", Res: 9},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+		Key:      beeline.PairKey{Area: areaA, Origin: oCellA, Dest: dCellA, Profile: "car", Res: 9},
+		Duration: 42, Distance: 420, ComputedAt: time.Now(),
 	}}))
 
 	result, err := handler.Table(ctx, &query.TableQuery{
@@ -540,8 +540,8 @@ func TestEstimateStaleHitBumps(t *testing.T) {
 	// Mark it computed two minutes ago so it reads as stale against a 1m TTL.
 	require.NoError(t, index.MarkComputed(ctx, []beeline.PairKey{key}, time.Now().Add(-2*time.Minute)))
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now().Add(-2 * time.Minute)},
+		Key:      key,
+		Duration: 42, Distance: 420, ComputedAt: time.Now().Add(-2 * time.Minute),
 	}}))
 
 	res, err := handler.Estimate(ctx, origin, dest, "car")
@@ -614,8 +614,8 @@ func TestEstimateTelemetryEvents(t *testing.T) {
 
 		handler, store, rec := build(inArea)
 		require.NoError(t, store.Put(ctx, []beeline.Entry{{
-			Key:    wantKey,
-			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+			Key:      wantKey,
+			Duration: 42, Distance: 420, ComputedAt: time.Now(),
 		}}))
 
 		_, estErr := handler.Estimate(ctx, origin, dest, "car")
@@ -634,8 +634,8 @@ func TestEstimateTelemetryEvents(t *testing.T) {
 
 		handler, store, rec := build(inArea)
 		require.NoError(t, store.Put(ctx, []beeline.Entry{{
-			Key:    wantKey,
-			Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now().Add(-2 * time.Minute)},
+			Key:      wantKey,
+			Duration: 42, Distance: 420, ComputedAt: time.Now().Add(-2 * time.Minute),
 		}}))
 
 		_, estErr := handler.Estimate(ctx, origin, dest, "car")
@@ -725,8 +725,8 @@ func TestTableTelemetryEvents(t *testing.T) {
 	dCell, err := beeline.CellAt(tableDests[0], 9)
 	require.NoError(t, err)
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 42, Distance: 420}, ComputedAt: time.Now()},
+		Key:      beeline.PairKey{Area: testArea, Origin: oCell, Dest: dCell, Profile: "car", Res: 9},
+		Duration: 42, Distance: 420, ComputedAt: time.Now(),
 	}}))
 
 	result, err := handler.Table(ctx, &query.TableQuery{

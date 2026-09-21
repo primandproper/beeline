@@ -15,7 +15,7 @@ COVERAGE_OUT  := $(ARTIFACTS_DIR)/coverage.out
 TOTAL_PACKAGE_LIST := `go list $(THIS)/...`
 
 # CONTAINER VERSIONS
-LINTER_IMAGE        := golangci/golangci-lint:v2.10.1
+LINTER_IMAGE        := golangci/golangci-lint:v2.13.1
 SHELLCHECK_IMAGE    := koalaman/shellcheck:stable
 SQL_GENERATOR_IMAGE := sqlc/sqlc:1.26.0
 
@@ -34,7 +34,7 @@ $(ARTIFACTS_DIR):
 ## PREREQUISITES
 
 # setup prepares a fresh clone: creates the artifacts dir and downloads the
-# module cache. This template does not vendor (platform-go's dependency tree is
+# module cache. This template does not vendor (primitives-go's dependency tree is
 # large); builds and tests run against the module cache.
 .PHONY: setup
 setup: $(ARTIFACTS_DIR)

@@ -13,8 +13,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/clock"
-	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/primitives-go/v2/clock"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
 )
 
 // defaultSubmitDivisor derives the default flush size as a fraction of the claim
@@ -179,8 +179,8 @@ func (p *Pool) refresh(ctx context.Context, keys []beeline.PairKey) {
 			}
 
 			entries = append(entries, beeline.Entry{
-				Key:    groupKeys[j],
-				Stored: beeline.Stored{Estimate: est, ComputedAt: now},
+				Key:      groupKeys[j],
+				Estimate: est, ComputedAt: now,
 			})
 		}
 

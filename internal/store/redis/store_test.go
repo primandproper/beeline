@@ -37,8 +37,8 @@ func TestStoreComputedAtSurvivesToMillisecondPrecision(t *testing.T) {
 	// first makes the assertion exact rather than approximate.
 	stamp := time.Now().Truncate(time.Millisecond)
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{ComputedAt: stamp, Estimate: beeline.Estimate{Duration: 120, Distance: 1500}},
+		Key:        key,
+		ComputedAt: stamp, Duration: 120, Distance: 1500,
 	}}))
 
 	got, err := store.BatchGet(ctx, []beeline.PairKey{key})
@@ -51,8 +51,8 @@ func TestStoreComputedAtSurvivesToMillisecondPrecision(t *testing.T) {
 	// dropped to zero, which the read path would treat as infinitely stale.
 	precise := time.Now().Add(500 * time.Microsecond)
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{ComputedAt: precise, Estimate: beeline.Estimate{Duration: 1, Distance: 1}},
+		Key:        key,
+		ComputedAt: precise, Duration: 1, Distance: 1,
 	}}))
 	got, err = store.BatchGet(ctx, []beeline.PairKey{key})
 	require.NoError(t, err)

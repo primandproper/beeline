@@ -11,7 +11,7 @@
 # because .dockerignore keeps .git out of the build context. docker-compose.yml
 # fills them in from the host's git checkout; they default to "unknown".
 
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 RUN apk add --no-cache build-base
 

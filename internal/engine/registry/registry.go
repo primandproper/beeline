@@ -18,10 +18,10 @@ import (
 	latencyengine "github.com/primandproper/beeline/internal/engine/latency"
 	osrmengine "github.com/primandproper/beeline/internal/engine/osrm"
 
-	"github.com/primandproper/platform-go/v10/circuitbreaking"
-	circuitbreakingcfg "github.com/primandproper/platform-go/v10/circuitbreaking/config"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/primitives-go/v2/circuitbreaking"
+	circuitbreakingcfg "github.com/primandproper/primitives-go/v2/circuitbreaking/config"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/metrics"
 )
 
 // BuiltinSpecs returns the specs of the always-synthesized providers: the raw

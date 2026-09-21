@@ -8,7 +8,7 @@
 //
 // See pgtest's package doc for why the default is to run rather than to skip.
 //
-// The container itself comes from platform-go's
+// The container itself comes from primitives-go's
 // testutils/containers/redistest, which already owns the image, the wait
 // strategy and the startup retry policy; this package adds only beeline's
 // resolution order and the config-shaped constructor. Note that it calls Try
@@ -33,7 +33,7 @@ import (
 	"github.com/primandproper/beeline/internal/config"
 	redisstore "github.com/primandproper/beeline/internal/store/redis"
 
-	platformredistest "github.com/primandproper/platform-go/v10/testutils/containers/redistest"
+	platformredistest "github.com/primandproper/primitives-go/v2/testutils/containers/redistest"
 
 	"github.com/stretchr/testify/require"
 )

@@ -8,8 +8,8 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/routing"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/routing"
 )
 
 // The /_work_/ endpoints are the leader side of the leader/follower split (design
@@ -219,11 +219,9 @@ func submitHandler(deps *Deps, logger logging.Logger) routing.Handler[submitRequ
 				Res:     res.Res,
 			}
 			entries = append(entries, beeline.Entry{
-				Key: key,
-				Stored: beeline.Stored{
-					Estimate:   beeline.Estimate{Duration: res.DurationSec, Distance: res.DistanceMeters},
-					ComputedAt: now,
-				},
+				Key:      key,
+				Duration: res.DurationSec, Distance: res.DistanceMeters,
+				ComputedAt: now,
 			})
 			keys = append(keys, key)
 		}

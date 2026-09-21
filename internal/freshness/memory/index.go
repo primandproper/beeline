@@ -23,7 +23,7 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/clock"
+	"github.com/primandproper/primitives-go/v2/clock"
 )
 
 // entry is the per-pair scheduling state.

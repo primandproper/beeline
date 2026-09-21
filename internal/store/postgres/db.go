@@ -15,12 +15,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/config"
 
-	"github.com/primandproper/platform-go/v10/database"
-	"github.com/primandproper/platform-go/v10/database/migrate"
-	pgclient "github.com/primandproper/platform-go/v10/database/postgres"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/observability/metrics"
-	"github.com/primandproper/platform-go/v10/observability/tracing"
+	"github.com/primandproper/primitives-go/v2/database"
+	"github.com/primandproper/primitives-go/v2/database/migrate"
+	pgclient "github.com/primandproper/primitives-go/v2/database/postgres"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/metrics"
+	"github.com/primandproper/primitives-go/v2/observability/tracing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )

@@ -1,7 +1,7 @@
 // Package telemetry captures read-path fetch events for offline analysis — the
 // training data an organization needs to model which estimates get queried in which
 // circumstances, and later feed predictions back through the warm endpoint. The
-// pipeline itself is platform-go's eventcapture package: the read path hands events
+// pipeline itself is primitives-go's eventcapture package: the read path hands events
 // to a Recorder over a bounded, never-blocking buffer; a flusher goroutine
 // serializes them through a pluggable Sink (an eventcapture/jsonl file today,
 // Kafka/S3/… behind the same interface later). This package owns only the
@@ -16,9 +16,9 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/eventcapture"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/observability/metrics"
+	"github.com/primandproper/primitives-go/v2/eventcapture"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/metrics"
 )
 
 // Source values for FetchEvent.Source. They mirror the read path's query.Source

@@ -35,8 +35,8 @@ func TestEstimateStoreServerStampsComputedAt(t *testing.T) {
 
 	// A zero ComputedAt on the way in: whatever comes back is the database's.
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 120, Distance: 1500}},
+		Key:      key,
+		Duration: 120, Distance: 1500,
 	}}))
 
 	got, err := store.BatchGet(ctx, []beeline.PairKey{key})
@@ -48,8 +48,8 @@ func TestEstimateStoreServerStampsComputedAt(t *testing.T) {
 	// An overwrite re-stamps, so a refreshed pair reads as freshly computed.
 	first := got[0].ComputedAt
 	require.NoError(t, store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 60, Distance: 900}},
+		Key:      key,
+		Duration: 60, Distance: 900,
 	}}))
 	got, err = store.BatchGet(ctx, []beeline.PairKey{key})
 	require.NoError(t, err)

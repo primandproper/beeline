@@ -163,8 +163,8 @@ func drainClaims(t *testing.T, h *harness) int {
 		entries := make([]beeline.Entry, 0, len(claimed))
 		for i := range claimed {
 			entries = append(entries, beeline.Entry{
-				Key:    claimed[i],
-				Stored: beeline.Stored{ComputedAt: time.Now(), Estimate: beeline.Estimate{Duration: 60, Distance: 1000}},
+				Key:        claimed[i],
+				ComputedAt: time.Now(), Duration: 60, Distance: 1000,
 			})
 		}
 		require.NoError(t, h.store.Put(ctx, entries))
@@ -335,8 +335,8 @@ func TestSweepExpiredEvictsColdDemandFromIndexAndStore(t *testing.T) {
 	key := beeline.PairKey{Area: area.ID, Origin: cells[0], Dest: cells[1], Profile: "car", Res: testRes}
 	require.NoError(t, h.index.Access(ctx, []beeline.PairKey{key}))
 	require.NoError(t, h.store.Put(ctx, []beeline.Entry{{
-		Key:    key,
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1, Distance: 2}},
+		Key:      key,
+		Duration: 1, Distance: 2,
 	}}))
 
 	debt, err := h.index.DebtForArea(ctx, area.ID)

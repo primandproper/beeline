@@ -13,9 +13,9 @@ import (
 	"github.com/primandproper/beeline/internal/engine/registry"
 	"github.com/primandproper/beeline/internal/follower"
 
-	"github.com/primandproper/platform-go/v10/circuitbreaking"
-	"github.com/primandproper/platform-go/v10/retry"
-	retrycfg "github.com/primandproper/platform-go/v10/retry/config"
+	"github.com/primandproper/primitives-go/v2/circuitbreaking"
+	"github.com/primandproper/primitives-go/v2/retry"
+	retrycfg "github.com/primandproper/primitives-go/v2/retry/config"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -123,8 +123,8 @@ func TestSubmitRetriesServerErrors(t *testing.T) {
 	defer srv.Close()
 
 	err = retryingFollower(t, srv.URL).Submit(context.Background(), []beeline.Entry{{
-		Key:    beeline.PairKey{Area: 1, Origin: origin, Dest: dest, Profile: "car", Res: 9},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 12, Distance: 340}},
+		Key:      beeline.PairKey{Area: 1, Origin: origin, Dest: dest, Profile: "car", Res: 9},
+		Duration: 12, Distance: 340,
 	}})
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), attempts.Load(), "the 502 was retried")

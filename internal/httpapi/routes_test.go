@@ -20,10 +20,10 @@ import (
 	"github.com/primandproper/beeline/internal/query"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	metricsnoop "github.com/primandproper/primitives-go/v2/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/primitives-go/v2/observability/tracing/noop"
+	chibackend "github.com/primandproper/primitives-go/v2/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -245,8 +245,8 @@ func TestPairsEndpointReturnsOnlyCachedAtOwnResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, store.Put(context.Background(), []beeline.Entry{{
-		Key:    beeline.PairKey{Area: 1, Origin: origin, Dest: cached, Profile: "car", Res: 7},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 321, Distance: 4200}, ComputedAt: time.Now()},
+		Key:      beeline.PairKey{Area: 1, Origin: origin, Dest: cached, Profile: "car", Res: 7},
+		Duration: 321, Distance: 4200, ComputedAt: time.Now(),
 	}}))
 
 	body := `{"area": 1, "origin": "` + origin.String() + `", "dests": ["` +

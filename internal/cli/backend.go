@@ -12,8 +12,8 @@ import (
 	pgstore "github.com/primandproper/beeline/internal/store/postgres"
 	redisstore "github.com/primandproper/beeline/internal/store/redis"
 
-	"github.com/primandproper/platform-go/v10/database"
-	"github.com/primandproper/platform-go/v10/healthcheck"
+	"github.com/primandproper/primitives-go/v2/database"
+	"github.com/primandproper/primitives-go/v2/healthcheck"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )

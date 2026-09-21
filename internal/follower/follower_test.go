@@ -18,10 +18,10 @@ import (
 	"github.com/primandproper/beeline/internal/refresh"
 	memstore "github.com/primandproper/beeline/internal/store/memory"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	metricsnoop "github.com/primandproper/primitives-go/v2/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/primitives-go/v2/observability/tracing/noop"
+	chibackend "github.com/primandproper/primitives-go/v2/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -228,8 +228,8 @@ func TestSubmitErrorsOnNon200(t *testing.T) {
 	require.NoError(t, err)
 
 	entries := []beeline.Entry{{
-		Key:    beeline.PairKey{Area: 1, Origin: origin, Dest: origin, Profile: "car", Res: 9},
-		Stored: beeline.Stored{Estimate: beeline.Estimate{Duration: 1}},
+		Key:      beeline.PairKey{Area: 1, Origin: origin, Dest: origin, Profile: "car", Res: 9},
+		Duration: 1,
 	}}
 	submitErr := newFollower(t, srv.URL).Submit(context.Background(), entries)
 	require.Error(t, submitErr)

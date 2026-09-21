@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/primandproper/platform-go/v10/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
 )
 
 // wireEncoder is beeline's encoding.ServerEncoderDecoder: plain JSON with this

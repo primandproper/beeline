@@ -1,16 +1,16 @@
 # beeline
 
 A batteries-included Go application template built on
-[`primandproper/platform-go`](https://github.com/primandproper/platform-go).
+[`primandproper/primitives-go`](https://github.com/primandproper/primitives-go).
 
 Unlike a bare scaffold, this template ships a **real, runnable application**: a
-[Cobra](https://github.com/spf13/cobra) CLI that bootstraps the platform-go
+[Cobra](https://github.com/spf13/cobra) CLI that bootstraps the primitives-go
 observability suite (logging, tracing, metrics, profiling) with graceful
 shutdown, plus the full build/format/lint/test toolchain and CI to go with it.
 
 The CLI is meant to be your single entrypoint. Building a one-off tool? Add a
 subcommand. A long-running worker? Add a subcommand. An HTTP service? Add a
-`serve` subcommand that stands up `platform-go`'s HTTP server. You start here.
+`serve` subcommand that stands up `primitives-go`'s HTTP server. You start here.
 
 ## Quickstart
 
@@ -256,7 +256,7 @@ make setup && make build && make test
 
 The `Makefile` `THIS` variable must be the full module path, because
 `scripts/format_imports.sh` runs `dirname` on it to derive the org-level import
-prefix (section 3 of the `gci` ordering). `platform-go` (also under
+prefix (section 3 of the `gci` ordering). `primitives-go` (also under
 `github.com/primandproper`) intentionally moves to the third-party import group
 once your module lives under a different org.
 </details>

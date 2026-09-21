@@ -10,10 +10,10 @@ import (
 
 	"github.com/primandproper/beeline/internal/httpapi"
 
-	"github.com/primandproper/platform-go/v10/healthcheck"
-	metricsnoop "github.com/primandproper/platform-go/v10/observability/metrics/noop"
-	tracingnoop "github.com/primandproper/platform-go/v10/observability/tracing/noop"
-	chibackend "github.com/primandproper/platform-go/v10/routing/backends/chi"
+	"github.com/primandproper/primitives-go/v2/healthcheck"
+	metricsnoop "github.com/primandproper/primitives-go/v2/observability/metrics/noop"
+	tracingnoop "github.com/primandproper/primitives-go/v2/observability/tracing/noop"
+	chibackend "github.com/primandproper/primitives-go/v2/routing/backends/chi"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

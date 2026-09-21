@@ -48,11 +48,9 @@ func Seed(tb testing.TB, store beeline.Store, keys []beeline.PairKey) {
 	entries := make([]beeline.Entry, len(keys))
 	for i := range keys {
 		entries[i] = beeline.Entry{
-			Key: keys[i],
-			Stored: beeline.Stored{
-				ComputedAt: time.Now(),
-				Estimate:   beeline.Estimate{Duration: float64(i), Distance: float64(i)},
-			},
+			Key:        keys[i],
+			ComputedAt: time.Now(),
+			Duration:   float64(i), Distance: float64(i),
 		}
 	}
 	require.NoError(tb, store.Put(context.Background(), entries))

@@ -74,11 +74,9 @@ func key(area beeline.AreaID, origin, dest int) beeline.PairKey {
 // misaligned read is caught by value and not just by presence.
 func entry(k beeline.PairKey, seq float64) beeline.Entry {
 	return beeline.Entry{
-		Key: k,
-		Stored: beeline.Stored{
-			ComputedAt: time.Now(),
-			Estimate:   beeline.Estimate{Duration: seq, Distance: seq * 10},
-		},
+		Key:        k,
+		ComputedAt: time.Now(),
+		Duration:   seq, Distance: seq * 10,
 	}
 }
 
@@ -301,8 +299,8 @@ func Run(t *testing.T, factory Factory) {
 		// value would read as infinitely stale.
 		ancient := time.Now().Add(-100 * 24 * time.Hour)
 		require.NoError(t, store.Put(ctx, []beeline.Entry{{
-			Key:    k,
-			Stored: beeline.Stored{ComputedAt: ancient, Estimate: beeline.Estimate{Duration: 1, Distance: 1}},
+			Key:        k,
+			ComputedAt: ancient, Duration: 1, Distance: 1,
 		}}))
 
 		got, err := store.BatchGet(ctx, []beeline.PairKey{k})

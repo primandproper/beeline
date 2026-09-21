@@ -6,12 +6,12 @@ import (
 
 	"github.com/primandproper/beeline/internal/beeline"
 
-	"github.com/primandproper/platform-go/v10/database"
-	"github.com/primandproper/platform-go/v10/distributedlock"
-	dlpostgres "github.com/primandproper/platform-go/v10/distributedlock/postgres"
-	"github.com/primandproper/platform-go/v10/observability/logging"
-	"github.com/primandproper/platform-go/v10/observability/metrics"
-	"github.com/primandproper/platform-go/v10/observability/tracing"
+	"github.com/primandproper/primitives-go/v2/database"
+	"github.com/primandproper/primitives-go/v2/distributedlock"
+	dlpostgres "github.com/primandproper/primitives-go/v2/distributedlock/postgres"
+	"github.com/primandproper/primitives-go/v2/observability/logging"
+	"github.com/primandproper/primitives-go/v2/observability/metrics"
+	"github.com/primandproper/primitives-go/v2/observability/tracing"
 )
 
 // Advisory-lock names. The platform locker hashes them into the advisory-lock
